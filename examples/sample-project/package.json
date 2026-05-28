@@ -1,0 +1,22 @@
+{
+  "name": "lacuna-sample",
+  "version": "1.0.0",
+  "description": "Sample project for testing lacuna locally",
+  "scripts": {
+    "test": "jest",
+    "test:coverage": "jest --coverage"
+  },
+  "devDependencies": {
+    "@types/jest": "^29",
+    "jest": "^29",
+    "ts-jest": "^29",
+    "typescript": "^5"
+  },
+  "jest": {
+    "preset": "ts-jest",
+    "testEnvironment": "node",
+    "collectCoverageFrom": ["src/**/*.ts", "!src/**/__tests__/**"],
+    "coverageReporters": ["lcov", "text-summary"],
+    "coverageDirectory": "coverage"
+  }
+}

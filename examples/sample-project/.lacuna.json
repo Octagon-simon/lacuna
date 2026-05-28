@@ -1,0 +1,12 @@
+{
+  "provider": "openai-compatible",
+  "model": "deepseek-chat",
+  "apiKeyEnv": "DEEPSEEK_API_KEY",
+  "testRunner": "jest",
+  "coverageFormat": "lcov",
+  "coverageDir": "coverage",
+  "sourceDir": "src",
+  "threshold": 80,
+  "maxIterations": 3,
+  "baseURL": "https://api.deepseek.com/v1"
+}

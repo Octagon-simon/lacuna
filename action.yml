@@ -1,0 +1,89 @@
+name: lacuna
+description: Agentic test coverage — find gaps, generate tests, verify they pass, report on PRs
+author: lacuna-dev
+
+branding:
+  icon: shield
+  color: purple
+
+inputs:
+  mode:
+    description: "'analyze' (read-only report) or 'generate' (write tests)"
+    required: false
+    default: generate
+  threshold:
+    description: Minimum line coverage percentage required to pass
+    required: false
+    default: '80'
+  model:
+    description: Claude model to use
+    required: false
+    default: claude-sonnet-4-6
+  source-dir:
+    description: Directory containing source files
+    required: false
+    default: src
+  coverage-dir:
+    description: Directory where coverage output is written
+    required: false
+    default: coverage
+  anthropic-api-key:
+    description: Anthropic API key (required for generate mode)
+    required: false
+  github-token:
+    description: GitHub token for posting PR comments and status checks
+    required: false
+    default: ${{ github.token }}
+  post-comment:
+    description: Post a coverage report comment on the PR
+    required: false
+    default: 'true'
+
+outputs:
+  coverage-before:
+    description: Coverage percentage before lacuna ran
+    value: ${{ steps.report.outputs.coverage-before }}
+  coverage-after:
+    description: Coverage percentage after lacuna ran
+    value: ${{ steps.report.outputs.coverage-after }}
+  passed:
+    description: Whether coverage meets the threshold
+    value: ${{ steps.report.outputs.passed }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install lacuna
+      shell: bash
+      run: npm install -g lacuna@latest
+
+    - name: Run lacuna
+      id: lacuna
+      shell: bash
+      run: |
+        lacuna ${{ inputs.mode }} \
+          --format json \
+          --output lacuna-report.json \
+          --threshold ${{ inputs.threshold }}
+      env:
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+
+    - name: Parse report outputs
+      id: report
+      shell: bash
+      run: node ${{ github.action_path }}/dist/ci/parse-outputs.js
+
+    - name: Post PR comment
+      if: inputs.post-comment == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      run: node ${{ github.action_path }}/dist/ci/comment.js
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_PR_NUMBER: ${{ github.event.pull_request.number }}
+        LACUNA_REPORT_FILE: lacuna-report.json

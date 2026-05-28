@@ -1,0 +1,62 @@
+{
+  "name": "lacuna",
+  "version": "0.1.0",
+  "description": "Agentic CLI that finds coverage gaps, generates tests, and verifies them in a loop",
+  "keywords": [
+    "testing",
+    "coverage",
+    "ai",
+    "agent",
+    "cli"
+  ],
+  "homepage": "https://github.com/lacuna-dev/lacuna",
+  "license": "MIT",
+  "bin": {
+    "lacuna": "./bin/run.js"
+  },
+  "main": "dist/index.js",
+  "type": "module",
+  "files": [
+    "/bin",
+    "/dist",
+    "/oclif.manifest.json"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "watch": "tsc -p tsconfig.json --watch",
+    "lint": "eslint src --ext .ts",
+    "format": "prettier --write 'src/**/*.ts'",
+    "test": "node --loader ts-node/esm --test src/**/*.test.ts",
+    "prepack": "npm run build",
+    "dev": "ts-node --esm src/index.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.52.0",
+    "@inquirer/prompts": "^8.5.0",
+    "@oclif/core": "^4",
+    "chalk": "^5",
+    "cosmiconfig": "^9",
+    "lcov-parse": "^1",
+    "openai": "^6.39.0",
+    "ora": "^8",
+    "zod": "^3"
+  },
+  "devDependencies": {
+    "@oclif/test": "^4",
+    "@types/node": "^22",
+    "eslint": "^9",
+    "prettier": "^3",
+    "ts-node": "^10",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "oclif": {
+    "bin": "lacuna",
+    "dirname": "lacuna",
+    "commands": "./dist/commands",
+    "plugins": [],
+    "topicSeparator": " "
+  }
+}
