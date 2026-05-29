@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - run: npm ci
+
+      - run: npm run build
+
+      - name: Commit dist and update tags
+        run: |
+          TAG="${GITHUB_REF_NAME}"                            # e.g. v1.2.3
+          MAJOR="$(echo "$TAG" | sed 's/\([^.]*\).*/\1/')"  # e.g. v1
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Force-add dist/ even though it's in .gitignore (intentional — dist is
+          # excluded from day-to-day commits but must be present in release tags
+          # so the GitHub Action works without requiring users to run npm install)
+          git add --force dist/
+
+          if git diff --cached --quiet; then
+            echo "dist/ is unchanged — tags already point to the correct commit."
+          else
+            git commit -m "chore: build dist for ${TAG} [skip ci]"
+
+            # Move the exact version tag to the new commit that includes dist/
+            git tag -fa "${TAG}" -m "Release ${TAG}"
+
+            git push origin HEAD:main
+            git push origin "${TAG}" --force
+          fi
+
+          # Always update the floating major tag (v1 → latest 1.x)
+          git tag -fa "${MAJOR}" -m "Release ${TAG}"
+          git push origin "${MAJOR}" --force
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "${TAG}" \
+            --title "${TAG}" \
+            --generate-notes \
+            --latest
+
+      - name: Publish to npm
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

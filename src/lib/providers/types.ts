@@ -93,6 +93,22 @@ export const PRESETS: Record<string, ProviderPreset> = {
     apiKeyEnv: '',
     apiKeyHint: 'Start LM Studio server on port 1234',
   },
+  gemini: {
+    label: 'Gemini 2.5 Pro (Google)',
+    provider: 'openai-compatible',
+    model: 'gemini-2.5-pro',
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    apiKeyEnv: 'GEMINI_API_KEY',
+    apiKeyHint: 'https://aistudio.google.com/apikey',
+  },
+  'gemini-flash': {
+    label: 'Gemini 2.0 Flash (Google) — fast & cheap',
+    provider: 'openai-compatible',
+    model: 'gemini-2.0-flash',
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    apiKeyEnv: 'GEMINI_API_KEY',
+    apiKeyHint: 'https://aistudio.google.com/apikey',
+  },
   custom: {
     label: 'Custom — any OpenAI-compatible endpoint',
     provider: 'openai-compatible',

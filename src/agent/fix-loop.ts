@@ -9,7 +9,7 @@ import { runCommand } from '../lib/runner.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
-import { buildFixFileContext, computeRelativeImport } from './context.js'
+import { buildFixFileContext, computeRelativeImport, collectTypeDefinitions, collectLocalImportPaths, detectReactMajorVersion } from './context.js'
 import { TestGenerator, TruncatedOutputError, OscillationError, TRUNCATION_RETRY_MESSAGE } from './generator.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
@@ -171,6 +171,17 @@ async function fixFile(
 
   const sourceImportPath = sourceFilePath ? computeRelativeImport(absTestPath, sourceFilePath) : null
 
+  // Collect type definitions, local import paths, and React version in parallel
+  const [typeDefinitions, localImportPaths, reactMajorVersion] = await Promise.all([
+    sourceCode && sourceFilePath
+      ? collectTypeDefinitions(sourceCode, sourceFilePath, cwd).catch(() => null)
+      : Promise.resolve(null),
+    sourceCode && sourceFilePath
+      ? collectLocalImportPaths(sourceCode, sourceFilePath, absTestPath, cwd).catch(() => null)
+      : Promise.resolve(null),
+    detectReactMajorVersion(cwd).catch(() => null),
+  ])
+
   // Build mocks/setup context relative to the actual test file path
   const ctx = await buildFixFileContext(absTestPath, cwd, config).catch(() => null)
 
@@ -205,6 +216,9 @@ async function fixFile(
             setupFileCode: ctx?.setupFileCode ?? null,
             packageDeps: ctx?.packageDeps ?? null,
             tsconfigPaths: ctx?.tsconfigPaths ?? null,
+            typeDefinitions,
+            localImportPaths,
+            reactMajorVersion,
             projectMemory,
           })
         : await generator.retry(errorOutput)

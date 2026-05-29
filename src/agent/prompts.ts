@@ -142,8 +142,9 @@ RULES — follow every one:
 11. Structure ALL output using exactly these two XML blocks — nothing before, nothing after:
     <thinking>
     1. WHAT IS NEEDED: What functions/behaviors are untested or broken?
-    2. WHY IT FAILED (retries only): What is the structural root cause — wrong mock level, missing await, bad import path, type mismatch?
-    3. PLAN: List the exact steps you will take before writing a single line of code.
+    2. COMPONENT RENDER MAP (React components only): Before writing any assertion, list what is in the DOM in each relevant state (idle / loading / error / success). Read the JSX — check every ternary, &&, and switch — to determine whether a button is disabled vs unmounted, what text changes, what elements appear. Never assume a button is disabled during loading without verifying this in the JSX.
+    3. WHY IT FAILED (retries only): What is the structural root cause — wrong mock level, missing await, bad import path, type mismatch?
+    4. PLAN: List the exact steps you will take before writing a single line of code.
     </thinking>
     <code_output>
     // complete test file here
@@ -164,6 +165,9 @@ Common failure causes to avoid:
 - Mocking modules that are already mocked in the setup file
 - Using browser globals without jsdom (only use them if the setup file configures jsdom)
 - Forgetting to await async functions
+- React 18 act() async rule: ALWAYS await act() when it wraps async code — \`await act(async () => { ... })\`. Never store an unawaited act() call in a variable like \`const promise = act(async () => ...)\` without immediately awaiting it. Unawaited act() calls cause React state updates to leak into subsequent tests, producing cascading timeout failures and "Cannot read properties of null" errors in unrelated tests.
+- vi.mock() paths are relative to the TEST FILE, not the source file. If the test is at src/features/auth/__tests__/Login.test.tsx and you need to mock src/components/Button, the mock path is ../../../components/Button — count directories from the TEST file's location, not the source file's.
+- Loading state architecture: before asserting that a button is disabled during loading, check whether the component hides the button entirely and replaces it with a spinner. If the button is unmounted during loading rather than disabled, \`getByText("Submit")\` will throw — test for the spinner instead, or use \`queryByText("Submit")\` with a null assertion.
 - Unhandled promise rejections: when testing error paths with mockRejectedValueOnce, the rejection must be fully resolved inside the test. After triggering the action, always use await waitFor(() => expect(errorElement).toBeInTheDocument()) to tie the rejection to the test scope. Never let a rejected mock promise go unawaited — Vitest will flag it as an unhandled error even if the component catches it internally.
 - Real HTTP requests: NEVER let a real network call reach the internet. If you see a real URL (https://...), a 401/403 error, or a network timeout in test output, your mock is missing or at the wrong level. Every function that calls an API must be mocked before the test runs.
 
@@ -185,6 +189,9 @@ export function buildGeneratePrompt(args: {
   setupFileCode?: string | null
   packageDeps?: string | null
   tsconfigPaths?: string | null
+  typeDefinitions?: string | null
+  localImportPaths?: string[] | null
+  reactMajorVersion?: number | null
   projectMemory?: string | null
 }): string {
   const {
@@ -199,6 +206,9 @@ export function buildGeneratePrompt(args: {
     setupFileCode,
     packageDeps,
     tsconfigPaths,
+    typeDefinitions,
+    localImportPaths,
+    reactMajorVersion,
     projectMemory,
   } = args
 
@@ -216,9 +226,25 @@ export function buildGeneratePrompt(args: {
     parts.push('```')
   }
 
+  if (reactMajorVersion !== null && reactMajorVersion !== undefined && reactMajorVersion >= 18) {
+    parts.push(`\nREACT ${reactMajorVersion} DETECTED — act() async rule: every act(async () => { ... }) call MUST be awaited. Never assign an unawaited act() to a variable. Unawaited act() leaks state updates into subsequent tests, causing cascading failures and null-read errors in unrelated tests.`)
+  }
+
   if (tsconfigPaths) {
     parts.push('\nPROJECT TYPESCRIPT CONFIG (strict flags, target, and path aliases — follow these exactly):')
     parts.push(tsconfigPaths)
+  }
+
+  if (localImportPaths && localImportPaths.length > 0) {
+    parts.push('\nLOCAL IMPORT PATHS (pre-computed relative to the test file — use these exact strings in vi.mock() calls, do NOT recount directory levels yourself):')
+    for (const p of localImportPaths) parts.push(`  ${p}`)
+  }
+
+  if (typeDefinitions) {
+    parts.push('\nTYPE DEFINITIONS (exported from files the source imports — use these exact shapes, do NOT invent properties or guess types):')
+    parts.push('```typescript')
+    parts.push(typeDefinitions)
+    parts.push('```')
   }
 
   if (setupFileCode) {
@@ -293,9 +319,12 @@ export function buildFixPrompt(args: {
   setupFileCode?: string | null
   packageDeps?: string | null
   tsconfigPaths?: string | null
+  typeDefinitions?: string | null
+  localImportPaths?: string[] | null
+  reactMajorVersion?: number | null
   projectMemory?: string | null
 }): string {
-  const { testFile, testCode, sourceFile, sourceCode, sourceImportPath, errorOutput, mocksCode, mocksImportPath, setupFileCode, packageDeps, tsconfigPaths, projectMemory } = args
+  const { testFile, testCode, sourceFile, sourceCode, sourceImportPath, errorOutput, mocksCode, mocksImportPath, setupFileCode, packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, reactMajorVersion, projectMemory } = args
   const parts: string[] = []
 
   parts.push('Your job is to fix a failing test file. Do NOT rewrite it from scratch — preserve every existing test and only change what is necessary to make them pass.')
@@ -313,9 +342,25 @@ export function buildFixPrompt(args: {
     parts.push('```')
   }
 
+  if (reactMajorVersion !== null && reactMajorVersion !== undefined && reactMajorVersion >= 18) {
+    parts.push(`\nREACT ${reactMajorVersion} DETECTED — act() async rule: every act(async () => { ... }) call MUST be awaited. Never assign an unawaited act() to a variable. Unawaited act() leaks state updates into subsequent tests, causing cascading failures and null-read errors in unrelated tests.`)
+  }
+
   if (tsconfigPaths) {
     parts.push('\nPROJECT TYPESCRIPT CONFIG:')
     parts.push(tsconfigPaths)
+  }
+
+  if (localImportPaths && localImportPaths.length > 0) {
+    parts.push('\nLOCAL IMPORT PATHS (pre-computed relative to the test file — use these exact strings in vi.mock() calls, do NOT recount directory levels yourself):')
+    for (const p of localImportPaths) parts.push(`  ${p}`)
+  }
+
+  if (typeDefinitions) {
+    parts.push('\nTYPE DEFINITIONS (exported from files the source imports — use these exact shapes, do NOT invent properties or guess types):')
+    parts.push('```typescript')
+    parts.push(typeDefinitions)
+    parts.push('```')
   }
 
   if (setupFileCode) {
@@ -435,8 +480,11 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
   parts.push('Common causes:')
   parts.push('- Wrong import path — check the path aliases and dependency list from the original prompt')
   parts.push('- Missing mock — if a module needs mocking, add it to the shared mock file')
+  parts.push('- Wrong vi.mock() path: mock paths are relative to the TEST FILE, not the source file. Count up from the test file\'s directory to reach the mocked module — if the test is in src/features/x/__tests__/ and mocks src/components/, that is ../../../components/, not ../components/.')
   parts.push('- Wrong API — use only methods that exist in the installed version of the library')
   parts.push('- Type error — make sure the types match what the source file exports')
+  parts.push('- React 18 act() async: every act(async () => ...) MUST be awaited. Unawaited act() calls cause state to leak across tests, producing "Cannot read properties of null" or timeout failures in unrelated tests. Fix: add await before every act() call that wraps async code.')
+  parts.push('- Loading state — if the error is "Unable to find element" on a Submit/Save button, the component likely unmounts the button during loading rather than disabling it. Assert on the spinner or loading indicator instead.')
   parts.push('- Unhandled rejection ("Vitest caught 1 unhandled error" / "Unhandled Rejection"): a mockRejectedValueOnce promise is escaping the test scope. After the action that triggers the rejection, add: await waitFor(() => expect(screen.getByText(/error/i)).toBeInTheDocument()) — this keeps the rejection chained inside the test so Vitest doesn\'t treat it as unhandled. The component may already catch the error internally, but the test still needs to await the resulting state change.')
   parts.push('')
   parts.push('Fix the issue and return your response in the required <thinking> + <code_output> format.')

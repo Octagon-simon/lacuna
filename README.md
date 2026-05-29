@@ -23,6 +23,7 @@ lacuna analyze / lacuna generate            lacuna fix
   │                                           └── For each failing test file:
   └── For each gap: (generate only)                 ├── Runs file alone → captures error output
         ├── Reads source + existing tests           ├── Reads the test file + its source file
+        ├── Reads imported type definitions         ├── Reads imported type definitions
         ├── Reads tsconfig paths, deps,             ├── Reads tsconfig paths, deps, setup file
         │   and test setup file                     ├── Detects network mocking issues
         ├── Sends full context to AI model          ├── AI reasons in <thinking>, writes fix
@@ -177,6 +178,8 @@ Lacuna works with any AI model — local or cloud.
 | DeepSeek R1 | `deepseek-reasoner` | `DEEPSEEK_API_KEY` | Reasoning model |
 | GPT-4o | `gpt-4o` | `OPENAI_API_KEY` | |
 | Groq | `llama-3.3-70b-versatile` | `GROQ_API_KEY` | Fast, free tier |
+| Gemini 2.5 Pro | `gemini-2.5-pro` | `GEMINI_API_KEY` | Google's most capable |
+| Gemini 2.0 Flash | `gemini-2.0-flash` | `GEMINI_API_KEY` | Fast & cheap |
 | OpenRouter | any model | `OPENROUTER_API_KEY` | 100+ models, one key |
 | Ollama | any local model | none | Fully local, free |
 | LM Studio | any local model | none | Fully local, free |
@@ -408,7 +411,7 @@ lacuna/
 │   ├── agent/             # AI agent loop
 │   │   ├── loop.ts        # main generate → run → retry loop
 │   │   ├── fix-loop.ts    # fix → run → retry loop for failing tests
-│   │   ├── context.ts     # builds context for the AI (source + tests + mocks)
+│   │   ├── context.ts     # builds context for the AI (source + tests + mocks + type definitions)
 │   │   ├── generator.ts   # calls the AI model, manages conversation history
 │   │   └── prompts.ts     # system prompt + user prompt templates
 │   ├── lib/
