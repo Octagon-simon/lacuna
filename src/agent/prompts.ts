@@ -32,6 +32,24 @@ function analyzeNetworkDeps(sourceCode: string): NetworkAnalysis {
   return { usesAxios, usesFetch, usesCustomInstance, apiModuleImports }
 }
 
+// Scans error output for an unhandled rejection caused by mockRejectedValueOnce.
+// Vitest surfaces this as a top-level "Unhandled Rejection" or "Vitest caught N unhandled error(s)"
+// even when the component catches the error internally — the test never awaited the error state.
+function detectUnhandledRejection(errorOutput: string): string | null {
+  const hasUnhandled = /unhandled\s+(promise\s+)?rejection|vitest caught \d+ unhandled/i.test(errorOutput)
+  const hasRejectedMock = /mockRejectedValue(Once)?/.test(errorOutput)
+
+  if (!hasUnhandled && !hasRejectedMock) return null
+
+  return [
+    'UNHANDLED REJECTION DETECTED — a mockRejectedValueOnce (or mockRejectedValue) promise is escaping the test scope.',
+    'The component may catch the error internally, but Vitest still requires the rejection to be resolved inside the test.',
+    'Required fix: after the action that triggers the rejection, await the resulting error state:',
+    "  await waitFor(() => expect(screen.getByText(/error text/i)).toBeInTheDocument())",
+    'This chains the rejection inside the test scope. Without it, Vitest flags it as unhandled even if the UI handles it correctly.',
+  ].join('\n')
+}
+
 // Scans error output for signs that a real HTTP request leaked through.
 function detectRealRequestInError(errorOutput: string): string | null {
   const hasRealUrl = /https?:\/\/[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/.test(errorOutput)
@@ -170,6 +188,7 @@ Common failure causes to avoid:
 - Loading state architecture: before asserting that a button is disabled during loading, check whether the component hides the button entirely and replaces it with a spinner. If the button is unmounted during loading rather than disabled, \`getByText("Submit")\` will throw — test for the spinner instead, or use \`queryByText("Submit")\` with a null assertion.
 - Unhandled promise rejections: when testing error paths with mockRejectedValueOnce, the rejection must be fully resolved inside the test. After triggering the action, always use await waitFor(() => expect(errorElement).toBeInTheDocument()) to tie the rejection to the test scope. Never let a rejected mock promise go unawaited — Vitest will flag it as an unhandled error even if the component catches it internally.
 - Real HTTP requests: NEVER let a real network call reach the internet. If you see a real URL (https://...), a 401/403 error, or a network timeout in test output, your mock is missing or at the wrong level. Every function that calls an API must be mocked before the test runs.
+- Barrel file vi.mock() resolution: if a module is exported from a barrel/index file (e.g. src/components/index.ts re-exports Foo from ./Foo), mock the DIRECT file path, not the barrel. vi.mock('../components') mocks the barrel but the component may import directly from '../components/Foo' — making the mock miss. Always mock the specific module the source file actually imports. If unsure, mock both the direct file AND the barrel.
 
 Test file pattern for this project: ${env.testFilePattern}
 
@@ -418,11 +437,11 @@ export function buildFixPrompt(args: {
   parts.push(errorOutput.slice(0, 3000))
   parts.push('```')
 
-  // Detect real HTTP requests in the error output — highest-priority signal
   const realRequestWarning = detectRealRequestInError(errorOutput)
-  if (realRequestWarning) {
-    parts.push(`\n⚠️  ${realRequestWarning}`)
-  }
+  if (realRequestWarning) parts.push(`\n⚠️  ${realRequestWarning}`)
+
+  const rejectionWarning = detectUnhandledRejection(errorOutput)
+  if (rejectionWarning) parts.push(`\n⚠️  ${rejectionWarning}`)
 
   // Detect wrong mock pattern: test uses vi.mock('axios') but source uses axios.create()
   const testHasAxiosMock = /vi\.mock\(['"]axios['"]\)/.test(testCode)
@@ -472,15 +491,17 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
   parts.push('```')
 
   const realRequestWarning = detectRealRequestInError(failureOutput)
-  if (realRequestWarning) {
-    parts.push(`\n⚠️  ${realRequestWarning}`)
-  }
+  if (realRequestWarning) parts.push(`\n⚠️  ${realRequestWarning}`)
+
+  const rejectionWarning = detectUnhandledRejection(failureOutput)
+  if (rejectionWarning) parts.push(`\n⚠️  ${rejectionWarning}`)
 
   parts.push('')
   parts.push('Common causes:')
   parts.push('- Wrong import path — check the path aliases and dependency list from the original prompt')
   parts.push('- Missing mock — if a module needs mocking, add it to the shared mock file')
   parts.push('- Wrong vi.mock() path: mock paths are relative to the TEST FILE, not the source file. Count up from the test file\'s directory to reach the mocked module — if the test is in src/features/x/__tests__/ and mocks src/components/, that is ../../../components/, not ../components/.')
+  parts.push('- Barrel file mock miss: if a module is re-exported from a barrel/index file, mocking the barrel (vi.mock(\'../components\')) will NOT intercept imports of the direct file (\'../components/Foo\'). Mock the specific file the source actually imports. If unsure, mock both.')
   parts.push('- Wrong API — use only methods that exist in the installed version of the library')
   parts.push('- Type error — make sure the types match what the source file exports')
   parts.push('- React 18 act() async: every act(async () => ...) MUST be awaited. Unawaited act() calls cause state to leak across tests, producing "Cannot read properties of null" or timeout failures in unrelated tests. Fix: add await before every act() call that wraps async code.')

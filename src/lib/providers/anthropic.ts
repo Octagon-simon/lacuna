@@ -19,20 +19,31 @@ export class AnthropicProvider implements ModelProvider {
   ): Promise<string> {
     let content = ''
 
-    const stream = this.client.messages.stream({
-      model: this.model,
-      max_tokens: maxTokens,
-      stop_sequences: ['</code_output>'],
-      ...(temperature !== undefined ? { temperature } : {}),
-      system,
-      messages,
-    })
+    try {
+      const stream = this.client.messages.stream({
+        model: this.model,
+        max_tokens: maxTokens,
+        stop_sequences: ['</code_output>'],
+        ...(temperature !== undefined ? { temperature } : {}),
+        system,
+        messages,
+      })
 
-    for await (const event of stream) {
-      if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
-        content += event.delta.text
-        onToken?.(event.delta.text)
+      for await (const event of stream) {
+        if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          content += event.delta.text
+          onToken?.(event.delta.text)
+        }
       }
+    } catch (err) {
+      if (err instanceof Error && /prompt is too long|max_tokens.*exceed|too many tokens/i.test(err.message)) {
+        throw new Error(
+          `${this.model} rejected the request — prompt too large.\n` +
+          `The assembled context (source file + test file + type definitions + mocks) exceeds the model's input limit.\n` +
+          `Try: lower maxTokens in .lacuna.json, or use --file to target a smaller source file.`,
+        )
+      }
+      throw err
     }
 
     return content.trim()
