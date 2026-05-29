@@ -1,7 +1,7 @@
 import { Command, Flags } from '@oclif/core'
 import { writeFile } from 'fs/promises'
 import chalk from 'chalk'
-import { loadConfig } from '../lib/config.js'
+import { loadConfig, applyModelOverride } from '../lib/config.js'
 import { detectEnvironment } from '../lib/detector.js'
 import { runAgentLoop } from '../agent/loop.js'
 import { reportTerminal, buildJsonReport, buildMarkdownReport, getExitCode } from '../lib/reporter.js'
@@ -73,7 +73,7 @@ export default class Generate extends Command {
     const { flags } = await this.parse(Generate)
 
     const config = await loadConfig()
-    if (flags.model) config.model = flags.model
+    if (flags.model) applyModelOverride(config, flags.model)
     if (flags.threshold) config.threshold = flags.threshold
 
     const env = await detectEnvironment(process.cwd(), config.testRunner)

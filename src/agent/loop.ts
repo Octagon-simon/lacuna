@@ -36,6 +36,7 @@ export interface LoopResult {
   testsWritten: number
   coverageBefore: number
   coverageAfter: number
+  hasCoverage: boolean   // false in single-file mode (no suite run, no coverage data)
   errors: string[]
 }
 
@@ -311,6 +312,39 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   const workerCount = Math.max(1, Math.min(options.workers ?? 1, 10))
   const parallel = workerCount > 1
 
+  // ─── Single-file fast path ────────────────────────────────────────────────────
+  // Skip the coverage suite entirely. Build a synthetic gap that treats the whole
+  // file as uncovered — the AI reads the source and writes comprehensive tests.
+  // Uses fileTestCommand (not the full suite) to verify the generated tests pass.
+  if (options.targetFile) {
+    const abs = options.targetFile.startsWith('/')
+      ? options.targetFile
+      : join(cwd, options.targetFile)
+
+    const gap: CoverageGap = {
+      filePath: abs,
+      uncoveredLines: [],
+      uncoveredFunctions: [],
+    }
+
+    const memory = new ProjectMemory()
+    await memory.initialize(cwd, env, config)
+
+    const generator = new TestGenerator({ config, env })
+    const result = await processGap(gap, options, generator, true, undefined, memory.toPromptSection())
+
+    return {
+      filesProcessed: 1,
+      testsWritten: result.success ? 1 : 0,
+      coverageBefore: 0,
+      coverageAfter: 0,
+      hasCoverage: false,
+      errors: result.error ? [result.error] : [],
+    }
+  }
+
+  // ─── Full suite path ──────────────────────────────────────────────────────────
+
   const ageSeconds = await coverageAgeSeconds(config, cwd)
   const useCached = !options.fresh && ageSeconds !== null && ageSeconds < COVERAGE_CACHE_TTL_S
 
@@ -351,25 +385,16 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
 
   const coverageBefore = report.totalLineRate * 100
 
-  let gaps = await filterTestableGaps(extractGaps(report, config.threshold), config.ignore)
+  const gaps = await filterTestableGaps(extractGaps(report, config.threshold), config.ignore)
   const untouchedFiles = await findUncoveredFiles(report, config.sourceDir, cwd, config.ignore)
   const existingPaths = new Set(gaps.map((g) => g.filePath))
   for (const g of untouchedFiles) {
     if (!existingPaths.has(g.filePath)) gaps.push(g)
   }
 
-  if (options.targetFile) {
-    const abs = options.targetFile.startsWith('/') ? options.targetFile : `${cwd}/${options.targetFile}`
-    gaps = gaps.filter((g) => g.filePath === abs || g.filePath.endsWith(options.targetFile!))
-    if (gaps.length === 0) {
-      log(chalk.yellow(`\nNo coverage gaps found for ${options.targetFile} (it may already meet the threshold).`))
-      return { filesProcessed: 0, testsWritten: 0, coverageBefore, coverageAfter: coverageBefore, errors: [] }
-    }
-  }
-
   if (gaps.length === 0) {
     log(chalk.green(`\nAll files already meet the ${config.threshold}% threshold.`))
-    return { filesProcessed: 0, testsWritten: 0, coverageBefore, coverageAfter: coverageBefore, errors: [] }
+    return { filesProcessed: 0, testsWritten: 0, coverageBefore, coverageAfter: coverageBefore, hasCoverage: true, errors: [] }
   }
 
   log(chalk.bold(`\nFound ${gaps.length} file(s) below ${config.threshold}% threshold.`))
@@ -434,5 +459,5 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
 
   const coverageAfter = options.dryRun ? coverageBefore : await getCoverageRate(config, cwd)
 
-  return { filesProcessed, testsWritten, coverageBefore, coverageAfter, errors }
+  return { filesProcessed, testsWritten, coverageBefore, coverageAfter, hasCoverage: true, errors }
 }

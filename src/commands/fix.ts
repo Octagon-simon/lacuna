@@ -1,6 +1,6 @@
 import { Command, Flags } from '@oclif/core'
 import chalk from 'chalk'
-import { loadConfig } from '../lib/config.js'
+import { loadConfig, applyModelOverride } from '../lib/config.js'
 import { detectEnvironment } from '../lib/detector.js'
 import { runFixLoop } from '../agent/fix-loop.js'
 
@@ -47,7 +47,7 @@ export default class Fix extends Command {
     const { flags } = await this.parse(Fix)
 
     const config = await loadConfig()
-    if (flags.model) config.model = flags.model
+    if (flags.model) applyModelOverride(config, flags.model)
 
     const env = await detectEnvironment(process.cwd(), config.testRunner)
 

@@ -85,6 +85,7 @@ async function main() {
             testsWritten: (report.testsWritten as number) ?? 0,
             coverageBefore: coverage?.before ?? 0,
             coverageAfter: coverage?.after ?? 0,
+            hasCoverage: coverage?.before !== undefined,
             errors: (report.errors as string[]) ?? [],
           }
         : undefined,

@@ -80,6 +80,8 @@ lacuna analyze --format markdown
 ### `lacuna generate`
 The main command. Runs the full agent loop — analyzes gaps, writes tests, runs them, retries failures.
 
+When `--file` is given, lacuna skips the coverage suite entirely and goes straight to the AI — no waiting for a full suite run. The generated tests are verified by running just that file. Use this to increase coverage on a specific file without touching the rest of the project.
+
 If you ran `lacuna analyze` recently (within 10 minutes), `generate` will reuse the existing coverage report instead of running the suite again. Use `--fresh` to force a new run.
 
 If all retries fail, the original test file is restored — your workspace is never left with a half-written file. If the model oscillates (produces the same code twice), the retry loop stops early rather than burning remaining iterations.
@@ -114,7 +116,7 @@ If all retries fail or the model oscillates (identical output detected), the ori
 
 If a fix attempt breaks an import (causing 0 tests to be collected) or reduces the number of passing tests, lacuna detects the regression and tells the model exactly what the original failure was — so it doesn't waste further iterations trying to recover from the wrong problem.
 
-When `--file` is given, lacuna skips the full suite and runs only the target file — much faster for iterating on a single broken test. Without `--file`, the failing-files list is cached for 5 minutes so re-running `lacuna fix` immediately doesn't trigger another full suite run.
+When `--file` is given, lacuna skips the full suite and runs only the target file — much faster for iterating on a single broken test. Without `--file`, the failing-files list is cached for 30 minutes. After a fix run, the cache is updated to contain only the files that are still failing — so re-running `lacuna fix` immediately picks up exactly where the last run left off. Once all files are fixed, the cache is cleared so the next run does a clean suite scan.
 
 ### `lacuna run`
 Runs your test suite and reports coverage. No AI involved.
@@ -179,7 +181,7 @@ Lacuna works with any AI model — local or cloud.
 | GPT-4o | `gpt-4o` | `OPENAI_API_KEY` | |
 | Groq | `llama-3.3-70b-versatile` | `GROQ_API_KEY` | Fast, free tier |
 | Gemini 2.5 Pro | `gemini-2.5-pro` | `GEMINI_API_KEY` | Google's most capable |
-| Gemini 2.0 Flash | `gemini-2.0-flash` | `GEMINI_API_KEY` | Fast & cheap |
+| Gemini 2.5 Flash | `gemini-2.5-flash` | `GEMINI_API_KEY` | Fast & cheap |
 | OpenRouter | any model | `OPENROUTER_API_KEY` | 100+ models, one key |
 | Ollama | any local model | none | Fully local, free |
 | LM Studio | any local model | none | Fully local, free |

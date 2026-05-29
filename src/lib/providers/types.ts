@@ -102,9 +102,9 @@ export const PRESETS: Record<string, ProviderPreset> = {
     apiKeyHint: 'https://aistudio.google.com/apikey',
   },
   'gemini-flash': {
-    label: 'Gemini 2.0 Flash (Google) — fast & cheap',
+    label: 'Gemini 2.5 Flash (Google) — fast & cheap',
     provider: 'openai-compatible',
-    model: 'gemini-2.0-flash',
+    model: 'gemini-2.5-flash',
     baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
     apiKeyEnv: 'GEMINI_API_KEY',
     apiKeyHint: 'https://aistudio.google.com/apikey',

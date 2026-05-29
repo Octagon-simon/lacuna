@@ -1,5 +1,6 @@
 import { cosmiconfig } from 'cosmiconfig'
 import { z } from 'zod'
+import { PRESETS } from './providers/types.js'
 
 const ConfigSchema = z.object({
   testRunner: z.enum(['jest', 'vitest', 'pytest', 'mocha', 'go-test']).optional(),
@@ -36,6 +37,30 @@ const explorer = cosmiconfig('lacuna', {
     'lacuna.config.cjs',
   ],
 })
+
+// Applies a -m / --model flag to the config. If the value matches a preset key
+// (e.g. "gemini") or a preset model name (e.g. "gemini-2.5-pro"), the full preset
+// is applied so provider/baseURL/apiKeyEnv are also updated. Otherwise, only
+// config.model is updated (caller already has the right provider config).
+export function applyModelOverride(config: LacunaConfig, model: string): void {
+  const byKey = PRESETS[model]
+  if (byKey) {
+    config.provider = byKey.provider
+    config.model = byKey.model
+    if (byKey.baseURL) config.baseURL = byKey.baseURL
+    if (byKey.apiKeyEnv) config.apiKeyEnv = byKey.apiKeyEnv
+    return
+  }
+  const byModel = Object.values(PRESETS).find((p) => p.model === model)
+  if (byModel) {
+    config.provider = byModel.provider
+    config.model = byModel.model
+    if (byModel.baseURL) config.baseURL = byModel.baseURL
+    if (byModel.apiKeyEnv) config.apiKeyEnv = byModel.apiKeyEnv
+    return
+  }
+  config.model = model
+}
 
 export async function loadConfig(cwd: string = process.cwd()): Promise<LacunaConfig> {
   const result = await explorer.search(cwd)

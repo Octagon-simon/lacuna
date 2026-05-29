@@ -62,24 +62,30 @@ export function reportTerminal(input: ReportInput): void {
 
   if (input.type === 'generate' && input.generate) {
     const r = input.generate
-    const delta = r.coverageAfter - r.coverageBefore
-    const deltaStr = (delta >= 0 ? '+' : '') + delta.toFixed(1) + '%'
-    const afterColor = r.coverageAfter >= threshold ? chalk.green : chalk.yellow
 
     console.log(chalk.bold('\n─── Results ───────────────────────────────'))
     console.log(`  Files processed : ${r.filesProcessed}`)
     console.log(`  Tests written   : ${r.testsWritten}`)
-    console.log(
-      `  Coverage        : ${chalk.dim(r.coverageBefore.toFixed(1) + '%')} → ${afterColor(r.coverageAfter.toFixed(1) + '%')} (${delta >= 0 ? chalk.green(deltaStr) : chalk.red(deltaStr)})`,
-    )
-    console.log(
-      `  Threshold       : ${threshold}%  ${r.coverageAfter >= threshold ? chalk.green('PASS') : chalk.red('FAIL')}`,
-    )
+
+    if (r.hasCoverage) {
+      const delta = r.coverageAfter - r.coverageBefore
+      const deltaStr = (delta >= 0 ? '+' : '') + delta.toFixed(1) + '%'
+      const afterColor = r.coverageAfter >= threshold ? chalk.green : chalk.yellow
+      console.log(
+        `  Coverage        : ${chalk.dim(r.coverageBefore.toFixed(1) + '%')} → ${afterColor(r.coverageAfter.toFixed(1) + '%')} (${delta >= 0 ? chalk.green(deltaStr) : chalk.red(deltaStr)})`,
+      )
+      console.log(
+        `  Threshold       : ${threshold}%  ${r.coverageAfter >= threshold ? chalk.green('PASS') : chalk.red('FAIL')}`,
+      )
+    } else {
+      const allPassed = r.testsWritten === r.filesProcessed && r.errors.length === 0
+      console.log(`  Coverage        : ${chalk.dim('n/a')} (single-file mode — no suite run)`)
+      console.log(`  Status          : ${allPassed ? chalk.green('PASS') : chalk.red('FAIL')}`)
+    }
 
     if (r.errors.length > 0) {
       console.log(chalk.red(`\n  ${r.errors.length} file(s) could not be fixed:`))
       for (const err of r.errors) {
-        // show up to 8 lines per error so the actual failure is visible
         const lines = err.split('\n').filter(Boolean).slice(0, 8)
         for (const line of lines) {
           console.log(chalk.dim(`    ${line}`))
@@ -133,13 +139,16 @@ export function buildJsonReport(input: ReportInput): JsonReport {
   }
 
   const r = input.generate!
+  const passed = r.hasCoverage
+    ? r.coverageAfter >= input.threshold
+    : r.testsWritten === r.filesProcessed && r.errors.length === 0
   return {
     lacuna: '0.1.0',
     timestamp,
     type: 'generate',
     threshold: input.threshold,
-    passed: r.coverageAfter >= input.threshold,
-    coverage: { before: r.coverageBefore, after: r.coverageAfter },
+    passed,
+    coverage: r.hasCoverage ? { before: r.coverageBefore, after: r.coverageAfter } : {},
     filesProcessed: r.filesProcessed,
     testsWritten: r.testsWritten,
     errors: r.errors,
@@ -220,8 +229,13 @@ export function getExitCode(input: ReportInput): number {
     return input.analyze?.passed ? EXIT.OK : EXIT.BELOW_THRESHOLD
   }
   if (input.type === 'generate') {
-    if (input.generate?.errors && input.generate.errors.length > 0) return EXIT.ERROR
-    return (input.generate?.coverageAfter ?? 0) >= input.threshold ? EXIT.OK : EXIT.BELOW_THRESHOLD
+    const r = input.generate
+    if (!r) return EXIT.ERROR
+    if (r.errors.length > 0) return EXIT.ERROR
+    if (!r.hasCoverage) {
+      return r.testsWritten === r.filesProcessed ? EXIT.OK : EXIT.BELOW_THRESHOLD
+    }
+    return r.coverageAfter >= input.threshold ? EXIT.OK : EXIT.BELOW_THRESHOLD
   }
   return EXIT.ERROR
 }

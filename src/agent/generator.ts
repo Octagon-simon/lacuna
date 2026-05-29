@@ -107,7 +107,15 @@ function parseStructuredResponse(raw: string): { hypothesis: string; code: strin
     return { hypothesis, code, truncated: isCodeIncomplete(code) }
   }
 
-  // No XML tags — strip markdown fences and treat full response as code
+  // No XML tags — extract the last fenced code block if present.
+  // Gemini and other models sometimes emit prose + multiple draft blocks before
+  // settling on a final answer; the last block is the intended output.
+  const fenceMatches = [...raw.matchAll(/```(?:typescript|tsx?|javascript|jsx?|python|go)?\s*\n([\s\S]*?)```/g)]
+  if (fenceMatches.length > 0) {
+    const code = fenceMatches[fenceMatches.length - 1][1].trim()
+    return { hypothesis, code, truncated: isCodeIncomplete(code) }
+  }
+  // No fenced blocks at all — strip any single fence pair and use as code
   let fallback = raw.trim()
   fallback = fallback.replace(/^```(?:typescript|tsx?|javascript|jsx?|python|go)?\s*\n/, '')
   fallback = fallback.replace(/\n```\s*$/, '')

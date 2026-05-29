@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'fs/promises'
+import { readFile, writeFile, mkdir, unlink } from 'fs/promises'
 import { join, dirname, basename, extname } from 'path'
 import { access, stat } from 'fs/promises'
 import chalk from 'chalk'
@@ -32,7 +32,7 @@ export interface FixOptions {
 
 // ─── Failing-files cache ──────────────────────────────────────────────────────
 
-const FIX_CACHE_TTL_S = 300 // 5 minutes
+const FIX_CACHE_TTL_S = 1800 // 30 minutes
 
 function fixCachePath(cwd: string): string {
   return join(cwd, '.lacuna-fix-cache.json')
@@ -56,6 +56,12 @@ async function saveFixCache(cwd: string, files: string[]): Promise<void> {
   } catch {
     // non-fatal — cache is best-effort
   }
+}
+
+async function clearFixCache(cwd: string): Promise<void> {
+  try {
+    await unlink(fixCachePath(cwd))
+  } catch { /* already gone — fine */ }
 }
 
 export interface FixResult {
@@ -336,11 +342,12 @@ async function runFixWorkers(
   options: FixOptions,
   workerCount: number,
   projectMemory: string | null,
-): Promise<{ filesProcessed: number; filesFixed: number; errors: string[] }> {
+): Promise<{ filesProcessed: number; filesFixed: number; errors: string[]; stillFailingFiles: string[] }> {
   const queue = [...testFiles]
   let filesProcessed = 0
   let filesFixed = 0
   const errors: string[] = []
+  const stillFailingFiles: string[] = []
 
   const tips = getActiveTips({
     workers: workerCount,
@@ -366,13 +373,16 @@ async function runFixWorkers(
         const result = await fixFile(file, { ...options, log: () => {}, verbose: false }, generator, onStatus, projectMemory)
         filesProcessed++
         if (result.success) filesFixed++
-        else if (result.error) errors.push(result.error)
+        else {
+          stillFailingFiles.push(file)
+          if (result.error) errors.push(result.error)
+        }
       }
     }),
   )
 
   display.finish()
-  return { filesProcessed, filesFixed, errors }
+  return { filesProcessed, filesFixed, errors, stillFailingFiles }
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -405,7 +415,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
     const useCached = cache !== null && cache.ageSeconds < FIX_CACHE_TTL_S
 
     if (useCached) {
-      log(chalk.dim(`  Using cached failing-files list (${Math.round(cache!.ageSeconds)}s old). Pass --fresh to re-run the suite.`))
+      log(chalk.dim(`  Resuming from last run (${Math.round(cache!.ageSeconds)}s ago, ${cache!.files.length} file(s) still failing). Pass --fresh to re-scan the full suite.`))
       failingFiles = cache!.files
     } else {
       const spinner = startCoverageSpinner(chalk.dim('  Running test suite to find failures...'), env.testRunner)
@@ -459,13 +469,15 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
   let filesProcessed: number
   let filesFixed: number
   let errors: string[]
+  let stillFailingFiles: string[]
 
   if (parallel) {
-    ;({ filesProcessed, filesFixed, errors } = await runFixWorkers(failingFiles, options, workerCount, memorySnapshot))
+    ;({ filesProcessed, filesFixed, errors, stillFailingFiles } = await runFixWorkers(failingFiles, options, workerCount, memorySnapshot))
   } else {
     filesProcessed = 0
     filesFixed = 0
     errors = []
+    stillFailingFiles = []
     const generator = new TestGenerator({ config, env })
     const tips = getActiveTips({
       workers: 1,
@@ -486,8 +498,20 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       const result = await fixFile(absFile, options, generator, undefined, memory.toPromptSection())
       filesProcessed++
       if (result.success) filesFixed++
-      else if (result.error) errors.push(result.error)
+      else {
+        stillFailingFiles.push(file)
+        if (result.error) errors.push(result.error)
+      }
     }
+  }
+
+  // Update cache with only the files that are still failing.
+  // This means the next `lacuna fix` run skips the full suite and picks up exactly
+  // where we left off. If everything was fixed, delete the cache so the next run
+  // does a clean suite scan to confirm.
+  if (!options.targetFile) {
+    if (stillFailingFiles.length > 0) await saveFixCache(cwd, stillFailingFiles)
+    else await clearFixCache(cwd)
   }
 
   return { filesProcessed, filesFixed, errors }
