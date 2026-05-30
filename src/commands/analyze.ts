@@ -112,7 +112,9 @@ export default class Analyze extends Command {
 
     const coveragePct = report.totalLineRate * 100
     const functionCoveragePct = report.totalFunctionRate * 100
-    const passed = coveragePct >= threshold
+    // untouched files are not in the LCOV report so they don't pull down coveragePct,
+    // but they're real gaps — a project with 122 untested files shouldn't show PASS.
+    const passed = coveragePct >= threshold && untouchedCount === 0
 
     const input: ReportInput = {
       type: 'analyze',

@@ -1,11 +1,89 @@
 import { Command } from '@oclif/core'
-import { writeFile, access } from 'fs/promises'
+import { writeFile, readFile, access } from 'fs/promises'
 import { join } from 'path'
+import { execSync } from 'child_process'
 import { select, input, confirm } from '@inquirer/prompts'
 import chalk from 'chalk'
 import { detectEnvironment } from '../lib/detector.js'
 import { PRESETS } from '../lib/providers/index.js'
 import type { LacunaConfig } from '../lib/config.js'
+
+const RUNNER_SETUP: Record<string, {
+  packages: string[]
+  configFile: string
+  configContent: string
+  scriptHint: string
+}> = {
+  vitest: {
+    packages: ['vitest', '@vitest/coverage-v8'],
+    configFile: 'vitest.config.ts',
+    configContent: `import { defineConfig } from 'vitest/config'\n\nexport default defineConfig({\n  test: {\n    coverage: {\n      provider: 'v8',\n      reporter: ['lcov', 'text-summary'],\n      reportsDirectory: './coverage',\n    },\n  },\n})\n`,
+    scriptHint: '"test": "vitest run --coverage"',
+  },
+  jest: {
+    packages: ['jest', '@types/jest', 'ts-jest'],
+    configFile: 'jest.config.js',
+    configContent: `/** @type {import('jest').Config} */\nmodule.exports = {\n  coverageReporters: ['lcov', 'text-summary'],\n  coverageDirectory: 'coverage',\n}\n`,
+    scriptHint: '"test": "jest --coverage"',
+  },
+  mocha: {
+    packages: ['mocha', '@types/mocha', 'c8'],
+    configFile: '.mocharc.json',
+    configContent: `{\n  "spec": "src/**/*.test.{ts,js}",\n  "require": ["ts-node/register"]\n}\n`,
+    scriptHint: '"test": "c8 --reporter=lcov mocha"',
+  },
+}
+
+async function isRunnerInstalled(runner: string, cwd: string): Promise<boolean> {
+  try {
+    const pkg = JSON.parse(await readFile(join(cwd, 'package.json'), 'utf-8')) as {
+      dependencies?: Record<string, string>
+      devDependencies?: Record<string, string>
+    }
+    const all = { ...pkg.dependencies, ...pkg.devDependencies }
+    return runner in all
+  } catch {
+    return false
+  }
+}
+
+async function ensureTestRunnerSetup(runner: string, cwd: string, log: (msg: string) => void): Promise<void> {
+  const setup = RUNNER_SETUP[runner]
+  if (!setup) return // pytest, go-test — handled outside Node ecosystem
+
+  const installed = await isRunnerInstalled(runner, cwd)
+  if (installed) return // already set up
+
+  log(chalk.yellow(`\n  ${runner} is not installed in this project.`))
+  const doInstall = await confirm({
+    message: `Install ${setup.packages.join(', ')} and create ${setup.configFile}?`,
+    default: true,
+  })
+  if (!doInstall) {
+    log(chalk.dim(`  Skipped. Install manually: npm install -D ${setup.packages.join(' ')}`))
+    return
+  }
+
+  log(chalk.dim(`\n  Installing ${setup.packages.join(', ')}...`))
+  try {
+    execSync(`npm install -D ${setup.packages.join(' ')}`, { cwd, stdio: 'inherit' })
+  } catch {
+    log(chalk.red(`  Install failed. Run manually: npm install -D ${setup.packages.join(' ')}`))
+    return
+  }
+
+  const configPath = join(cwd, setup.configFile)
+  try {
+    await access(configPath)
+    log(chalk.dim(`  ${setup.configFile} already exists — skipping.`))
+  } catch {
+    await writeFile(configPath, setup.configContent)
+    log(chalk.green(`  ✓ Created ${setup.configFile}`))
+  }
+
+  log(chalk.dim(`\n  Add this to your package.json scripts if not already there:`))
+  log(chalk.dim(`    ${setup.scriptHint}`))
+}
 
 export default class Init extends Command {
   static description = 'Interactive setup wizard — configure lacuna for your project'
@@ -78,6 +156,10 @@ export default class Init extends Command {
       ],
       default: detectedRunner ?? 'jest',
     })
+
+    // ── Test runner setup (if not installed) ─────────────────────────────
+
+    await ensureTestRunnerSetup(testRunner, process.cwd(), (msg) => this.log(msg))
 
     // ── Mocks file ────────────────────────────────────────────────────────
 
