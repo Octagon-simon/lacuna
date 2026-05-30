@@ -60,7 +60,7 @@ runs:
 
     - name: Install lacuna
       shell: bash
-      run: npm install -g lacuna@latest
+      run: npm install -g lacuna-cli@latest
 
     - name: Run lacuna
       id: lacuna

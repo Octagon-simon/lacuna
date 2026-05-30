@@ -283,7 +283,7 @@ jobs:
       - run: npm ci
 
       - name: Run lacuna
-        uses: lacuna-dev/lacuna@v1
+        uses: Octagon-simon/lacuna@v1
         with:
           threshold: 80
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -437,7 +437,7 @@ lacuna/
 Issues and PRs welcome. The codebase is TypeScript throughout.
 
 ```bash
-git clone https://github.com/lacuna-dev/lacuna
+git clone https://github.com/Octagon-simon/lacuna
 cd lacuna
 npm install
 npm run build
