@@ -524,7 +524,7 @@
   <div class="hero-actions">
     <div class="install-cmd" id="installCmd" onclick="copyInstall()">
       <span class="prompt">$</span>
-      <span class="cmd">npm install -g lacuna</span>
+      <span class="cmd">npm install -g lacuna-cli</span>
       <button class="copy-btn" aria-label="Copy">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
       </button>
@@ -555,8 +555,8 @@
       <div class="terminal-line">&nbsp;</div>
       <div class="terminal-line indent"><span class="t-pass">✓ </span><span class="t-label">src/utils/math.ts&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">34% → 94%&nbsp;&nbsp; </span><span class="t-pass">generated 8 tests</span></div>
       <div class="terminal-line indent"><span class="t-pass">✓ </span><span class="t-label">src/hooks/useAuth.ts&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">12% → 89%&nbsp;&nbsp; </span><span class="t-pass">generated 5 tests</span></div>
-      <div class="terminal-line indent"><span class="t-pass">✓ </span><span class="t-label">src/api/payments.ts&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">&nbsp;0% → 100% </span><span class="t-pass">generated 12 tests</span></div>
-      <div class="terminal-line indent"><span class="t-spinning">⠸ </span><span class="t-label">src/lib/formatters.ts&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">generating</span><span class="t-blink">_</span></div>
+      <div class="terminal-line indent"><span class="t-pass">✓ </span><span class="t-label">src/api/payments.ts&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">&nbsp;0% → 100%&nbsp;&nbsp; </span><span class="t-pass">generated 12 tests</span></div>
+      <div class="terminal-line indent"><span class="t-spinning">⠸ </span><span class="t-label">src/lib/formatters.ts&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">generating&nbsp;&nbsp;</span><span class="t-blink">_</span></div>
       <div class="terminal-line">&nbsp;</div>
       <div class="terminal-line"><span class="t-bold">Results</span></div>
       <div class="terminal-line indent"><span class="t-dim">Files processed: </span><span class="t-bold">4</span></div>
@@ -787,7 +787,7 @@
   <div class="footer-links">
     <a href="https://github.com/lacuna-dev/lacuna" target="_blank" rel="noopener">GitHub</a>
     <a href="https://github.com/lacuna-dev/lacuna#readme" target="_blank" rel="noopener">Docs</a>
-    <a href="https://www.npmjs.com/package/lacuna" target="_blank" rel="noopener">npm</a>
+    <a href="https://www.npmjs.com/package/lacuna-cli" target="_blank" rel="noopener">npm</a>
     <a href="https://github.com/lacuna-dev/lacuna/issues" target="_blank" rel="noopener">Issues</a>
   </div>
   <span class="footer-copy">MIT License · Made by <a href="https://github.com/lacuna-dev" style="color:inherit;text-decoration:none;">lacuna-dev</a></span>
@@ -795,7 +795,7 @@
 
 <script>
   function copyInstall() {
-    navigator.clipboard.writeText('npm install -g lacuna').then(() => {
+    navigator.clipboard.writeText('npm install -g lacuna-cli').then(() => {
       const el = document.getElementById('installCmd')
       el.classList.add('copied')
       setTimeout(() => el.classList.remove('copied'), 1800)

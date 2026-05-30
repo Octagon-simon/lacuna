@@ -1,6 +1,6 @@
 {
-  "name": "lacuna",
-  "version": "0.1.0",
+  "name": "lacuna-cli",
+  "version": "0.1.1",
   "description": "Agentic CLI that finds coverage gaps, generates tests, and verifies them in a loop",
   "keywords": [
     "testing",
@@ -9,7 +9,7 @@
     "agent",
     "cli"
   ],
-  "homepage": "https://lacuna-dev.github.io/lacuna",
+  "homepage": "https://octagon-simon.github.io/lacuna/",
   "license": "MIT",
   "bin": {
     "lacuna": "./bin/run.js"

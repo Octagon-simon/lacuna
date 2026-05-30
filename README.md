@@ -41,7 +41,7 @@ lacuna analyze / lacuna generate            lacuna fix
 ## Install
 
 ```bash
-npm install -g lacuna
+npm install -g lacuna-cli
 ```
 
 ---
