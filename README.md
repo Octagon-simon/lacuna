@@ -286,6 +286,7 @@ jobs:
         uses: Octagon-simon/lacuna@v1
         with:
           threshold: 80
+          model: claude-sonnet-4-6        # any lacuna preset or model name
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Commit generated tests
@@ -301,6 +302,32 @@ On every PR lacuna will:
 - Generate missing tests
 - Post a coverage report as a PR comment (updated on each push, no spam)
 - Block the merge if coverage stays below your threshold
+
+### Switching models
+
+Pass any lacuna model preset or full model name via the `model` input, along with the matching API key:
+
+```yaml
+# GPT-4o
+with:
+  model: gpt-4o
+  openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+
+# Gemini 2.5 Pro
+with:
+  model: gemini
+  gemini-api-key: ${{ secrets.GEMINI_API_KEY }}
+
+# DeepSeek (cost-effective)
+with:
+  model: deepseek
+  deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+
+# Groq (free tier available)
+with:
+  model: groq
+  groq-api-key: ${{ secrets.GROQ_API_KEY }}
+```
 
 ---
 
