@@ -330,20 +330,6 @@ lacuna analyze --format markdown
 
 ---
 
-## Report to dashboard (Pro)
-
-Send results to the lacuna dashboard for trend tracking and team visibility:
-
-```bash
-lacuna generate --report-to https://app.lacuna.dev --api-key lk_...
-# or
-export LACUNA_SERVER_URL=https://app.lacuna.dev
-export LACUNA_API_KEY=lk_...
-lacuna generate
-```
-
----
-
 ## Contextual tips
 
 While tests are generating, lacuna shows rotating tips in the terminal — hints about flags and config options you might not be using yet. Tips are context-aware: if you're already using a flag, its tip won't appear.
@@ -421,7 +407,6 @@ lacuna/
 │   │   ├── detector.ts    # auto-detects test runner and language
 │   │   ├── runner.ts      # spawns test commands, captures output
 │   │   ├── reporter.ts    # terminal / JSON / markdown reporters
-│   │   ├── report-upload.ts  # sends results to SaaS server
 │   │   ├── skeleton.ts    # collapses already-covered function bodies to reduce prompt size
 │   │   ├── extract-error.ts  # strips passing-test noise from runner output before retry
 │   │   ├── validate.ts    # checks generated code has real test calls; detects regressions and broken imports in retry output

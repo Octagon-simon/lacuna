@@ -6,7 +6,6 @@ import { detectEnvironment } from '../lib/detector.js'
 import { runAgentLoop } from '../agent/loop.js'
 import { reportTerminal, buildJsonReport, buildMarkdownReport, getExitCode } from '../lib/reporter.js'
 import type { ReportInput } from '../lib/reporter.js'
-import { uploadReport } from '../lib/report-upload.js'
 
 export default class Generate extends Command {
   static description = 'Run the full agent loop: analyze gaps, generate tests, verify they pass'
@@ -58,14 +57,6 @@ export default class Generate extends Command {
     fresh: Flags.boolean({
       description: 'Force a fresh coverage run even if a recent report already exists',
       default: false,
-    }),
-    'report-to': Flags.string({
-      description: 'Upload results to a lacuna server (e.g. https://app.lacuna.dev)',
-      env: 'LACUNA_SERVER_URL',
-    }),
-    'api-key': Flags.string({
-      description: 'API key for the lacuna server',
-      env: 'LACUNA_API_KEY',
     }),
   }
 
@@ -133,20 +124,6 @@ export default class Generate extends Command {
       }
     } else {
       reportTerminal(input)
-    }
-
-    if (flags['report-to']) {
-      const apiKey = flags['api-key'] ?? process.env.LACUNA_API_KEY ?? ''
-      if (!apiKey) {
-        this.warn('--report-to requires --api-key (or LACUNA_API_KEY env var)')
-      } else {
-        try {
-          await uploadReport(flags['report-to'], buildJsonReport(input), apiKey)
-          this.log(chalk.dim(`\nReport uploaded to ${flags['report-to']}`))
-        } catch (err) {
-          this.warn(`Could not upload report: ${err instanceof Error ? err.message : err}`)
-        }
-      }
     }
 
     this.exit(getExitCode(input))

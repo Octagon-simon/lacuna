@@ -9,7 +9,7 @@
     "agent",
     "cli"
   ],
-  "homepage": "https://github.com/lacuna-dev/lacuna",
+  "homepage": "https://lacuna-dev.github.io/lacuna",
   "license": "MIT",
   "bin": {
     "lacuna": "./bin/run.js"

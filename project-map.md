@@ -30,7 +30,7 @@ Each is an oclif `Command` subclass. All flags are defined here.
 | File | Command | What it does |
 |------|---------|-------------|
 | `analyze.ts` | `lacuna analyze` | Runs coverage suite, loads LCOV, calls `filterTestableGaps` + `findUncoveredFiles`, prints report. Flags: `--threshold`, `--format`, `--output`, `--verbose` |
-| `generate.ts` | `lacuna generate` | Calls `runAgentLoop`. Flags: `--file`, `--dry-run`, `--verbose`, `--model`, `--threshold`, `--format`, `--output`, `--workers`, `--fresh`, `--report-to`, `--api-key` |
+| `generate.ts` | `lacuna generate` | Calls `runAgentLoop`. Flags: `--file`, `--dry-run`, `--verbose`, `--model`, `--threshold`, `--format`, `--output`, `--workers`, `--fresh` |
 | `fix.ts` | `lacuna fix` | Calls `runFixLoop`. Flags: `--file`, `--dry-run`, `--verbose`, `--model`, `--workers`, `--fresh` |
 | `init.ts` | `lacuna init` | Interactive wizard using `@inquirer/prompts`. Writes `.lacuna.json`. Detects runner, lists model presets |
 | `run.ts` | `lacuna run` | Just runs the test suite and reports coverage. No AI. |
@@ -62,7 +62,6 @@ Pure utilities. No AI, no CLI.
 | `detector.ts` | `detectEnvironment()` — reads `package.json` deps to auto-detect runner. `envForRunner()` — returns `DetectedEnvironment` for a named runner. `fileTestCommand()` — builds per-runner command to run a single test file (used by parallel workers to avoid racing on full suite). Supports: vitest, jest, mocha, pytest, go-test. |
 | `runner.ts` | `runCommand(command, cwd, timeoutMs, onLine?)` — spawns shell command, streams stdout/stderr via `onLine` callback, kills process group with SIGKILL on timeout. Returns `RunResult { stdout, stderr, exitCode, success, timedOut? }`. Default timeout: 300s. |
 | `reporter.ts` | `reportTerminal()`, `buildJsonReport()`, `buildMarkdownReport()`, `getExitCode()`. Accepts `ReportInput { type, threshold, analyze?, generate?, untouchedCount }`. Exit codes: 0=pass, 1=below threshold, 2=error. |
-| `report-upload.ts` | `uploadReport(serverUrl, report, apiKey)` — POSTs `JsonReport` to a lacuna server. Used by `generate --report-to`. |
 | `coverage-spinner.ts` | `startCoverageSpinner(label, runner)` — live terminal spinner during coverage run. Parses vitest/jest/pytest file lines from stdout, shows last 7 files with pass/fail icons. `stop()` collapses to summary line. Non-TTY fallback: plain lines. **Critical**: `rendered` counts `\n` chars in output string, NOT `lines.length`. |
 | `typecheck.ts` | `typeCheckFile(absTestPath, cwd, env)` — runs `npx tsc --noEmit --skipLibCheck`, filters output to errors in the specific test file only (ignores pre-existing errors in other files). Returns null for non-TypeScript projects or when no errors found. Called in both `loop.ts` and `fix-loop.ts` after vitest passes — if type errors found, retries with the error message. |
 | `skeleton.ts` | `buildSourceSkeleton(code, expandFunctions)` — for files > 80 lines, collapses non-target function bodies to `{ /* ... (N lines) */ }` while keeping imports, types, interfaces, and full implementations for `expandFunctions` (the uncovered ones). `shouldUseSkeleton(code)` — threshold check. Used in `prompts.ts` generate prompt (expands uncovered functions) and fix prompt (threshold 150, no expansion — signatures only). |

@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>lacuna — AI-powered test coverage</title>
+  <meta name="description" content="Lacuna finds coverage gaps, writes tests with AI, runs them, and retries until they pass. Works with Claude, GPT-4o, Gemini, DeepSeek, and any local model." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:         #07090d;
+      --bg-2:       #0d1117;
+      --bg-3:       #111820;
+      --border:     #1c2333;
+      --border-2:   #243044;
+      --cyan:       #22d3ee;
+      --cyan-dim:   #0e7490;
+      --purple:     #818cf8;
+      --green:      #4ade80;
+      --text:       #e2e8f0;
+      --text-2:     #94a3b8;
+      --text-3:     #475569;
+      --radius:     12px;
+      --radius-sm:  8px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* ── NAV ─────────────────────────────────────────── */
+    nav {
+      position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 0 2rem;
+      height: 60px;
+      background: rgba(7,9,13,0.8);
+      backdrop-filter: blur(16px);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .nav-logo {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1.1rem;
+      font-weight: 500;
+      color: var(--text);
+      text-decoration: none;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .nav-logo span { color: var(--cyan); }
+
+    .nav-links { display: flex; align-items: center; gap: 1.5rem; }
+    .nav-links a {
+      color: var(--text-2);
+      text-decoration: none;
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 0.15s;
+    }
+    .nav-links a:hover { color: var(--text); }
+
+    .btn-nav {
+      display: flex; align-items: center; gap: 6px;
+      padding: 6px 14px;
+      border: 1px solid var(--border-2);
+      border-radius: 6px;
+      background: var(--bg-2);
+      color: var(--text);
+      font-size: 0.8125rem;
+      font-weight: 500;
+      text-decoration: none;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .btn-nav:hover { border-color: var(--text-3); background: var(--bg-3); }
+
+    /* ── HERO ─────────────────────────────────────────── */
+    .hero {
+      min-height: 100vh;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      padding: 6rem 2rem 4rem;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: -20%;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 900px; height: 600px;
+      background: radial-gradient(ellipse, rgba(34,211,238,0.07) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .badge {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 4px 12px;
+      border: 1px solid rgba(34,211,238,0.25);
+      border-radius: 999px;
+      background: rgba(34,211,238,0.06);
+      color: var(--cyan);
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 2rem;
+    }
+    .badge-dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--cyan);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50%       { opacity: 0.4; }
+    }
+
+    .hero h1 {
+      font-size: clamp(2.5rem, 6vw, 4.5rem);
+      font-weight: 700;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      max-width: 780px;
+      margin-bottom: 1.5rem;
+    }
+
+    .hero h1 .grad {
+      background: linear-gradient(135deg, var(--cyan) 0%, var(--purple) 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero p {
+      font-size: clamp(1rem, 2.5vw, 1.2rem);
+      color: var(--text-2);
+      max-width: 560px;
+      margin-bottom: 2.5rem;
+      font-weight: 400;
+    }
+
+    .hero-actions { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; justify-content: center; margin-bottom: 4rem; }
+
+    .install-cmd {
+      display: flex; align-items: center; gap: 10px;
+      background: var(--bg-2);
+      border: 1px solid var(--border-2);
+      border-radius: var(--radius-sm);
+      padding: 10px 16px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.9rem;
+      color: var(--text);
+      cursor: pointer;
+      transition: border-color 0.15s;
+      position: relative;
+    }
+    .install-cmd:hover { border-color: var(--text-3); }
+    .install-cmd .prompt { color: var(--text-3); }
+    .install-cmd .cmd    { color: var(--cyan); }
+
+    .copy-btn {
+      background: none; border: none; cursor: pointer;
+      color: var(--text-3); padding: 0; line-height: 1;
+      transition: color 0.15s;
+    }
+    .copy-btn:hover { color: var(--text-2); }
+    .copy-btn svg { display: block; }
+
+    .copied-toast {
+      position: absolute; top: -2rem; right: 0;
+      background: var(--bg-3); border: 1px solid var(--border-2);
+      border-radius: 4px; padding: 2px 8px;
+      font-size: 0.7rem; color: var(--green);
+      opacity: 0; pointer-events: none;
+      transition: opacity 0.2s;
+    }
+    .install-cmd.copied .copied-toast { opacity: 1; }
+
+    .btn-primary {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 10px 22px;
+      border-radius: var(--radius-sm);
+      background: var(--cyan);
+      color: #07090d;
+      font-weight: 600;
+      font-size: 0.9375rem;
+      text-decoration: none;
+      transition: opacity 0.15s, transform 0.15s;
+    }
+    .btn-primary:hover { opacity: 0.88; transform: translateY(-1px); }
+
+    /* ── TERMINAL ─────────────────────────────────────── */
+    .terminal-wrap {
+      width: 100%; max-width: 680px;
+      border-radius: var(--radius);
+      border: 1px solid var(--border-2);
+      overflow: hidden;
+      background: #0b0f18;
+      box-shadow: 0 24px 80px rgba(0,0,0,0.6), 0 0 0 1px rgba(255,255,255,0.03);
+      text-align: left;
+    }
+
+    .terminal-bar {
+      display: flex; align-items: center; gap: 6px;
+      padding: 12px 16px;
+      background: var(--bg-3);
+      border-bottom: 1px solid var(--border);
+    }
+    .dot { width: 12px; height: 12px; border-radius: 50%; }
+    .dot-r { background: #ff5f57; }
+    .dot-y { background: #febc2e; }
+    .dot-g { background: #28c840; }
+    .terminal-title {
+      margin-left: auto; margin-right: auto;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.72rem;
+      color: var(--text-3);
+    }
+
+    .terminal-body {
+      padding: 20px 24px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8125rem;
+      line-height: 1.7;
+      min-height: 280px;
+    }
+
+    .t-prompt  { color: var(--text-3); }
+    .t-cmd     { color: var(--cyan); }
+    .t-head    { color: var(--text); font-weight: 500; }
+    .t-dim     { color: var(--text-3); }
+    .t-label   { color: var(--text-2); }
+    .t-pass    { color: var(--green); }
+    .t-cyan    { color: var(--cyan); }
+    .t-bold    { color: var(--text); font-weight: 500; }
+    .t-spinning { color: var(--cyan); }
+
+    .terminal-line { display: flex; }
+    .terminal-line.indent { padding-left: 1.5rem; }
+    .terminal-line.indent2 { padding-left: 3rem; }
+
+    .t-blink { animation: blink 1s step-end infinite; }
+    @keyframes blink { 0%,100%{opacity:1;} 50%{opacity:0;} }
+
+    /* animated lines */
+    .terminal-line { opacity: 0; animation: fadein 0.25s forwards; }
+    .terminal-line:nth-child(1)  { animation-delay: 0.1s; }
+    .terminal-line:nth-child(2)  { animation-delay: 0.4s; }
+    .terminal-line:nth-child(3)  { animation-delay: 0.7s; }
+    .terminal-line:nth-child(4)  { animation-delay: 0.9s; }
+    .terminal-line:nth-child(5)  { animation-delay: 1.1s; }
+    .terminal-line:nth-child(6)  { animation-delay: 1.3s; }
+    .terminal-line:nth-child(7)  { animation-delay: 1.5s; }
+    .terminal-line:nth-child(8)  { animation-delay: 1.9s; }
+    .terminal-line:nth-child(9)  { animation-delay: 2.4s; }
+    .terminal-line:nth-child(10) { animation-delay: 2.9s; }
+    .terminal-line:nth-child(11) { animation-delay: 3.4s; }
+    .terminal-line:nth-child(12) { animation-delay: 3.9s; }
+    .terminal-line:nth-child(13) { animation-delay: 4.5s; }
+    .terminal-line:nth-child(14) { animation-delay: 5.0s; }
+    .terminal-line:nth-child(15) { animation-delay: 5.5s; }
+    .terminal-line:nth-child(16) { animation-delay: 5.7s; }
+    .terminal-line:nth-child(17) { animation-delay: 5.9s; }
+    .terminal-line:nth-child(18) { animation-delay: 6.1s; }
+    @keyframes fadein { to { opacity: 1; } }
+
+    /* ── LOGOS / SOCIAL PROOF ─────────────────────────── */
+    .social-row {
+      display: flex; align-items: center; gap: 2rem; justify-content: center;
+      flex-wrap: wrap;
+      padding: 3rem 2rem;
+      border-top: 1px solid var(--border);
+    }
+    .social-row p { color: var(--text-3); font-size: 0.8125rem; font-weight: 500; }
+    .runner-tags { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+    .tag {
+      padding: 4px 12px;
+      border: 1px solid var(--border-2);
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 500;
+      color: var(--text-2);
+      background: var(--bg-2);
+    }
+
+    /* ── SECTION COMMON ───────────────────────────────── */
+    section { padding: 6rem 2rem; }
+    .container { max-width: 1100px; margin: 0 auto; }
+
+    .section-label {
+      display: inline-flex; align-items: center; gap: 6px;
+      font-size: 0.75rem; font-weight: 600; letter-spacing: 0.1em;
+      text-transform: uppercase; color: var(--cyan);
+      margin-bottom: 1rem;
+    }
+
+    .section-title {
+      font-size: clamp(1.75rem, 4vw, 2.75rem);
+      font-weight: 700;
+      letter-spacing: -0.025em;
+      line-height: 1.15;
+      max-width: 560px;
+      margin-bottom: 1.25rem;
+    }
+
+    .section-sub {
+      color: var(--text-2);
+      font-size: 1.0625rem;
+      max-width: 520px;
+      margin-bottom: 3.5rem;
+    }
+
+    /* ── FEATURES ─────────────────────────────────────── */
+    #features { background: var(--bg); }
+
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.5px;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+      background: var(--border);
+    }
+
+    .feature-card {
+      background: var(--bg-2);
+      padding: 2rem;
+      transition: background 0.2s;
+    }
+    .feature-card:hover { background: var(--bg-3); }
+
+    .feature-icon {
+      width: 40px; height: 40px;
+      border-radius: var(--radius-sm);
+      display: flex; align-items: center; justify-content: center;
+      margin-bottom: 1rem;
+      font-size: 1.25rem;
+    }
+    .icon-cyan   { background: rgba(34,211,238,0.1); color: var(--cyan); }
+    .icon-purple { background: rgba(129,140,248,0.1); color: var(--purple); }
+    .icon-green  { background: rgba(74,222,128,0.1); color: var(--green); }
+
+    .feature-card h3 { font-size: 1rem; font-weight: 600; margin-bottom: 0.5rem; }
+    .feature-card p  { font-size: 0.875rem; color: var(--text-2); line-height: 1.65; }
+
+    /* ── HOW IT WORKS ─────────────────────────────────── */
+    #how { background: var(--bg-2); }
+
+    .steps { display: flex; flex-direction: column; gap: 2rem; }
+    .step {
+      display: grid;
+      grid-template-columns: 40px 1fr;
+      gap: 1.5rem;
+      align-items: start;
+    }
+
+    .step-num {
+      width: 40px; height: 40px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.875rem; font-weight: 700;
+      border: 1px solid var(--border-2);
+      background: var(--bg-3);
+      color: var(--cyan);
+      flex-shrink: 0;
+    }
+
+    .step-content h3 { font-size: 1.0625rem; font-weight: 600; margin-bottom: 0.5rem; }
+    .step-content p  { font-size: 0.875rem; color: var(--text-2); line-height: 1.65; }
+
+    .step-connector {
+      width: 1px; height: 2rem;
+      background: var(--border-2);
+      margin-left: 19px;
+    }
+
+    .code-block {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 1.25rem 1.5rem;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 0.8125rem;
+      line-height: 1.7;
+      color: var(--text-2);
+      overflow-x: auto;
+      margin-top: 1rem;
+    }
+    .code-block .kw  { color: var(--purple); }
+    .code-block .str { color: var(--green); }
+    .code-block .fn  { color: var(--cyan); }
+    .code-block .cm  { color: var(--text-3); }
+
+    /* ── MODELS ───────────────────────────────────────── */
+    #models { background: var(--bg); }
+
+    .models-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: 1rem;
+    }
+
+    .model-card {
+      display: flex; flex-direction: column; gap: 8px;
+      padding: 1.25rem;
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      transition: border-color 0.15s, transform 0.15s;
+    }
+    .model-card:hover { border-color: var(--border-2); transform: translateY(-2px); }
+
+    .model-name  { font-weight: 600; font-size: 0.9375rem; }
+    .model-sub   { font-size: 0.75rem; color: var(--text-3); }
+    .model-badge {
+      display: inline-flex;
+      width: fit-content;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.68rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .badge-default { background: rgba(34,211,238,0.12); color: var(--cyan); }
+    .badge-free    { background: rgba(74,222,128,0.12); color: var(--green); }
+    .badge-local   { background: rgba(129,140,248,0.12); color: var(--purple); }
+
+    /* ── CTA ──────────────────────────────────────────── */
+    #cta {
+      background: var(--bg-2);
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+    }
+    .cta-inner {
+      max-width: 1100px; margin: 0 auto;
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 2rem; flex-wrap: wrap;
+    }
+    .cta-inner h2 {
+      font-size: clamp(1.5rem, 3vw, 2.25rem);
+      font-weight: 700; letter-spacing: -0.025em;
+    }
+    .cta-actions { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .btn-outline {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 10px 20px;
+      border: 1px solid var(--border-2);
+      border-radius: var(--radius-sm);
+      color: var(--text);
+      font-weight: 500; font-size: 0.9375rem;
+      text-decoration: none;
+      transition: border-color 0.15s, background 0.15s;
+    }
+    .btn-outline:hover { border-color: var(--text-3); background: var(--bg-3); }
+
+    /* ── FOOTER ───────────────────────────────────────── */
+    footer {
+      padding: 2.5rem 2rem;
+      display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 1.5rem;
+    }
+    .footer-logo {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 1rem; font-weight: 500;
+      color: var(--text-2); text-decoration: none;
+    }
+    .footer-logo span { color: var(--cyan); }
+    .footer-links { display: flex; gap: 1.5rem; }
+    .footer-links a { color: var(--text-3); font-size: 0.8125rem; text-decoration: none; transition: color 0.15s; }
+    .footer-links a:hover { color: var(--text-2); }
+    .footer-copy { color: var(--text-3); font-size: 0.75rem; }
+
+    /* ── RESPONSIVE ───────────────────────────────────── */
+    @media (max-width: 640px) {
+      nav { padding: 0 1.25rem; }
+      .nav-links a:not(.btn-nav) { display: none; }
+      section { padding: 4rem 1.25rem; }
+      .cta-inner { flex-direction: column; }
+      footer { flex-direction: column; align-items: flex-start; }
+    }
+
+    /* ── DIVIDER ──────────────────────────────────────── */
+    .divider { border: none; border-top: 1px solid var(--border); margin: 0; }
+  </style>
+</head>
+<body>
+
+<!-- ── NAV ─────────────────────────────────────────────── -->
+<nav>
+  <a href="/" class="nav-logo">la<span>cuna</span></a>
+  <div class="nav-links">
+    <a href="#features">Features</a>
+    <a href="#how">How it works</a>
+    <a href="#models">Models</a>
+    <a href="https://github.com/lacuna-dev/lacuna" class="btn-nav" target="_blank" rel="noopener">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+      GitHub
+    </a>
+  </div>
+</nav>
+
+<!-- ── HERO ─────────────────────────────────────────────── -->
+<section class="hero">
+
+  <h1>Stop writing tests.<br><span class="grad">Let AI cover the gaps.</span></h1>
+
+  <p>Lacuna finds your uncovered code, writes real tests with AI, runs them, and retries until they pass — all from one command.</p>
+
+  <div class="hero-actions">
+    <div class="install-cmd" id="installCmd" onclick="copyInstall()">
+      <span class="prompt">$</span>
+      <span class="cmd">npm install -g lacuna</span>
+      <button class="copy-btn" aria-label="Copy">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+      </button>
+      <span class="copied-toast">Copied!</span>
+    </div>
+    <a href="https://github.com/lacuna-dev/lacuna" class="btn-primary" target="_blank" rel="noopener">
+      View on GitHub
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7M7 7h10v10"/></svg>
+    </a>
+  </div>
+
+  <!-- Terminal -->
+  <div class="terminal-wrap">
+    <div class="terminal-bar">
+      <div class="dot dot-r"></div>
+      <div class="dot dot-y"></div>
+      <div class="dot dot-g"></div>
+      <span class="terminal-title">lacuna generate</span>
+    </div>
+    <div class="terminal-body">
+      <div class="terminal-line"><span class="t-prompt">$ </span><span class="t-cmd">lacuna generate</span></div>
+      <div class="terminal-line">&nbsp;</div>
+      <div class="terminal-line"><span class="t-head">lacuna generate</span></div>
+      <div class="terminal-line">&nbsp;</div>
+      <div class="terminal-line"><span class="t-dim">Model:&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-cyan">claude-sonnet-4-6</span></div>
+      <div class="terminal-line"><span class="t-dim">Runner:&nbsp;&nbsp;&nbsp; </span><span class="t-cyan">vitest</span></div>
+      <div class="terminal-line"><span class="t-dim">Threshold: </span><span class="t-cyan">80%</span></div>
+      <div class="terminal-line">&nbsp;</div>
+      <div class="terminal-line indent"><span class="t-pass">✓ </span><span class="t-label">src/utils/math.ts&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">34% → 94%&nbsp;&nbsp; </span><span class="t-pass">generated 8 tests</span></div>
+      <div class="terminal-line indent"><span class="t-pass">✓ </span><span class="t-label">src/hooks/useAuth.ts&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">12% → 89%&nbsp;&nbsp; </span><span class="t-pass">generated 5 tests</span></div>
+      <div class="terminal-line indent"><span class="t-pass">✓ </span><span class="t-label">src/api/payments.ts&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">&nbsp;0% → 100% </span><span class="t-pass">generated 12 tests</span></div>
+      <div class="terminal-line indent"><span class="t-spinning">⠸ </span><span class="t-label">src/lib/formatters.ts&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-dim">generating</span><span class="t-blink">_</span></div>
+      <div class="terminal-line">&nbsp;</div>
+      <div class="terminal-line"><span class="t-bold">Results</span></div>
+      <div class="terminal-line indent"><span class="t-dim">Files processed: </span><span class="t-bold">4</span></div>
+      <div class="terminal-line indent"><span class="t-dim">Coverage:&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; </span><span class="t-bold">61% → </span><span class="t-pass">93% ↑</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── RUNNER SUPPORT ────────────────────────────────────── -->
+<div class="social-row">
+  <p>Works with</p>
+  <div class="runner-tags">
+    <span class="tag">Vitest</span>
+    <span class="tag">Jest</span>
+    <span class="tag">Mocha</span>
+    <span class="tag">Pytest</span>
+    <span class="tag">Go Test</span>
+    <span class="tag">TypeScript</span>
+    <span class="tag">JavaScript</span>
+    <span class="tag">Python</span>
+  </div>
+</div>
+
+<hr class="divider" />
+
+<!-- ── FEATURES ─────────────────────────────────────────── -->
+<section id="features">
+  <div class="container">
+    <h2 class="section-title">Everything you need to close the gap</h2>
+    <p class="section-sub">Lacuna isn't a code assistant that suggests tests. It's an autonomous agent that writes, runs, and verifies them — and recovers when something goes wrong.</p>
+
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon icon-cyan">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-5 1.5-5-2.5-7-3m14 6v-3.87a3.37 3.37 0 0 0-.94-2.61c3.14-.35 6.44-1.54 6.44-7A5.44 5.44 0 0 0 20 4.77 5.07 5.07 0 0 0 19.91 1S18.73.65 16 2.48a13.38 13.38 0 0 0-7 0C6.27.65 5.09 1 5.09 1A5.07 5.07 0 0 0 5 4.77a5.44 5.44 0 0 0-1.5 3.78c0 5.42 3.3 6.61 6.44 7A3.37 3.37 0 0 0 9 18.13V22"/></svg>
+        </div>
+        <h3>AI-powered generation</h3>
+        <p>Lacuna sends your source file, existing tests, type definitions, and project dependencies to the model — giving it everything needed to write real, meaningful tests.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-green">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        </div>
+        <h3>Verify and retry</h3>
+        <p>Every generated test is immediately run against your actual test suite. If it fails, lacuna records what went wrong and retries with negative constraints so it doesn't repeat the same mistake.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-purple">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        </div>
+        <h3>Fix failing tests</h3>
+        <p>Run <code style="font-family:'JetBrains Mono',monospace;color:var(--cyan);font-size:0.8em">lacuna fix</code> to repair existing failing tests without rewriting them. The model surgically fixes what's broken and leaves everything else untouched.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-cyan">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+        </div>
+        <h3>Parallel workers</h3>
+        <p>Process multiple files simultaneously with <code style="font-family:'JetBrains Mono',monospace;color:var(--cyan);font-size:0.8em">-w 4</code>. Each worker runs independently with a live status display showing what every worker is doing in real time.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-green">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        </div>
+        <h3>Safe by default</h3>
+        <p>If all retries fail or the model gets stuck, your original test file is automatically restored. Oscillation detection stops the loop early when the model is spinning in circles.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-purple">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
+        </div>
+        <h3>Any model, any provider</h3>
+        <p>Works with Claude, GPT-4o, Gemini, DeepSeek, Groq, OpenRouter, Ollama, and LM Studio — or any OpenAI-compatible API. Switch models with a single flag.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- ── HOW IT WORKS ──────────────────────────────────────── -->
+<section id="how">
+  <div class="container">
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:5rem;align-items:start;">
+      <div>
+        <h2 class="section-title">From zero to covered in one command</h2>
+        <p class="section-sub">Three steps. No configuration required to get started.</p>
+
+        <div class="steps">
+          <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-content">
+              <h3>Analyze your coverage</h3>
+              <p>Lacuna runs your test suite, reads the coverage report, and finds every file and function below your threshold — without touching any files.</p>
+            </div>
+          </div>
+          <div class="step-connector"></div>
+
+          <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-content">
+              <h3>Generate and verify</h3>
+              <p>For each gap, lacuna builds a full context — source code, type definitions, existing tests, imports, and mocks — then asks the model to write tests that actually exercise the behavior.</p>
+            </div>
+          </div>
+          <div class="step-connector"></div>
+
+          <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-content">
+              <h3>Retry until it passes</h3>
+              <p>Generated tests are run immediately. Failures are diagnosed, constraints are recorded, and the model retries with specific instructions not to repeat what failed.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="code-block">
+          <div><span class="cm"># install once</span></div>
+          <div><span class="fn">npm</span> install -g lacuna</div>
+          <div>&nbsp;</div>
+          <div><span class="cm"># in your project</span></div>
+          <div><span class="fn">lacuna</span> <span class="kw">init</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="cm"># interactive setup</span></div>
+          <div><span class="fn">lacuna</span> <span class="kw">analyze</span>&nbsp;&nbsp; <span class="cm"># see what's uncovered</span></div>
+          <div><span class="fn">lacuna</span> <span class="kw">generate</span>&nbsp; <span class="cm"># fill the gaps</span></div>
+          <div>&nbsp;</div>
+          <div><span class="cm"># target a single file (fast)</span></div>
+          <div><span class="fn">lacuna</span> <span class="kw">generate</span> -f <span class="str">src/utils/math.ts</span></div>
+          <div>&nbsp;</div>
+          <div><span class="cm"># fix failing tests</span></div>
+          <div><span class="fn">lacuna</span> <span class="kw">fix</span></div>
+          <div><span class="fn">lacuna</span> <span class="kw">fix</span> -f <span class="str">src/api/auth.test.ts</span></div>
+          <div>&nbsp;</div>
+          <div><span class="cm"># 4 files in parallel</span></div>
+          <div><span class="fn">lacuna</span> <span class="kw">generate</span> -w <span class="str">4</span></div>
+        </div>
+
+        <div style="margin-top:1rem;">
+          <div class="code-block">
+            <div><span class="cm"># .lacuna.json — optional config</span></div>
+            <div>{</div>
+            <div style="padding-left:1rem;"><span class="str">"model"</span>: <span class="str">"claude-sonnet-4-6"</span>,</div>
+            <div style="padding-left:1rem;"><span class="str">"testRunner"</span>: <span class="str">"vitest"</span>,</div>
+            <div style="padding-left:1rem;"><span class="str">"threshold"</span>: <span class="kw">80</span>,</div>
+            <div style="padding-left:1rem;"><span class="str">"mocksFile"</span>: <span class="str">"src/test/mocks.ts"</span></div>
+            <div>}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- ── MODELS ────────────────────────────────────────────── -->
+<section id="models">
+  <div class="container">
+    <h2 class="section-title">Use the model you already have</h2>
+    <p class="section-sub">Lacuna works with any AI provider. Bring your own API key, or run fully local with Ollama or LM Studio — no data leaves your machine.</p>
+
+    <div class="models-grid">
+      <div class="model-card">
+        <div class="model-name">Claude</div>
+        <div class="model-sub">Anthropic · Sonnet / Opus</div>
+        <span class="model-badge badge-default">Default</span>
+      </div>
+      <div class="model-card">
+        <div class="model-name">GPT-4o</div>
+        <div class="model-sub">OpenAI</div>
+      </div>
+      <div class="model-card">
+        <div class="model-name">Gemini</div>
+        <div class="model-sub">Google · 2.5 Pro / Flash</div>
+      </div>
+      <div class="model-card">
+        <div class="model-name">DeepSeek</div>
+        <div class="model-sub">Chat / Reasoner · Cheap</div>
+      </div>
+      <div class="model-card">
+        <div class="model-name">Groq</div>
+        <div class="model-sub">Llama 3.3 70B</div>
+        <span class="model-badge badge-free">Free tier</span>
+      </div>
+      <div class="model-card">
+        <div class="model-name">OpenRouter</div>
+        <div class="model-sub">100+ models, one key</div>
+      </div>
+      <div class="model-card">
+        <div class="model-name">Ollama</div>
+        <div class="model-sub">Any local model</div>
+        <span class="model-badge badge-local">Fully local</span>
+      </div>
+      <div class="model-card">
+        <div class="model-name">LM Studio</div>
+        <div class="model-sub">Any local model</div>
+        <span class="model-badge badge-local">Fully local</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
+<!-- ── CTA ───────────────────────────────────────────────── -->
+<section id="cta">
+  <div class="cta-inner">
+    <h2>Ship with confidence.<br>Coverage handled.</h2>
+    <div class="cta-actions">
+      <a href="https://github.com/lacuna-dev/lacuna" class="btn-primary" target="_blank" rel="noopener">
+        Get started free
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7M7 7h10v10"/></svg>
+      </a>
+      <a href="https://github.com/lacuna-dev/lacuna#readme" class="btn-outline" target="_blank" rel="noopener">Read the docs</a>
+    </div>
+  </div>
+</section>
+
+<!-- ── FOOTER ─────────────────────────────────────────────── -->
+<footer>
+  <a href="/" class="footer-logo">la<span>cuna</span></a>
+  <div class="footer-links">
+    <a href="https://github.com/lacuna-dev/lacuna" target="_blank" rel="noopener">GitHub</a>
+    <a href="https://github.com/lacuna-dev/lacuna#readme" target="_blank" rel="noopener">Docs</a>
+    <a href="https://www.npmjs.com/package/lacuna" target="_blank" rel="noopener">npm</a>
+    <a href="https://github.com/lacuna-dev/lacuna/issues" target="_blank" rel="noopener">Issues</a>
+  </div>
+  <span class="footer-copy">MIT License · Made by <a href="https://github.com/lacuna-dev" style="color:inherit;text-decoration:none;">lacuna-dev</a></span>
+</footer>
+
+<script>
+  function copyInstall() {
+    navigator.clipboard.writeText('npm install -g lacuna').then(() => {
+      const el = document.getElementById('installCmd')
+      el.classList.add('copied')
+      setTimeout(() => el.classList.remove('copied'), 1800)
+    })
+  }
+
+  // Responsive: collapse two-col how-it-works on mobile
+  function checkLayout() {
+    const grid = document.querySelector('#how .container > div')
+    if (!grid) return
+    if (window.innerWidth < 800) {
+      grid.style.gridTemplateColumns = '1fr'
+      grid.style.gap = '3rem'
+    } else {
+      grid.style.gridTemplateColumns = '1fr 1fr'
+      grid.style.gap = '5rem'
+    }
+  }
+  checkLayout()
+  window.addEventListener('resize', checkLayout)
+</script>
+
+</body>
+</html>
