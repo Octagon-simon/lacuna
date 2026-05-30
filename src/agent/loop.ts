@@ -228,7 +228,13 @@ async function processGap(
   }
 
   onStatus?.({ phase: 'failed', file: shortPath })
-  await restoreTestFile(context.suggestedTestFile, originalTestContent)
+  if (originalTestContent !== null) {
+    // Pre-existing file — restore it so the workspace stays coherent
+    await restoreTestFile(context.suggestedTestFile, originalTestContent)
+  } else {
+    // New file — keep the last attempt on disk so `lacuna fix` can repair it
+    if (!onStatus) log(chalk.yellow(`\n  Last attempt kept at ${shortPath} — run ${chalk.cyan('lacuna fix')} to repair it`))
+  }
   return {
     success: false,
     error: `Tests still failing after ${config.maxIterations} attempts. Last error:\n${lastError?.slice(0, 1500)}`,
