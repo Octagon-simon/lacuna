@@ -1,6 +1,6 @@
-name: lacuna
+name: lacuna-cli
 description: Agentic test coverage — find gaps, generate tests, verify they pass, report on PRs
-author: lacuna-dev
+author: octagon-simon
 
 branding:
   icon: shield
