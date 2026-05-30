@@ -16,7 +16,7 @@ inputs:
     required: false
     default: '80'
   model:
-    description: Claude model to use
+    description: "Model to use — any lacuna preset: claude-sonnet-4-6, claude-opus-4-7, gpt-4o, gemini, gemini-flash, deepseek, deepseek-r1, groq, openrouter, ollama. Or pass a full model name."
     required: false
     default: claude-sonnet-4-6
   source-dir:
@@ -28,7 +28,22 @@ inputs:
     required: false
     default: coverage
   anthropic-api-key:
-    description: Anthropic API key (required for generate mode)
+    description: Anthropic API key — required when using Claude models
+    required: false
+  openai-api-key:
+    description: OpenAI API key — required when using GPT-4o
+    required: false
+  gemini-api-key:
+    description: Google Gemini API key — required when using Gemini models
+    required: false
+  deepseek-api-key:
+    description: DeepSeek API key — required when using DeepSeek models
+    required: false
+  groq-api-key:
+    description: Groq API key — required when using Groq models
+    required: false
+  openrouter-api-key:
+    description: OpenRouter API key — required when using OpenRouter
     required: false
   github-token:
     description: GitHub token for posting PR comments and status checks
@@ -67,11 +82,17 @@ runs:
       shell: bash
       run: |
         lacuna ${{ inputs.mode }} \
+          --model ${{ inputs.model }} \
           --format json \
           --output lacuna-report.json \
           --threshold ${{ inputs.threshold }}
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        OPENAI_API_KEY: ${{ inputs.openai-api-key }}
+        GEMINI_API_KEY: ${{ inputs.gemini-api-key }}
+        DEEPSEEK_API_KEY: ${{ inputs.deepseek-api-key }}
+        GROQ_API_KEY: ${{ inputs.groq-api-key }}
+        OPENROUTER_API_KEY: ${{ inputs.openrouter-api-key }}
 
     - name: Parse report outputs
       id: report
