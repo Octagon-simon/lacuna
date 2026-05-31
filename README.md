@@ -292,13 +292,19 @@ jobs:
       - run: npm ci
 
       - name: Run lacuna
+        id: lacuna
         uses: Octagon-simon/lacuna@v1
+        continue-on-error: true         # allow commit step to run even if coverage is below threshold
         with:
           threshold: 80
-          model: claude-sonnet-4-6        # any lacuna preset or model name
+          workers: 2                    # parallel workers — increase for larger repos
+          model: claude-sonnet-4-6      # any lacuna preset or model name
           anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
 
+      # Runs even when lacuna exits with code 1 (below threshold) so generated
+      # tests are never lost. Skips the commit if nothing was written.
       - name: Commit generated tests
+        if: steps.lacuna.outcome != 'cancelled'
         run: |
           git config user.name "lacuna[bot]"
           git config user.email "lacuna[bot]@users.noreply.github.com"
@@ -361,8 +367,8 @@ lacuna analyze --format markdown
 | Code | Meaning |
 |---|---|
 | `0` | Pass — coverage meets threshold |
-| `1` | Fail — coverage below threshold |
-| `2` | Error — test runner failed or config issue |
+| `1` | Fail — coverage below threshold or some files could not be tested |
+| `2` | Error — test runner failed, config issue, or zero tests generated |
 
 ---
 

@@ -231,9 +231,11 @@ export function getExitCode(input: ReportInput): number {
   if (input.type === 'generate') {
     const r = input.generate
     if (!r) return EXIT.ERROR
-    if (r.errors.length > 0) return EXIT.ERROR
+    // Hard error only when nothing was generated at all — partial success (some files
+    // failed, others passed) is BELOW_THRESHOLD so downstream steps (e.g. commit) still run.
+    if (r.errors.length > 0 && r.testsWritten === 0) return EXIT.ERROR
     if (!r.hasCoverage) {
-      return r.testsWritten === r.filesProcessed ? EXIT.OK : EXIT.BELOW_THRESHOLD
+      return r.testsWritten === r.filesProcessed && r.errors.length === 0 ? EXIT.OK : EXIT.BELOW_THRESHOLD
     }
     return r.coverageAfter >= input.threshold ? EXIT.OK : EXIT.BELOW_THRESHOLD
   }
