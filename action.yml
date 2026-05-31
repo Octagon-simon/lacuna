@@ -49,6 +49,10 @@ inputs:
     description: GitHub token for posting PR comments and status checks
     required: false
     default: ${{ github.token }}
+  workers:
+    description: Number of parallel workers (each handles one file at a time)
+    required: false
+    default: '1'
   post-comment:
     description: Post a coverage report comment on the PR
     required: false
@@ -85,7 +89,8 @@ runs:
           --model ${{ inputs.model }} \
           --format json \
           --output lacuna-report.json \
-          --threshold ${{ inputs.threshold }}
+          --threshold ${{ inputs.threshold }} \
+          --workers ${{ inputs.workers }}
       env:
         ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
         OPENAI_API_KEY: ${{ inputs.openai-api-key }}

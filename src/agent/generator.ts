@@ -93,17 +93,22 @@ function parseStructuredResponse(raw: string): { hypothesis: string; code: strin
   const thinkingMatch = raw.match(/<thinking>([\s\S]*?)<\/thinking>/i)
   const hypothesis = thinkingMatch ? thinkingMatch[1].trim() : ''
 
-  // Closed tag present (stop sequence not in effect, or model included it anyway)
-  const codeMatch = raw.match(/<code_output>([\s\S]*?)<\/code_output>/i)
-  if (codeMatch) {
-    const code = codeMatch[1].trim()
-    return { hypothesis, code, truncated: isCodeIncomplete(code) }
-  }
+  // The real <code_output> delimiter is always on its own line (preceded by \n or start-of-string).
+  // References to it inside planning text ("output in <code_output> tags") appear mid-sentence,
+  // never on their own line. Use a line-anchored search to skip prose mentions entirely.
+  const lineAnchoredOpen = /(?:^|\n)<code_output>[ \t]*(?:\n|$)/i
+  const lineAnchoredClose = /(?:^|\n)<\/code_output>[ \t]*(?:\n|$)/i
 
-  // Opening tag present, no closing tag — normal when stop sequence fires cleanly
-  const openIdx = raw.search(/<code_output>/i)
-  if (openIdx !== -1) {
-    const code = raw.slice(openIdx + '<code_output>'.length).trim()
+  const openMatch = lineAnchoredOpen.exec(raw)
+  if (openMatch) {
+    const openEnd = openMatch.index + openMatch[0].length
+    const closeMatch = lineAnchoredClose.exec(raw.slice(openEnd))
+    if (closeMatch) {
+      const code = raw.slice(openEnd, openEnd + closeMatch.index).trim()
+      return { hypothesis, code, truncated: isCodeIncomplete(code) }
+    }
+    // No closing tag — normal when stop sequence fires cleanly
+    const code = raw.slice(openEnd).trim()
     return { hypothesis, code, truncated: isCodeIncomplete(code) }
   }
 
