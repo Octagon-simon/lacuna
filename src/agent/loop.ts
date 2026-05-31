@@ -342,6 +342,19 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       ? options.targetFile
       : join(cwd, options.targetFile)
 
+    // Fail fast if the user passed a test file instead of a source file.
+    const isTestPath = /\.(test|spec)\.[jt]sx?$/.test(abs)
+      || abs.includes('__tests__/')
+      || /\/test_[^/]+\.[jt]sx?$/.test(abs)
+      || abs.endsWith('_test.go')
+    if (isTestPath) {
+      throw new Error(
+        `"${options.targetFile}" looks like a test file, not a source file.\n` +
+        `Pass the source file you want tests generated for.\n` +
+        `Example: lacuna generate --file ${options.targetFile.replace(/__tests__\//, '').replace(/\.(test|spec)(\.[jt]sx?)$/, '$2')}`,
+      )
+    }
+
     const gap: CoverageGap = {
       filePath: abs,
       uncoveredLines: [],
