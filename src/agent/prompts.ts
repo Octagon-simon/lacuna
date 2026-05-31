@@ -1,6 +1,124 @@
 import type { DetectedEnvironment } from '../lib/detector.js'
 import { buildSourceSkeleton, shouldUseSkeleton } from '../lib/skeleton.js'
 
+// Extracts module names that are already globally mocked in the setup file.
+// Used to tell the agent "don't mock these again" to avoid double-mock conflicts.
+function extractGlobalNextMocks(setupCode: string): string[] {
+  const mocked: string[] = []
+  for (const m of setupCode.matchAll(/vi\.mock\(['"]([^'"]+)['"]/g)) {
+    mocked.push(m[1])
+  }
+  return [...new Set(mocked)]
+}
+
+// ─── Next.js import analyser ─────────────────────────────────────────────────
+// Detects Next.js-specific imports that Vitest cannot resolve without mocking.
+
+interface NextJsAnalysis {
+  hasNavigation: boolean           // next/navigation (useRouter, usePathname, etc.)
+  hasHeaders: boolean              // next/headers (cookies, headers — server-only)
+  hasCache: boolean                // next/cache (unstable_cache, revalidatePath, etc.)
+  clientModules: string[]          // imports ending in .client — Next.js client boundary
+  serverModules: string[]          // imports ending in .server — Next.js server boundary
+  sessionProviders: string[]       // imports from */providers/*session* or useSession patterns
+}
+
+function analyzeNextJs(sourceCode: string): NextJsAnalysis {
+  const hasNavigation = /from\s+['"]next\/navigation['"]/.test(sourceCode)
+  const hasHeaders    = /from\s+['"]next\/headers['"]/.test(sourceCode)
+  const hasCache      = /from\s+['"]next\/cache['"]/.test(sourceCode)
+
+  const clientModules: string[] = []
+  for (const m of sourceCode.matchAll(/from\s+['"]([^'"]+\.client)['"]/g)) clientModules.push(m[1])
+
+  const serverModules: string[] = []
+  for (const m of sourceCode.matchAll(/from\s+['"]([^'"]+\.server)['"]/g)) serverModules.push(m[1])
+
+  const sessionProviders: string[] = []
+  for (const m of sourceCode.matchAll(/from\s+['"]([^'"]*(?:session|auth)[^'"]*)['"]/gi)) {
+    const p = m[1]
+    if (!p.startsWith('next-auth') && !p.startsWith('@auth')) sessionProviders.push(p)
+  }
+
+  return { hasNavigation, hasHeaders, hasCache, clientModules, serverModules, sessionProviders }
+}
+
+function buildNextJsGuidance(a: NextJsAnalysis): string | null {
+  if (!a.hasNavigation && !a.hasHeaders && !a.hasCache && !a.clientModules.length && !a.serverModules.length && !a.sessionProviders.length) return null
+
+  const lines: string[] = [
+    'NEXT.JS MOCKING (critical — Vitest cannot resolve these modules without explicit mocks):',
+  ]
+
+  if (a.hasNavigation) {
+    lines.push(
+      "Mock next/navigation — required for any component that uses useRouter, usePathname, useSearchParams, or useParams (skip if already listed as globally mocked above):",
+      "  vi.mock('next/navigation', () => ({",
+      "    useRouter:       vi.fn(() => ({ push: vi.fn(), replace: vi.fn(), back: vi.fn(), forward: vi.fn() })),",
+      "    usePathname:     vi.fn(() => '/'),",
+      "    useSearchParams: vi.fn(() => new URLSearchParams()),",
+      "    useParams:       vi.fn(() => ({})),",
+      "    redirect:        vi.fn(),",
+      "  }))",
+    )
+  }
+
+  if (a.hasHeaders) {
+    lines.push(
+      "Mock next/headers — it is server-only and will throw in Vitest:",
+      "  vi.mock('next/headers', () => ({",
+      "    cookies:  vi.fn(() => ({ get: vi.fn(), set: vi.fn(), delete: vi.fn(), has: vi.fn() })),",
+      "    headers:  vi.fn(() => new Headers()),",
+      "  }))",
+    )
+  }
+
+  if (a.hasCache) {
+    lines.push(
+      "Mock next/cache — revalidatePath, revalidateTag, unstable_cache are no-ops in tests:",
+      "  vi.mock('next/cache', () => ({",
+      "    revalidatePath:  vi.fn(),",
+      "    revalidateTag:   vi.fn(),",
+      "    unstable_cache:  vi.fn((fn: () => unknown) => fn),",
+      "  }))",
+    )
+  }
+
+  if (a.clientModules.length > 0) {
+    lines.push(
+      `The source imports .client boundary files that Vitest cannot resolve: ${a.clientModules.join(', ')}`,
+      "Mock each one by its EXACT import path as it appears in the source file. Export every function the source uses as a vi.fn():",
+      ...a.clientModules.map(p => `  vi.mock('${p}', () => ({ /* each exported function: myFn: vi.fn() */ }))`),
+      "Do not try to import the real .client file — it will always fail in Vitest.",
+    )
+  }
+
+  if (a.serverModules.length > 0) {
+    lines.push(
+      `The source imports .server boundary files that Vitest cannot resolve: ${a.serverModules.join(', ')}`,
+      "Mock each one the same way as .client files:",
+      ...a.serverModules.map(p => `  vi.mock('${p}', () => ({ /* each exported function: myFn: vi.fn() */ }))`),
+    )
+  }
+
+  if (a.sessionProviders.length > 0) {
+    lines.push(
+      `The source imports session/auth providers: ${a.sessionProviders.join(', ')}`,
+      "Mock them and return a controlled session object:",
+      `  vi.mock('${a.sessionProviders[0]}', () => ({`,
+      "    useSession: vi.fn(() => ({ user: { id: 'user-1', email: 'test@example.com' }, status: 'authenticated' })),",
+      "    getSession: vi.fn(() => Promise.resolve({ user: { id: 'user-1' } })),",
+      "  }))",
+    )
+  }
+
+  lines.push(
+    "If Vitest still reports 'Failed to resolve import', the mock path does not exactly match the import in the source. Copy it character-for-character.",
+  )
+
+  return lines.join('\n')
+}
+
 // ─── Network dependency analyser ─────────────────────────────────────────────
 // Scans source code and returns guidance the AI must follow to avoid real requests.
 
@@ -30,6 +148,78 @@ function analyzeNetworkDeps(sourceCode: string): NetworkAnalysis {
   }
 
   return { usesAxios, usesFetch, usesCustomInstance, apiModuleImports }
+}
+
+// Detects thinking-bleed parse errors: model wrote reasoning inside <code_output>
+// causing the file to start with prose instead of TypeScript.
+function detectThinkingBleed(errorOutput: string): string | null {
+  // Vitest/esbuild parse errors at line 1 with non-code content are a strong signal
+  const parseErr = errorOutput.match(/PARSE_ERROR|Unexpected token|SyntaxError.*\b1:\d+\b/)
+  if (!parseErr) return null
+  // Check if the error context shows non-TypeScript at the file start
+  const contextLine = errorOutput.match(/^\s*1\s*[│|]\s*(.+)/m)
+  if (!contextLine) return null
+  const firstLine = contextLine[1].trim()
+  // If first line looks like prose (no import/export/const/vi./etc.)
+  if (/^(import|export|const|let|var|\/\/|\/\*|describe|it\s*\(|test\s*\(|vi\.|jest\.)/.test(firstLine)) return null
+  return [
+    `THINKING BLEED DETECTED — your previous response had reasoning text inside <code_output>.`,
+    `The file started with: "${firstLine.slice(0, 80)}"`,
+    `This is not valid TypeScript and caused a parse error at line 1.`,
+    `RULE: finish ALL reasoning inside <thinking> first. Once <code_output> opens, the very first character must be valid code — an import, function definition, comment (//, #), or similar construct for the project's language.`,
+    `Do NOT continue thinking inside <code_output> under any circumstances.`,
+  ].join('\n')
+}
+
+// Scans error output for Next.js import resolution failures (Failed to resolve import).
+function detectNextJsImportError(errorOutput: string): string | null {
+  const failedImport = errorOutput.match(/Failed to resolve import "([^"]+)"/)
+  if (!failedImport) return null
+
+  const importPath = failedImport[1]
+  const isAlias = importPath.startsWith('@/')
+  const isClient = importPath.endsWith('.client')
+  const isServer = importPath.endsWith('.server')
+  const isNextInternal = importPath.startsWith('next/')
+  const isProviderOrSession = /session|auth|provider/i.test(importPath)
+
+  if (!isAlias && !isClient && !isServer && !isNextInternal && !isProviderOrSession) return null
+
+  const lines = [
+    `IMPORT RESOLUTION ERROR — Vitest cannot resolve "${importPath}".`,
+  ]
+
+  if (isAlias) {
+    lines.push(
+      `The "@/" alias is not configured in vitest.config.ts — you cannot fix this by changing the test file.`,
+      `WORKAROUND: use the pre-computed relative paths from LOCAL IMPORT PATHS in your vi.mock() calls instead of "@/" paths.`,
+      `  WRONG:   vi.mock('@/components/ui/button', ...)`,
+      `  CORRECT: vi.mock('../../../components/ui/button', ...)  ← use the relative path from LOCAL IMPORT PATHS`,
+      `Do NOT attempt to add resolve aliases inside the test file — that does not work.`,
+      `Do NOT switch import statements to relative paths — only vi.mock() calls need to change.`,
+    )
+  } else if (isClient || isServer) {
+    lines.push(
+      `This is a Next.js ${isClient ? 'client' : 'server'} boundary file. Vitest never resolves these — mock it with the exact import path from the source file:`,
+      `  vi.mock('${importPath}', () => ({`,
+      `    // each function the source imports: myFn: vi.fn()`,
+      `  }))`,
+    )
+  } else if (isNextInternal) {
+    lines.push(
+      `${importPath} is a Next.js internal that does not work in Vitest. Mock it:`,
+      `  vi.mock('${importPath}', () => ({ /* relevant exports as vi.fn() */ }))`,
+    )
+  } else if (isProviderOrSession) {
+    lines.push(
+      `This looks like a session or auth provider that Vitest cannot resolve. Mock it:`,
+      `  vi.mock('${importPath}', () => ({`,
+      `    useSession: vi.fn(() => ({ user: { id: 'user-1', email: 'test@example.com' }, status: 'authenticated' })),`,
+      `  }))`,
+    )
+  }
+
+  return lines.join('\n')
 }
 
 // Scans error output for an unhandled rejection caused by mockRejectedValueOnce.
@@ -144,11 +334,16 @@ Your tests catch real bugs. You think about what could go wrong — null inputs,
 RULES — follow every one:
 1. Write tests that verify real behavior: correctness, edge cases, boundary values, and error handling. Never write empty or trivial assertions (e.g. expect(true).toBe(true)).
 2. Match the EXACT import style shown in the existing test file or PROJECT TEST EXAMPLES. If none exists, use the style from the source file.
-3. Use path aliases from the PROJECT TYPESCRIPT CONFIG section (e.g. "@/components/Button" not "../../components/Button").
+3. Use path aliases from the PROJECT TYPESCRIPT CONFIG section in IMPORT statements (e.g. "@/components/Button" not "../../components/Button").
+   EXCEPTION — vi.mock() call paths: use the exact same path string that appears in the SOURCE FILE'S import statement.
+   If a LOCAL IMPORT PATHS section is provided, use those pre-computed relative paths in vi.mock() calls — they are the fallback when aliases cannot be resolved by Vitest.
+   Never second-guess the pre-computed paths. Never convert them back to @/ aliases in vi.mock() calls.
 4. Only import from packages listed in PROJECT DEPENDENCIES. Do not invent packages that are not listed.
 5. When a SHARED MOCK FILE is provided, its exported names are listed under "Available exports". Before writing the test, go through that list and identify every mock that relates to what the source file does (by name, type, or domain). Import and use ALL of those mocks. Never re-create inline vi.fn() / jest.fn() for anything already exported from the mocks file.
+   CRITICAL — never rename or change the casing of existing mock exports. If the mocks file has mockValidationError, use exactly mockValidationError — do NOT change it to MockValidationError or any other variant. Renaming an existing mock breaks every test that already imports it by the original name.
 6. If you need a mock that is missing from the shared mock file, add it to that file AND import it in the test. Return BOTH files separated by exactly one line containing only: // ---MOCKS_FILE---
 7. If a SHARED MOCK FILE (does not exist yet) section is shown — create it for any mocks you need and return it using the // ---MOCKS_FILE--- separator.
+   CRITICAL — the mocks file must contain ONLY: vi.fn()/jest.fn() mock definitions, vi.mock() module stubs, shared mock objects/constants, and beforeEach reset hooks. NEVER write describe(), it(), test(), or expect() calls in the mocks file. Those belong exclusively in the test file. A mocks file that contains test blocks will break the entire test suite.
 8. If a TEST SETUP FILE is shown, assume its globals and matchers are already available (e.g. expect(...).toBeInTheDocument()). Do NOT import or re-declare them.
 9. TypeScript type safety: all test code must compile without type errors.
    - Check PROJECT TYPESCRIPT CONFIG for strict flags — if strict or noImplicitAny is set, every value must be properly typed.
@@ -167,8 +362,18 @@ RULES — follow every one:
     <code_output>
     // complete test file here
     </code_output>
+    CRITICAL: Once you open <code_output>, ALL remaining output must be code. Never continue reasoning, writing bullet points,
+    or restating the problem inside <code_output>. If you are still uncertain, finish your reasoning inside <thinking> first,
+    then commit to a solution and write only code inside <code_output>. Thinking inside <code_output> corrupts the output file.
 12. Inside <code_output>: do NOT wrap in markdown code fences.
 13. Inside <code_output>: output ONLY the test file content (or test file // ---MOCKS_FILE--- mocks file).
+    If you use // ---MOCKS_FILE---, everything AFTER the separator is the mocks file. The mocks file must contain ONLY:
+    vi.fn()/jest.fn() mock definitions, vi.mock() module stubs, shared constants, and beforeEach resets.
+    NEVER put describe(), it(), test(), or expect() calls after the separator — those belong BEFORE it, in the test file.
+    Writing test blocks in the mocks section corrupts the shared mock file for every other test in the project.
+14. NEVER output vitest.config.ts, jest.config.js, or any framework configuration. If an import cannot be resolved,
+    fix it by mocking it with vi.mock() — NOT by modifying the test runner configuration. You cannot modify config
+    files from here, and outputting them will cause the entire mocks file to be discarded.
 
 A good test suite you write will have:
 - A happy-path test that confirms the main behavior works
@@ -255,7 +460,7 @@ export function buildGeneratePrompt(args: {
   }
 
   if (localImportPaths && localImportPaths.length > 0) {
-    parts.push('\nLOCAL IMPORT PATHS (pre-computed relative to the test file — use these exact strings in vi.mock() calls, do NOT recount directory levels yourself):')
+    parts.push('\nLOCAL IMPORT PATHS (pre-computed relative to the test file — use EXACTLY these strings in vi.mock() calls, even if the source file uses @/ aliases. Vitest resolves vi.mock() paths relative to the test file, not via tsconfig aliases. Do NOT convert these back to @/ paths in vi.mock(). Do NOT recount directory levels yourself.):')
     for (const p of localImportPaths) parts.push(`  ${p}`)
   }
 
@@ -267,7 +472,11 @@ export function buildGeneratePrompt(args: {
   }
 
   if (setupFileCode) {
-    parts.push('\nTEST SETUP FILE (already loaded before every test — do NOT import it again):')
+    const nextMocked = extractGlobalNextMocks(setupFileCode)
+    const setupNote = nextMocked.length > 0
+      ? `\nTEST SETUP FILE (already loaded before every test — do NOT import it again):\nThe following modules are ALREADY mocked globally in this setup file — do NOT add vi.mock() for them in the test: ${nextMocked.join(', ')}`
+      : `\nTEST SETUP FILE (already loaded before every test — do NOT import it again):`
+    parts.push(setupNote)
     parts.push('```')
     parts.push(setupFileCode)
     parts.push('```')
@@ -279,20 +488,21 @@ export function buildGeneratePrompt(args: {
       parts.push(`\nSHARED MOCK FILE (import from: '${mocksImportPath}')`)
       if (exports.length > 0) {
         parts.push(`Available exports: ${exports.join(', ')}`)
-        parts.push(`↑ Before writing the test, identify which of these match the source file's domain and import every relevant one. Do NOT create inline mocks for anything already in this list.`)
+        parts.push(`↑ Before writing the test, identify which of these match the source file's domain and import every relevant one. Do NOT create inline mocks for anything already in this list.\n↑ NAMES ARE FROZEN — use each export exactly as spelled above. Never rename, recase, or restructure an existing mock (e.g. do not change mockFoo → MockFoo or const → class). Renaming breaks every other test that imports the original name.`)
       }
       parts.push('```')
       parts.push(mocksCode)
       parts.push('```')
     } else {
-      parts.push(`\nSHARED MOCK FILE (does not exist yet) — create it if you need mocks, return it via the // ---MOCKS_FILE--- separator. Path: '${mocksImportPath}'`)
+      parts.push(`\nSHARED MOCK FILE (does not exist yet) — create it if you need mocks, return it via the // ---MOCKS_FILE--- separator. Path: '${mocksImportPath}'\n⚠ Mocks file must contain ONLY vi.fn()/vi.mock() definitions and beforeEach resets — NEVER describe/it/test/expect blocks.`)
     }
   }
 
   const networkGuidance = buildNetworkMockingGuidance(analyzeNetworkDeps(sourceCode), sourceFile)
-  if (networkGuidance) {
-    parts.push(`\n${networkGuidance}`)
-  }
+  if (networkGuidance) parts.push(`\n${networkGuidance}`)
+
+  const nextGuidance = buildNextJsGuidance(analyzeNextJs(sourceCode))
+  if (nextGuidance) parts.push(`\n${nextGuidance}`)
 
   const displaySource = buildSourceSkeleton(sourceCode, uncoveredFunctions)
   const skeletonized = shouldUseSkeleton(sourceCode)
@@ -371,7 +581,7 @@ export function buildFixPrompt(args: {
   }
 
   if (localImportPaths && localImportPaths.length > 0) {
-    parts.push('\nLOCAL IMPORT PATHS (pre-computed relative to the test file — use these exact strings in vi.mock() calls, do NOT recount directory levels yourself):')
+    parts.push('\nLOCAL IMPORT PATHS (pre-computed relative to the test file — use EXACTLY these strings in vi.mock() calls, even if the source file uses @/ aliases. Vitest resolves vi.mock() paths relative to the test file, not via tsconfig aliases. Do NOT convert these back to @/ paths in vi.mock(). Do NOT recount directory levels yourself.):')
     for (const p of localImportPaths) parts.push(`  ${p}`)
   }
 
@@ -401,15 +611,16 @@ export function buildFixPrompt(args: {
       parts.push(mocksCode)
       parts.push('```')
     } else {
-      parts.push(`\nSHARED MOCK FILE (does not exist yet) — create it if you need mocks, return it via the // ---MOCKS_FILE--- separator. Path: '${mocksImportPath}'`)
+      parts.push(`\nSHARED MOCK FILE (does not exist yet) — create it if you need mocks, return it via the // ---MOCKS_FILE--- separator. Path: '${mocksImportPath}'\n⚠ Mocks file must contain ONLY vi.fn()/vi.mock() definitions and beforeEach resets — NEVER describe/it/test/expect blocks.`)
     }
   }
 
   if (sourceFile && sourceCode) {
     const networkGuidance = buildNetworkMockingGuidance(analyzeNetworkDeps(sourceCode), sourceFile)
-    if (networkGuidance) {
-      parts.push(`\n${networkGuidance}`)
-    }
+    if (networkGuidance) parts.push(`\n${networkGuidance}`)
+
+    const nextGuidance = buildNextJsGuidance(analyzeNextJs(sourceCode))
+    if (nextGuidance) parts.push(`\n${nextGuidance}`)
 
     // For fix: skeleton with no function expansion — the test already tells the AI
     // which function matters; showing signatures is enough to understand the API.
@@ -442,6 +653,12 @@ export function buildFixPrompt(args: {
 
   const rejectionWarning = detectUnhandledRejection(errorOutput)
   if (rejectionWarning) parts.push(`\n⚠️  ${rejectionWarning}`)
+
+  const nextImportWarning = detectNextJsImportError(errorOutput)
+  if (nextImportWarning) parts.push(`\n⚠️  ${nextImportWarning}`)
+
+  const bleedWarning = detectThinkingBleed(errorOutput)
+  if (bleedWarning) parts.push(`\n⚠️  ${bleedWarning}`)
 
   // Detect wrong mock pattern: test uses vi.mock('axios') but source uses axios.create()
   const testHasAxiosMock = /vi\.mock\(['"]axios['"]\)/.test(testCode)
@@ -495,6 +712,12 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
 
   const rejectionWarning = detectUnhandledRejection(failureOutput)
   if (rejectionWarning) parts.push(`\n⚠️  ${rejectionWarning}`)
+
+  const nextImportWarning = detectNextJsImportError(failureOutput)
+  if (nextImportWarning) parts.push(`\n⚠️  ${nextImportWarning}`)
+
+  const bleedWarning = detectThinkingBleed(failureOutput)
+  if (bleedWarning) parts.push(`\n⚠️  ${bleedWarning}`)
 
   parts.push('')
   parts.push('Common causes:')

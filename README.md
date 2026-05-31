@@ -49,8 +49,11 @@ npm install -g lacuna-cli
 ## Quick start
 
 ```bash
+lacuna --version   # or -V
+lacuna --help      # or -h
+
 cd your-project
-lacuna init        # interactive setup wizard
+lacuna init        # interactive setup wizard — installs test runner if missing
 lacuna analyze     # see what's uncovered (read-only)
 lacuna generate    # AI fills the gaps
 ```
@@ -60,8 +63,14 @@ lacuna generate    # AI fills the gaps
 ## Commands
 
 ### `lacuna init`
-Interactive setup wizard. Configures your model, test runner, coverage threshold, and mock file.
-Creates `.lacuna.json` in your project root.
+Interactive setup wizard. Configures your model, test runner, source directory, coverage threshold, and mock file. Creates `.lacuna.json` in your project root.
+
+Works from any subdirectory — lacuna finds the project root automatically.
+
+For **React and Next.js** projects, `lacuna init` also:
+- Installs `@testing-library/react`, `@testing-library/jest-dom`, `@testing-library/user-event`, and `jsdom`
+- Creates `vitest.config.ts` with the correct `environment: 'jsdom'` and `@/` alias (read from your `tsconfig.json`)
+- Creates a setup file pre-loaded with global `vi.mock()` calls for `next/navigation`, `next/headers`, and `next/cache` so individual tests don't need to mock them
 
 ```bash
 lacuna init
@@ -157,7 +166,7 @@ Created by `lacuna init`. All fields are optional with sensible defaults.
 | `testRunner` | auto-detect | `jest` \| `vitest` \| `pytest` \| `mocha` \| `go-test` |
 | `coverageFormat` | `lcov` | `lcov` \| `json-summary` |
 | `coverageDir` | `coverage` | Where your test runner writes coverage |
-| `sourceDir` | `src` | Root directory of source files |
+| `sourceDir` | `src` | Root directory of source files — set during `lacuna init` |
 | `threshold` | `80` | Minimum line coverage % to pass |
 | `maxIterations` | `3` | How many times to retry a failing generated test |
 | `coverageTimeout` | `300` | Seconds before the test suite is killed (prevents hanging on open handles) |
