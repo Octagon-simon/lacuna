@@ -14,7 +14,7 @@ import { TestGenerator, TruncatedOutputError, OscillationError, TRUNCATION_RETRY
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile } from '../lib/typecheck.js'
-import { hasTestFunctions, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage } from '../lib/validate.js'
+import { hasTestFunctions, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -261,6 +261,13 @@ async function fixFile(
       return { success: true }
     }
 
+    // Strip thinking/prose that leaked before the first real code line.
+    const { code: cleanFixed, stripped: bleedText } = stripLeadingProse(fixed)
+    if (bleedText !== null) {
+      if (!onStatus) log(chalk.yellow(`  ⚠ Thinking bleed detected — stripped: "${bleedText.slice(0, 80)}…"`))
+      fixed = cleanFixed
+    }
+
     // Split out mocks file if AI returned one
     const MOCKS_SEPARATOR = '// ---MOCKS_FILE---'
     let testFileContent = fixed
@@ -268,10 +275,17 @@ async function fixFile(
       const [newTestCode, newMocksCode] = fixed.split(MOCKS_SEPARATOR)
       testFileContent = newTestCode.trim()
       if (newMocksCode?.trim()) {
-        const absoluteMocksFile = join(cwd, config.mocksFile)
-        await mkdir(dirname(absoluteMocksFile), { recursive: true })
-        await writeFile(absoluteMocksFile, newMocksCode.trim(), 'utf-8')
-        if (!onStatus) log(chalk.dim(`  Updated mocks file: ${config.mocksFile}`))
+        const { code: safeMocks, stripped } = sanitizeMocksContent(newMocksCode.trim())
+        if (stripped && !onStatus) log(chalk.yellow(`  ⚠ Mocks file contained test blocks — stripped before writing`))
+        if (safeMocks) {
+          const absoluteMocksFile = join(cwd, config.mocksFile)
+          await mkdir(dirname(absoluteMocksFile), { recursive: true })
+          let existing = ''
+          try { existing = await readFile(absoluteMocksFile, 'utf-8') } catch { /* new file */ }
+          const merged = existing ? mergeMocksContent(existing, safeMocks) : safeMocks
+          await writeFile(absoluteMocksFile, merged, 'utf-8')
+          if (!onStatus) log(chalk.dim(`  Updated mocks file: ${config.mocksFile}`))
+        }
       }
     }
 
