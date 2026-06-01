@@ -142,9 +142,10 @@ Created by `lacuna init`. All fields are optional with sensible defaults.
 
 ```json
 {
-  "provider": "anthropic",
-  "model": "claude-sonnet-4-6",
-  "apiKeyEnv": "ANTHROPIC_API_KEY",
+  "provider": "openai-compatible",
+  "model": "deepseek-chat",
+  "baseURL": "https://api.deepseek.com/v1",
+  "apiKeyEnv": "DEEPSEEK_API_KEY",
   "testRunner": "jest",
   "coverageFormat": "lcov",
   "coverageDir": "coverage",
@@ -159,10 +160,10 @@ Created by `lacuna init`. All fields are optional with sensible defaults.
 
 | Field | Default | Description |
 |---|---|---|
-| `provider` | `anthropic` | `anthropic` or `openai-compatible` |
-| `model` | `claude-sonnet-4-6` | Model name |
-| `apiKeyEnv` | `ANTHROPIC_API_KEY` | Env var holding your API key |
-| `baseURL` | — | Required for `openai-compatible` provider |
+| `provider` | `openai-compatible` | `anthropic` or `openai-compatible` |
+| `model` | `deepseek-chat` | Model name |
+| `apiKeyEnv` | `DEEPSEEK_API_KEY` | Env var holding your API key |
+| `baseURL` | `https://api.deepseek.com/v1` | API base URL — required for `openai-compatible` provider |
 | `testRunner` | auto-detect | `jest` \| `vitest` \| `pytest` \| `mocha` \| `go-test` |
 | `coverageFormat` | `lcov` | `lcov` \| `json-summary` |
 | `coverageDir` | `coverage` | Where your test runner writes coverage |
@@ -183,9 +184,10 @@ Lacuna works with any AI model — local or cloud.
 
 | Preset | Model | API key env | Notes |
 |---|---|---|---|
-| Claude (default) | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` | Best for code |
+| **DeepSeek (default)** | `deepseek-chat` | `DEEPSEEK_API_KEY` | Best value — fast, cheap, no rate-limit issues |
+| DeepSeek R1 | `deepseek-reasoner` | `DEEPSEEK_API_KEY` | Reasoning model |
+| Claude Sonnet | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` | High quality |
 | Claude Opus | `claude-opus-4-7` | `ANTHROPIC_API_KEY` | Most capable |
-| DeepSeek | `deepseek-chat` | `DEEPSEEK_API_KEY` | Very cost-effective |
 | DeepSeek R1 | `deepseek-reasoner` | `DEEPSEEK_API_KEY` | Reasoning model |
 | GPT-4o | `gpt-4o` | `OPENAI_API_KEY` | |
 | Groq | `llama-3.3-70b-versatile` | `GROQ_API_KEY` | Fast, free tier |
@@ -298,8 +300,8 @@ jobs:
         with:
           threshold: 80
           workers: 2                    # parallel workers — increase for larger repos
-          model: claude-sonnet-4-6      # any lacuna preset or model name
-          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: deepseek               # default — cost-effective, no rate-limit issues
+          deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
 
       # Runs even when lacuna exits with code 1 (below threshold) so generated
       # tests are never lost. Skips the commit if nothing was written.

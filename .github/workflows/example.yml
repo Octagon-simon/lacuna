@@ -35,8 +35,8 @@ jobs:
           mode: generate                # generate tests (use 'analyze' for read-only)
           threshold: 80                 # fail PR if coverage stays below this
           workers: 2                    # parallel workers — increase for larger repos
-          model: claude-sonnet-4-6      # any lacuna preset or model name
-          anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: deepseek               # default — cost-effective, no rate-limit issues
+          deepseek-api-key: ${{ secrets.DEEPSEEK_API_KEY }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           post-comment: true
 

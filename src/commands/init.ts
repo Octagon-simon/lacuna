@@ -10,8 +10,14 @@ import type { LacunaConfig } from '../lib/config.js'
 
 interface ProjectMeta {
   isReact: boolean
+  isReactNative: boolean
+  isExpo: boolean
   isNextJs: boolean
   isTypeScript: boolean
+  isVue: boolean
+  isAngular: boolean
+  isSvelte: boolean
+  isNestJs: boolean
 }
 
 async function readProjectMeta(cwd: string): Promise<ProjectMeta> {
@@ -22,12 +28,18 @@ async function readProjectMeta(cwd: string): Promise<ProjectMeta> {
     }
     const all = { ...pkg.dependencies, ...pkg.devDependencies }
     return {
-      isReact: 'react' in all,
+      isReact: 'react' in all && !('react-native' in all),
+      isReactNative: 'react-native' in all,
+      isExpo: 'expo' in all,
       isNextJs: 'next' in all,
       isTypeScript: 'typescript' in all,
+      isVue: 'vue' in all,
+      isAngular: '@angular/core' in all,
+      isSvelte: 'svelte' in all,
+      isNestJs: '@nestjs/core' in all,
     }
   } catch {
-    return { isReact: false, isNextJs: false, isTypeScript: false }
+    return { isReact: false, isReactNative: false, isExpo: false, isNextJs: false, isTypeScript: false, isVue: false, isAngular: false, isSvelte: false, isNestJs: false }
   }
 }
 
@@ -96,10 +108,39 @@ async function findProjectRoot(startDir: string): Promise<string> {
   }
 }
 
-function buildSetupFileContent(isNextJs: boolean): string {
+function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svelte' | 'angular' | 'nest' | 'nextjs'): string {
+  if (variant === 'react-native') {
+    return [
+      `// React Native / Expo test setup`,
+      `// @testing-library/react-native matchers`,
+      `import '@testing-library/react-native/extend-expect'`,
+      ``,
+      `import { jest } from '@jest/globals'`,
+      ``,
+      `// Silence the native animated warning in tests`,
+      `jest.mock('react-native/Libraries/Animated/NativeAnimatedHelper')`,
+    ].join('\n') + '\n'
+  }
+
+  if (variant === 'angular') {
+    return `import 'jest-preset-angular/setup-jest'\n`
+  }
+
+  if (variant === 'nest') {
+    return `// NestJS test setup — no DOM environment needed\n`
+  }
+
+  if (variant === 'vue') {
+    return `import '@testing-library/jest-dom'\n`
+  }
+
+  if (variant === 'svelte') {
+    return `import '@testing-library/jest-dom'\n`
+  }
+
   const lines = [`import '@testing-library/jest-dom'`]
 
-  if (isNextJs) {
+  if (variant === 'nextjs') {
     lines.push(
       ``,
       `// ── Next.js global mocks ──────────────────────────────────────────────────`,
@@ -156,7 +197,27 @@ async function ensureTestRunnerSetup(
   cwd: string,
   log: (msg: string) => void,
 ): Promise<string | undefined> {
-  if (runner === 'pytest' || runner === 'go-test') return undefined // outside Node ecosystem
+  if (['pytest', 'go-test'].includes(runner)) return undefined
+
+  const NON_NODE_RUNNERS = ['phpunit', 'pest', 'rspec', 'cargo-test', 'dotnet-test', 'gradle-test', 'maven-test', 'swift-test']
+  if (NON_NODE_RUNNERS.includes(runner)) {
+    log(chalk.dim(`\n  ${runner} detected — skipping Node.js dependency setup.`))
+    log(chalk.yellow(`  ⚠ Coverage analysis (lacuna analyze) requires LCOV output from your test runner.`))
+    const hints: Record<string, string> = {
+      phpunit:      'Add <logging><junit .../><coverage clover="..."/></logging> to phpunit.xml, or use --coverage-clover and convert with phpunit-coverage-lcov.',
+      pest:         'Run pest --coverage --coverage-lcov coverage/lcov.info (requires Xdebug or PCOV).',
+      rspec:        'Add gem "simplecov-lcov" to your Gemfile and configure SimpleCov::Formatter::LcovFormatter in spec_helper.rb.',
+      'cargo-test': 'Install cargo-llvm-cov (cargo install cargo-llvm-cov) then run: cargo llvm-cov --lcov --output-path coverage/lcov.info',
+      'dotnet-test':'Install coverlet: dotnet add package coverlet.collector — then run: dotnet test --collect:"XPlat Code Coverage" and convert the XML to LCOV with reportgenerator.',
+      'gradle-test':'Add the JaCoCo plugin to build.gradle and run ./gradlew jacocoTestReport — then convert the XML report to LCOV with lcov-gradle-plugin or reportgenerator.',
+      'maven-test': 'Add jacoco-maven-plugin to pom.xml and run mvn jacoco:report — then convert the XML to LCOV with reportgenerator.',
+      'swift-test': 'Run swift test --enable-code-coverage then: llvm-cov export -format lcov .build/debug/<target>.xctest > coverage/lcov.info',
+    }
+    const hint = hints[runner]
+    if (hint) log(chalk.dim(`  How to get LCOV: ${hint}`))
+    log(chalk.dim(`  lacuna generate --file <path> works without coverage — it generates tests for a single file directly.\n`))
+    return undefined
+  }
 
   const meta = await readProjectMeta(cwd)
   const alreadyInstalled = await isPackageInstalled(runner, cwd)
@@ -168,7 +229,18 @@ async function ensureTestRunnerSetup(
 
   if (runner === 'vitest') {
     basePackages.push('vitest', '@vitest/coverage-v8')
-    if (meta.isReact) {
+    if (meta.isReactNative) {
+      // RN with vitest: warn but proceed, add @testing-library/react-native
+      log(chalk.yellow('\n  ⚠ Vitest is not recommended for React Native — Metro transforms are incompatible out of the box.'))
+      log(chalk.dim('  Consider Jest, which is the official test runner for React Native and Expo.'))
+      setupFilePackages.push('@testing-library/react-native')
+    } else if (meta.isVue) {
+      basePackages.push('jsdom', '@vitejs/plugin-vue')
+      setupFilePackages.push('@testing-library/vue', '@testing-library/jest-dom', '@testing-library/user-event')
+    } else if (meta.isSvelte) {
+      basePackages.push('jsdom', '@sveltejs/vite-plugin-svelte')
+      setupFilePackages.push('@testing-library/svelte', '@testing-library/jest-dom')
+    } else if (meta.isReact) {
       basePackages.push('jsdom')
       setupFilePackages.push('@testing-library/react', '@testing-library/jest-dom', '@testing-library/user-event')
     }
@@ -179,7 +251,24 @@ async function ensureTestRunnerSetup(
     } else {
       basePackages.push('jest')
     }
-    if (meta.isReact) {
+    if (meta.isReactNative) {
+      // Don't add jest-environment-jsdom for RN
+      const rnPreset = meta.isExpo ? 'jest-expo' : 'react-native'
+      if (rnPreset === 'jest-expo') basePackages.push('jest-expo')
+      setupFilePackages.push('@testing-library/react-native')
+    } else if (meta.isAngular) {
+      basePackages.push('jest-preset-angular')
+      setupFilePackages.push('@types/jest')
+    } else if (meta.isNestJs) {
+      // NestJS: no DOM environment needed
+      setupFilePackages.push('@nestjs/testing')
+    } else if (meta.isVue) {
+      basePackages.push('jest-environment-jsdom')
+      setupFilePackages.push('@testing-library/vue', '@testing-library/jest-dom', '@testing-library/user-event')
+    } else if (meta.isSvelte) {
+      basePackages.push('jest-environment-jsdom')
+      setupFilePackages.push('@testing-library/svelte', '@testing-library/jest-dom', 'svelte-jeste')
+    } else if (meta.isReact) {
       basePackages.push('jest-environment-jsdom')
       setupFilePackages.push('@testing-library/react', '@testing-library/jest-dom', '@testing-library/user-event')
     }
@@ -188,11 +277,15 @@ async function ensureTestRunnerSetup(
     if (meta.isTypeScript) basePackages.push('@types/mocha', 'ts-node')
   }
 
-  // Next.js: setup file goes at root test/setup.ts — app/ is the App Router,
-  // files inside it are treated as routes. For regular React, co-locate with source.
-  const setupFilePath = meta.isReact
-    ? (meta.isNextJs ? `test/setup.ts` : `${sourceDir}/test/setup.ts`)
-    : undefined
+  // Determine setup file path based on framework
+  const setupFilePath = (() => {
+    if (meta.isReactNative || meta.isExpo) return `test/setup.ts`
+    if (meta.isNextJs) return `test/setup.ts`
+    if (meta.isAngular) return `test/setup.ts`
+    if (meta.isNestJs) return undefined  // NestJS doesn't need a DOM setup file
+    if (meta.isReact || meta.isVue || meta.isSvelte) return `${sourceDir}/test/setup.ts`
+    return undefined
+  })()
 
   // ── Install missing packages ───────────────────────────────────────────────
 
@@ -239,7 +332,14 @@ async function ensureTestRunnerSetup(
       log(chalk.dim(`  ${setupFilePath} already exists — skipping.`))
       createdSetupFile = setupFilePath
     } catch {
-      const setupContent = buildSetupFileContent(meta.isNextJs)
+      const setupVariant = (meta.isReactNative || meta.isExpo) ? 'react-native'
+        : meta.isNextJs ? 'nextjs'
+        : meta.isAngular ? 'angular'
+        : meta.isNestJs ? 'nest'
+        : meta.isVue ? 'vue'
+        : meta.isSvelte ? 'svelte'
+        : 'react'
+      const setupContent = buildSetupFileContent(setupVariant)
       await writeFileWithDir(absSetup, setupContent)
       log(chalk.green(`  ✓ Created ${setupFilePath}`))
       if (meta.isNextJs) log(chalk.dim(`    Includes global mocks for next/navigation, next/headers, next/cache`))
@@ -260,7 +360,7 @@ async function ensureTestRunnerSetup(
       const setupLine = createdSetupFile
         ? `\n    setupFiles: ['./${createdSetupFile}'],`
         : ''
-      const envLine = meta.isReact ? `\n    environment: 'jsdom',` : ''
+      const envLine = (meta.isReact || meta.isVue || meta.isSvelte) ? `\n    environment: 'jsdom',` : ''
       // Next.js uses @/ as the root alias. Read the actual target from tsconfig.json
       // to stay consistent with whatever the project has configured.
       // No React plugin needed: Vitest uses esbuild which handles JSX/TSX natively.
@@ -269,10 +369,17 @@ async function ensureTestRunnerSetup(
         ? `\n  resolve: {\n    alias: { '@': path.resolve(__dirname, '${aliasTarget}') },\n  },`
         : ''
       const pathImport = aliasTarget ? `import path from 'path'\n` : ''
+      const vuePlugin = meta.isVue ? `\nimport vue from '@vitejs/plugin-vue'` : ''
+      const sveltePlugin = meta.isSvelte ? `\nimport { svelte } from '@sveltejs/vite-plugin-svelte'` : ''
+      const pluginsBlock = meta.isVue
+        ? `\n  plugins: [vue()],`
+        : meta.isSvelte
+        ? `\n  plugins: [svelte({ hot: !process.env.VITEST })],`
+        : ''
       const content = [
-        `${pathImport}import { defineConfig } from 'vitest/config'`,
+        `${pathImport}${vuePlugin}${sveltePlugin}import { defineConfig } from 'vitest/config'`,
         ``,
-        `export default defineConfig({${aliasBlock}`,
+        `export default defineConfig({${aliasBlock}${pluginsBlock}`,
         `  test: {`,
         `    globals: true,${envLine}${setupLine}`,
         `    coverage: {`,
@@ -298,13 +405,20 @@ async function ensureTestRunnerSetup(
       const setupLine = createdSetupFile
         ? `\n  setupFilesAfterFramework: ['<rootDir>/${createdSetupFile}'],`
         : ''
-      const envLine = meta.isReact ? `\n  testEnvironment: 'jsdom',` : ''
+      const needsJsdom = (meta.isReact || meta.isVue || meta.isSvelte) && !meta.isReactNative && !meta.isAngular && !meta.isNestJs
+      const envLine = needsJsdom ? `\n  testEnvironment: 'jsdom',` : ''
       const tsLines = meta.isTypeScript
         ? `\n  transform: { '^.+\\\\.tsx?$': 'ts-jest' },`
         : ''
+      const rnPreset = meta.isExpo ? 'jest-expo' : 'react-native'
+      const presetLine = meta.isReactNative ? `\n  preset: '${rnPreset}',` : ''
+      const transformIgnoreLine = meta.isReactNative
+        ? `\n  transformIgnorePatterns: ['node_modules/(?!(react-native|@react-native|@react-navigation|expo|@expo|@testing-library)/)',],`
+        : ''
+      const angularPreset = meta.isAngular ? `\n  preset: 'jest-preset-angular',` : ''
       const content = [
         `/** @type {import('jest').Config} */`,
-        `module.exports = {${envLine}${tsLines}${setupLine}`,
+        `module.exports = {${presetLine}${angularPreset}${envLine}${tsLines}${transformIgnoreLine}${setupLine}`,
         `  coverageReporters: ['lcov', 'text-summary'],`,
         `  coverageDirectory: 'coverage',`,
         `}`,
@@ -395,11 +509,19 @@ export default class Init extends Command {
     const testRunner = await select({
       message: 'Test runner:',
       choices: [
-        { value: 'vitest', name: `vitest${detectedRunner === 'vitest' ? ' (detected)' : ''}` },
-        { value: 'jest',   name: `jest${detectedRunner === 'jest' ? ' (detected)' : ''}` },
-        { value: 'mocha',  name: `mocha${detectedRunner === 'mocha' ? ' (detected)' : ''}` },
-        { value: 'pytest', name: `pytest${detectedRunner === 'pytest' ? ' (detected)' : ''}` },
-        { value: 'go-test',name: `go test${detectedRunner === 'go-test' ? ' (detected)' : ''}` },
+        { value: 'vitest',       name: `vitest${detectedRunner === 'vitest' ? ' (detected)' : ''}` },
+        { value: 'jest',         name: `jest${detectedRunner === 'jest' ? ' (detected)' : ''}` },
+        { value: 'mocha',        name: `mocha${detectedRunner === 'mocha' ? ' (detected)' : ''}` },
+        { value: 'pytest',       name: `pytest${detectedRunner === 'pytest' ? ' (detected)' : ''}` },
+        { value: 'go-test',      name: `go test${detectedRunner === 'go-test' ? ' (detected)' : ''}` },
+        { value: 'phpunit',      name: `phpunit${detectedRunner === 'phpunit' ? ' (detected)' : ''}` },
+        { value: 'pest',         name: `pest (PHP)${detectedRunner === 'pest' ? ' (detected)' : ''}` },
+        { value: 'rspec',        name: `rspec (Ruby)${detectedRunner === 'rspec' ? ' (detected)' : ''}` },
+        { value: 'cargo-test',   name: `cargo test (Rust)${detectedRunner === 'cargo-test' ? ' (detected)' : ''}` },
+        { value: 'dotnet-test',  name: `dotnet test (C#)${detectedRunner === 'dotnet-test' ? ' (detected)' : ''}` },
+        { value: 'gradle-test',  name: `gradle test (Java/Kotlin)${detectedRunner === 'gradle-test' ? ' (detected)' : ''}` },
+        { value: 'maven-test',   name: `mvn test (Java)${detectedRunner === 'maven-test' ? ' (detected)' : ''}` },
+        { value: 'swift-test',   name: `swift test (Swift)${detectedRunner === 'swift-test' ? ' (detected)' : ''}` },
       ],
       default: detectedRunner ?? 'vitest',
     })

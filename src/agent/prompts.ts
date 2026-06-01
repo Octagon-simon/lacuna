@@ -119,6 +119,42 @@ function buildNextJsGuidance(a: NextJsAnalysis): string | null {
   return lines.join('\n')
 }
 
+// ─── React Native detector & guidance ───────────────────────────────────────
+
+function detectReactNative(packageDeps: string | null): boolean {
+  if (!packageDeps) return false
+  return /\breact-native\b/.test(packageDeps) || /\bexpo\b/.test(packageDeps)
+}
+
+function buildReactNativeGuidance(): string {
+  return [
+    'REACT NATIVE PROJECT — use @testing-library/react-native, not @testing-library/react.',
+    "- Import render, screen, fireEvent, waitFor from '@testing-library/react-native'",
+    '- No document, window, or localStorage globals — they do not exist in React Native',
+    "- Mock react-native modules with vi.mock('react-native', ...) or jest.mock('react-native', ...)",
+    '- Mock navigation: if @react-navigation/native is used, mock useNavigation, useRoute',
+    '- Mock expo-router if present: mock useRouter, useLocalSearchParams, Link',
+    '- Use fireEvent.press() not fireEvent.click() for Pressable/TouchableOpacity',
+    '- Async state: use waitFor() from @testing-library/react-native, not from @testing-library/react',
+  ].join('\n')
+}
+
+// ─── Vue detector & guidance ─────────────────────────────────────────────────
+
+function detectVue(packageDeps: string | null): boolean {
+  if (!packageDeps) return false
+  return /\bvue\b/.test(packageDeps)
+}
+
+function buildVueGuidance(): string {
+  return [
+    'VUE PROJECT — use @testing-library/vue for component tests.',
+    "- Import render, screen, fireEvent, waitFor from '@testing-library/vue'",
+    "- Import userEvent from '@testing-library/user-event'",
+    '- Wrap async user interactions with await userEvent.setup() and await act()',
+  ].join('\n')
+}
+
 // ─── Network dependency analyser ─────────────────────────────────────────────
 // Scans source code and returns guidance the AI must follow to avoid real requests.
 
@@ -148,6 +184,79 @@ function analyzeNetworkDeps(sourceCode: string): NetworkAnalysis {
   }
 
   return { usesAxios, usesFetch, usesCustomInstance, apiModuleImports }
+}
+
+// Surfaces TypeScript compiler errors in a form the model can act on directly.
+// Philosophy: tsc output is already the fix instruction — our job is to make sure
+// the model reads it literally rather than overriding it with framework conventions.
+// Two layers:
+//   1. Extract structured info from the error text for the highest-value patterns
+//      (member lists, suggestions, mismatched types) so the model doesn't have to hunt.
+//   2. Generic pass-through for everything else — the compiler already said what's wrong.
+function detectTypeScriptErrors(errorOutput: string): string | null {
+  if (!/error TS\d+:/.test(errorOutput)) return null
+
+  const parts: string[] = [
+    'TYPESCRIPT ERRORS — treat each compiler message as an exact instruction, not a hint:',
+    'The TypeScript compiler tells you precisely what is wrong and usually what the fix is.',
+    'Do NOT override it with framework conventions or assumptions.',
+  ]
+
+  // TS1378: top-level await — only specific branch because the fix is structural
+  if (/TS1378/.test(errorOutput)) {
+    parts.push(
+      '• Top-level await (TS1378): move ALL await calls inside it()/test()/beforeEach()/etc.',
+      '  WRONG: const result = await fn();',
+      '  RIGHT: it("desc", async () => { const result = await fn(); });',
+    )
+  }
+
+  // Wrong member name — extract the actual member list TypeScript printed inline.
+  // Covers TS2339, TS2551, TS2561 and any variant with "does not exist on/in type '{...}'"
+  const propErrors = [...errorOutput.matchAll(/'(\w+)' does not exist (?:on|in) type '\{([^']+)\}'/g)]
+  if (propErrors.length > 0) {
+    parts.push('• Wrong member name — the actual available members are:')
+    const seen = new Set<string>()
+    for (const m of propErrors) {
+      const wrongProp = m[1]
+      const available = [...m[2].matchAll(/(\w+)\s*[?]?\s*:/g)].map(p => p[1]).filter(p => p !== 'type')
+      const key = wrongProp + available.join()
+      if (seen.has(key)) continue
+      seen.add(key)
+      parts.push(`  '${wrongProp}' → not valid. Use one of: ${available.slice(0, 12).join(', ')}${available.length > 12 ? ' …' : ''}`)
+    }
+  }
+
+  // Compiler suggestions — TypeScript already provides the answer
+  const suggestions = [...new Set([...errorOutput.matchAll(/Did you mean(?: to write)? '(\w+)'\?/g)].map(m => m[1]))]
+  if (suggestions.length > 0) {
+    parts.push(`• Compiler suggestion: use ${suggestions.map(s => `'${s}'`).join(', ')}`)
+  }
+
+  // Type mismatch — extract what was passed vs what was required
+  const typeMismatches = [...errorOutput.matchAll(/Argument of type '([^']+)' is not assignable to parameter of type '([^']+)'/g)]
+  if (typeMismatches.length > 0) {
+    for (const m of typeMismatches) {
+      parts.push(`• Type mismatch: passed '${m[1].slice(0, 80)}', required '${m[2].slice(0, 80)}'`)
+    }
+    parts.push('  (use null not undefined for nullable values; check TYPE DEFINITIONS for the required shape)')
+  }
+
+  // Generic pass-through for all other TS errors — list them so the model reads each one
+  // rather than guessing. No special handling needed: the message IS the instruction.
+  const otherErrors = [...errorOutput.matchAll(/error (TS(?!1378|2339|2551|2561|2345)\d+): ([^\n]+)/g)]
+  if (otherErrors.length > 0) {
+    parts.push('• Additional compiler errors — read each one and apply the exact fix it describes:')
+    const seen = new Set<string>()
+    for (const m of otherErrors) {
+      const msg = `${m[1]}: ${m[2].slice(0, 120)}`
+      if (seen.has(msg)) continue
+      seen.add(msg)
+      parts.push(`  ${msg}`)
+    }
+  }
+
+  return parts.join('\n')
 }
 
 // Detects thinking-bleed parse errors: model wrote reasoning inside <code_output>
@@ -345,8 +454,10 @@ RULES — follow every one:
 7. If a SHARED MOCK FILE (does not exist yet) section is shown — create it for any mocks you need and return it using the // ---MOCKS_FILE--- separator.
    CRITICAL — the mocks file must contain ONLY: vi.fn()/jest.fn() mock definitions, vi.mock() module stubs, shared mock objects/constants, and beforeEach reset hooks. NEVER write describe(), it(), test(), or expect() calls in the mocks file. Those belong exclusively in the test file. A mocks file that contains test blocks will break the entire test suite.
 8. If a TEST SETUP FILE is shown, assume its globals and matchers are already available (e.g. expect(...).toBeInTheDocument()). Do NOT import or re-declare them.
-9. TypeScript type safety: all test code must compile without type errors.
-   - Check PROJECT TYPESCRIPT CONFIG for strict flags — if strict or noImplicitAny is set, every value must be properly typed.
+9. TypeScript type safety: all test code must compile without type errors. The TypeScript compiler is the authority — its error messages are exact instructions, not hints.
+   - When tsc reports an error, read it literally and apply the precise fix it describes. Never override the compiler with framework conventions or assumptions.
+   - Use EXACT property/member names from the TYPE DEFINITIONS section and source code. Do not apply naming conventions: if a hook returns { loading, users }, do NOT write isLoading or isUsers. Read what is actually declared.
+   - Import enums, constants, interfaces, and types from the project's existing files. Do NOT redeclare them inline or invent lookalike values. Check TYPE DEFINITIONS and the source file's imports for what already exists.
    - Never use "as any", "@ts-ignore", or "@ts-expect-error" to suppress type errors. Use proper types or generics instead.
    - For vi.fn() / jest.fn(), either let TypeScript infer the type from context or type it explicitly: vi.fn<Parameters<typeof fn>, ReturnType<typeof fn>>().
    - Use ReturnType<>, Parameters<>, and other utility types to derive mock types from the real function signatures rather than guessing.
@@ -388,6 +499,7 @@ Common failure causes to avoid:
 - Mocking modules that are already mocked in the setup file
 - Using browser globals without jsdom (only use them if the setup file configures jsdom)
 - Forgetting to await async functions
+- Top-level await (TS1378): NEVER use \`await\` at the top level of a test file. Every \`await\` must be inside an async callback: \`it("...", async () => { ... })\`, \`beforeEach(async () => { ... })\`, etc. Top-level \`await\` is rejected by most TypeScript configurations and will cause a type error even if the tests appear to run.
 - React 18 act() async rule: ALWAYS await act() when it wraps async code — \`await act(async () => { ... })\`. Never store an unawaited act() call in a variable like \`const promise = act(async () => ...)\` without immediately awaiting it. Unawaited act() calls cause React state updates to leak into subsequent tests, producing cascading timeout failures and "Cannot read properties of null" errors in unrelated tests.
 - vi.mock() paths are relative to the TEST FILE, not the source file. If the test is at src/features/auth/__tests__/Login.test.tsx and you need to mock src/components/Button, the mock path is ../../../components/Button — count directories from the TEST file's location, not the source file's.
 - Loading state architecture: before asserting that a button is disabled during loading, check whether the component hides the button entirely and replaces it with a spinner. If the button is unmounted during loading rather than disabled, \`getByText("Submit")\` will throw — test for the spinner instead, or use \`queryByText("Submit")\` with a null assertion.
@@ -504,6 +616,9 @@ export function buildGeneratePrompt(args: {
   const nextGuidance = buildNextJsGuidance(analyzeNextJs(sourceCode))
   if (nextGuidance) parts.push(`\n${nextGuidance}`)
 
+  if (detectReactNative(packageDeps ?? null)) parts.push(`\n${buildReactNativeGuidance()}`)
+  else if (detectVue(packageDeps ?? null)) parts.push(`\n${buildVueGuidance()}`)
+
   const displaySource = buildSourceSkeleton(sourceCode, uncoveredFunctions)
   const skeletonized = shouldUseSkeleton(sourceCode)
   parts.push(`\nSOURCE FILE: ${sourceFile}${skeletonized ? ' (large file — bodies of already-covered functions collapsed; uncovered functions shown in full)' : ''}`)
@@ -615,6 +730,9 @@ export function buildFixPrompt(args: {
     }
   }
 
+  if (detectReactNative(packageDeps ?? null)) parts.push(`\n${buildReactNativeGuidance()}`)
+  else if (detectVue(packageDeps ?? null)) parts.push(`\n${buildVueGuidance()}`)
+
   if (sourceFile && sourceCode) {
     const networkGuidance = buildNetworkMockingGuidance(analyzeNetworkDeps(sourceCode), sourceFile)
     if (networkGuidance) parts.push(`\n${networkGuidance}`)
@@ -659,6 +777,9 @@ export function buildFixPrompt(args: {
 
   const bleedWarning = detectThinkingBleed(errorOutput)
   if (bleedWarning) parts.push(`\n⚠️  ${bleedWarning}`)
+
+  const tsErrorWarning = detectTypeScriptErrors(errorOutput)
+  if (tsErrorWarning) parts.push(`\n⚠️  ${tsErrorWarning}`)
 
   // Detect wrong mock pattern: test uses vi.mock('axios') but source uses axios.create()
   const testHasAxiosMock = /vi\.mock\(['"]axios['"]\)/.test(testCode)
@@ -718,6 +839,9 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
 
   const bleedWarning = detectThinkingBleed(failureOutput)
   if (bleedWarning) parts.push(`\n⚠️  ${bleedWarning}`)
+
+  const tsErrorWarning = detectTypeScriptErrors(failureOutput)
+  if (tsErrorWarning) parts.push(`\n⚠️  ${tsErrorWarning}`)
 
   parts.push('')
   parts.push('Common causes:')
