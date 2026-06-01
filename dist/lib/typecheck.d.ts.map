@@ -1,0 +1,1 @@
+{"version":3,"file":"typecheck.d.ts","sourceRoot":"","sources":["../../src/lib/typecheck.ts"],"names":[],"mappings":"AAEA,OAAO,KAAK,EAAE,mBAAmB,EAAE,MAAM,eAAe,CAAA;AAOxD,wBAAsB,aAAa,CACjC,WAAW,EAAE,MAAM,EACnB,GAAG,EAAE,MAAM,EACX,GAAG,EAAE,IAAI,CAAC,mBAAmB,EAAE,UAAU,CAAC,GACzC,OAAO,CAAC,MAAM,GAAG,IAAI,CAAC,CAoBxB"}
