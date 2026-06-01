@@ -1,0 +1,1 @@
+{"version":3,"file":"fix.d.ts","sourceRoot":"","sources":["../../src/commands/fix.ts"],"names":[],"mappings":"AAAA,OAAO,EAAE,OAAO,EAAS,MAAM,aAAa,CAAA;AAM5C,MAAM,CAAC,OAAO,OAAO,GAAI,SAAQ,OAAO;IACtC,MAAM,CAAC,WAAW,SAAgG;IAElH,MAAM,CAAC,QAAQ,WAKd;IAED,MAAM,CAAC,KAAK;;;;;;;MA2BX;IAEK,GAAG,IAAI,OAAO,CAAC,IAAI,CAAC;CAiE3B"}
