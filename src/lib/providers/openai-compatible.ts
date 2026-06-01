@@ -94,6 +94,16 @@ export class OpenAICompatibleProvider implements ModelProvider {
         const body = e.error?.message
           ? `${e.error.message}${e.error.type ? ` (type: ${e.error.type})` : ''}${e.error.code ? ` [${e.error.code}]` : ''}`
           : (e.message ?? 'no message')
+        if (e.status === 429 || /rate.?limit|output tokens per minute|request.*exceed.*limit/i.test(body)) {
+          throw new Error(
+            `Rate limit hit (HTTP 429) — ${this.model} is rejecting requests due to quota.\n` +
+            `Options:\n` +
+            `  1. Lower maxTokens in .lacuna.json (e.g. "maxTokens": 4000) to reduce output per request.\n` +
+            `  2. Use --workers 1 to avoid parallel requests consuming your quota.\n` +
+            `  3. Try a different model: lacuna generate -m deepseek\n` +
+            `  4. Check your provider's usage dashboard and upgrade if needed.`,
+          )
+        }
         throw new Error(`${this.model} API error (HTTP ${e.status ?? '?'}): ${body}`)
       }
       throw err

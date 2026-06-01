@@ -3,7 +3,7 @@ import { z } from 'zod'
 import { PRESETS } from './providers/types.js'
 
 const ConfigSchema = z.object({
-  testRunner: z.enum(['jest', 'vitest', 'pytest', 'mocha', 'go-test']).optional(),
+  testRunner: z.enum(['jest', 'vitest', 'pytest', 'mocha', 'go-test', 'phpunit', 'pest', 'rspec', 'cargo-test', 'dotnet-test', 'gradle-test', 'maven-test', 'swift-test']).optional(),
   coverageFormat: z.enum(['lcov', 'json-summary', 'cobertura']).default('lcov'),
   coverageDir: z.string().default('coverage'),
   sourceDir: z.string().default('src'),
@@ -16,10 +16,10 @@ const ConfigSchema = z.object({
   mocksFile: z.string().optional(),     // path to shared mock file (e.g. src/test/mocks.ts)
   setupFile: z.string().optional(),     // path to test setup file (e.g. src/test/setup.ts)
   // provider config
-  provider: z.enum(['anthropic', 'openai-compatible']).default('anthropic'),
-  model: z.string().default('claude-sonnet-4-6'),
-  baseURL: z.string().optional(),
-  apiKeyEnv: z.string().default('ANTHROPIC_API_KEY'),
+  provider: z.enum(['anthropic', 'openai-compatible']).default('openai-compatible'),
+  model: z.string().default('deepseek-chat'),
+  baseURL: z.string().default('https://api.deepseek.com/v1'),
+  apiKeyEnv: z.string().default('DEEPSEEK_API_KEY'),
   maxTokens: z.number().min(1024).max(128000).default(16000),
 })
 

@@ -16,9 +16,9 @@ inputs:
     required: false
     default: '80'
   model:
-    description: "Model to use — any lacuna preset: claude-sonnet-4-6, claude-opus-4-7, gpt-4o, gemini, gemini-flash, deepseek, deepseek-r1, groq, openrouter, ollama. Or pass a full model name."
+    description: "Model to use — any lacuna preset: deepseek, deepseek-r1, claude-sonnet-4-6, claude-opus-4-7, gpt-4o, gemini, gemini-flash, groq, openrouter, ollama. Or pass a full model name."
     required: false
-    default: claude-sonnet-4-6
+    default: deepseek
   source-dir:
     description: Directory containing source files
     required: false
