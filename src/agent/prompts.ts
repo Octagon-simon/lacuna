@@ -286,19 +286,30 @@ function detectNextJsImportError(errorOutput: string): string | null {
   if (!failedImport) return null
 
   const importPath = failedImport[1]
+  const isServerOnly = importPath === 'server-only'
   const isAlias = importPath.startsWith('@/')
   const isClient = importPath.endsWith('.client')
   const isServer = importPath.endsWith('.server')
   const isNextInternal = importPath.startsWith('next/')
   const isProviderOrSession = /session|auth|provider/i.test(importPath)
 
-  if (!isAlias && !isClient && !isServer && !isNextInternal && !isProviderOrSession) return null
+  if (!isServerOnly && !isAlias && !isClient && !isServer && !isNextInternal && !isProviderOrSession) return null
 
   const lines = [
     `IMPORT RESOLUTION ERROR — Vitest cannot resolve "${importPath}".`,
   ]
 
-  if (isAlias) {
+  if (isServerOnly) {
+    lines.push(
+      `"server-only" is a Next.js build guard — it throws intentionally when server code is loaded in a non-server context.`,
+      `This is a CONFIGURATION issue, not something fixable in the test file. Two options:`,
+      `  OPTION A (preferred): Add an alias in vitest.config.ts that maps "server-only" to an empty module:`,
+      `    alias: { 'server-only': path.resolve(__dirname, './test/empty-module.ts') }`,
+      `    and create test/empty-module.ts containing: export default {}`,
+      `  OPTION B: Mock the entire module that imports server-only (the hook or service) so Vitest never resolves its dependency tree.`,
+      `Do NOT try to mock "server-only" directly in the test file — vi.mock('server-only') is too late; the import is resolved before mocks run.`,
+    )
+  } else if (isAlias) {
     lines.push(
       `The "@/" alias is not configured in vitest.config.ts — you cannot fix this by changing the test file.`,
       `WORKAROUND: use the pre-computed relative paths from LOCAL IMPORT PATHS in your vi.mock() calls instead of "@/" paths.`,
@@ -309,10 +320,17 @@ function detectNextJsImportError(errorOutput: string): string | null {
     )
   } else if (isClient || isServer) {
     lines.push(
-      `This is a Next.js ${isClient ? 'client' : 'server'} boundary file. Vitest never resolves these — mock it with the exact import path from the source file:`,
-      `  vi.mock('${importPath}', () => ({`,
-      `    // each function the source imports: myFn: vi.fn()`,
+      `This is a Next.js ${isClient ? 'client' : 'server'} boundary file. Vitest never resolves these.`,
+      `If the source file IMPORTS this module directly, mock it with the exact import path:`,
+      `  vi.mock('${importPath}', () => ({ myFn: vi.fn() }))`,
+      ``,
+      `If the failing source is a HOOK that internally imports *.client services (which chain into many other server-only modules),`,
+      `use the complete self-replacement strategy — mock the entire hook, not its sub-dependencies:`,
+      `  const mockState = vi.hoisted(() => ({ data: [], loading: false, error: null }))`,
+      `  vi.mock('../useMyHook', () => ({`,
+      `    useMyHook: () => mockState,`,
       `  }))`,
+      `This bypasses the entire dependency tree and tests the component contract, not the hook internals.`,
     )
   } else if (isNextInternal) {
     lines.push(
@@ -436,76 +454,143 @@ function parseMockExports(code: string): string[] {
 }
 
 export function buildSystemPrompt(env: DetectedEnvironment): string {
+  const isJS = env.language === 'typescript' || env.language === 'javascript' || env.language === 'unknown'
+  const isTS = env.language === 'typescript'
+  const isVitest = env.testRunner === 'vitest'
+  const isJSRunner = env.testRunner === 'jest' || env.testRunner === 'vitest' || env.testRunner === 'mocha'
+
+  // ── Thinking template ────────────────────────────────────────────────────────
+  const mockAuditStep = isJS ? `
+    2. MOCK AUDIT — do this before writing a single line of test code:
+       a) IMPORT INVENTORY: List every import in the source file. For each client/service/hook, find every method it calls (grep for Client.method() patterns). Mock exactly those methods — nothing more, nothing less. Mocking a method the source never calls is useless; missing a method the source DOES call is a silent failure.
+       b) RESPONSE ENVELOPE: At each Client.method() call site, check how the return value is consumed. If the source guards with \`if (res.success)\` or destructures \`{ success, data }\`, the mock MUST return that envelope — NOT a raw array. \`mockResolvedValue([...])\` when the hook expects \`{ success: true, data: [...] }\` produces silently empty state with no error. Pattern: \`const ok = (data: unknown) => ({ success: true, data })\`.
+       c) RETURN FIELD ENUMERATION: Find the hook's \`return { ... }\` statement. List every key. Only write assertions for fields that actually appear there. A field not in the return statement is always undefined — asserting it produces a vacuous test that passes and fails for the wrong reasons.
+       d) LOADING TRIGGER MAP: Not all data loads on mount. For each piece of state, find what populates it. If a function like loadResults(classId) must be called explicitly (user selects something), the mount test will never see that data. Map: state → function that populates it → when that function is triggered.
+       e) FIXTURE FIELD NAMES: Read the source's selector logic — every .find(), .filter(), and property access. Field names in fixture data must match what the source reads, not what sounds reasonable. \`is_active\` and \`is_current\` are both plausible; only one will pass the filter. Read the source.
+       f) MOCK STRUCTURE — object vs factory: when the source imports a client/service as a module export and calls it as \`SomeClient.method()\`, the mock must be a plain object \`{ SomeClient: { method: vi.fn() } }\`. If you mock it as \`vi.fn().mockReturnValue({ method: vi.fn() })\`, SomeClient.method is undefined at runtime — the mock replaced a singleton with a callable that the source never calls. The mock structure must match how the source uses the import, not how you'd design an API.
+       g) DATA TRANSFORMATIONS: Before writing any assertion about the shape of loaded data, read every .map(), .filter(), and mutation the hook applies to the raw API response. If the hook does \`.map(s => ({ ...s, selected: true, status: 'promoted' }))\`, the fixture assertion must expect the TRANSFORMED shape, not the raw API fixture. Keep two separate fixtures: the raw API response (for mockResolvedValue) and the expected hook output (for assertions).
+       h) USEEFFECT COMPOUND SIDE EFFECTS: For each useEffect, read its dependency array AND every state setter it calls. Some effects reset sibling state as a side effect (e.g. fetchSourceClasses always calls setSelectedSourceClassId('')). Setting state that triggers such an effect will silently undo other state you set in the same act(). Map the full chain: which state changes trigger which effects, and what those effects do to other state — before writing any test that sets multiple state values.
+       HOOK STATE SYNC: If the test mocks a hook or function that returns an object (e.g. useClasses(), useUsers()), compare its CURRENT return signature in the source against the mocked return object in the test. If any properties are missing, renamed, or stale, realign the mock FIRST — before touching any assertions.
+       UNCONDITIONAL CRASH CHECK: Look at the very top of the component body — what fields are destructured and used BEFORE any conditional render (e.g. totalRevenue.toLocaleString(), sessions.length)? Every one of those fields MUST be present in the mock return value or ALL tests will crash immediately.
+       MOCK PROP INTERFACE: When mocking a child component (e.g. EmptyState, Modal), check how the PARENT calls it — what prop names does the JSX pass? Use those exact names in the mock, not the names from the child's own prop type definition.
+    3. COMPONENT RENDER MAP (React/Vue components only): Before writing any assertion, list what is in the DOM in each relevant state (idle / loading / error / success). Read the template/JSX — check every ternary, &&, and conditional — to determine whether a button is disabled vs unmounted, what text changes, what elements appear.
+       GUARD CLAUSE AUDIT: Identify every conditional render guard in the component (e.g. payments.length > 0, isLoading, hasPermission). A test that provides data violating a guard will never find the element — the guard hides it. Match mock data to the guard condition required by each test.
+       STALE TEST AUDIT: Check whether any existing test asserts UI or behavior that the current source no longer has. DELETE those tests — do not try to make the component pass a test for features it no longer has.` : `
+    2. DEPENDENCY AUDIT: List every external dependency the source calls. For each one, determine what needs to be mocked and what return value the code expects. Read every call site — don't infer the expected shape from the type name.
+    3. DATA FIXTURE AUDIT: Read the source's selector logic — every filter, find, and field access. Fixture data field names must match what the source reads exactly.`
+
+  const thinkingTemplate = `
+    1. WHAT IS NEEDED: What functions/behaviors are untested or broken?${mockAuditStep}
+    4. WHY IT FAILED (retries only): Errors cascade — a compile error hides a resolution error which hides a wiring error which hides a logic error. Fix the first layer and expect a new error to surface. What layer are we on now?
+    5. PLAN: List the exact steps you will take before writing a single line of code.`
+
+  // ── JS/TS-specific rules ─────────────────────────────────────────────────────
+  const jsRules = isJS ? `
+3. Use path aliases from the PROJECT TYPESCRIPT CONFIG section in IMPORT statements (e.g. "@/components/Button" not "../../components/Button").
+   EXCEPTION — mock call paths: use the exact same path string that appears in the SOURCE FILE'S import statement.
+   If a LOCAL IMPORT PATHS section is provided, use those pre-computed relative paths in mock calls — they are the fallback when aliases cannot be resolved by the test runner.
+   Never second-guess the pre-computed paths. Never convert them back to @/ aliases in mock calls.
+4. Only import from packages listed in PROJECT DEPENDENCIES. Do not invent packages that are not listed.
+5. When a SHARED MOCK FILE is provided, its exported names are listed under "Available exports". Before writing the test, go through that list and identify every mock that relates to what the source file does. Import and use ALL of those mocks. Never re-create inline vi.fn() / jest.fn() for anything already exported from the mocks file.
+   CRITICAL — never rename or change the casing of existing mock exports.
+6. If you need a mock that is missing from the shared mock file, add it to that file AND import it in the test. Return BOTH files separated by exactly one line containing only: // ---MOCKS_FILE---
+7. If a SHARED MOCK FILE (does not exist yet) section is shown — create it for any mocks you need and return it using the // ---MOCKS_FILE--- separator.
+   CRITICAL — the mocks file must contain ONLY: vi.fn()/jest.fn() mock definitions, vi.mock() module stubs, shared mock objects/constants, and beforeEach reset hooks. NEVER write describe(), it(), test(), or expect() calls in the mocks file.
+8. If a TEST SETUP FILE is shown, assume its globals and matchers are already available. Do NOT import or re-declare them.` : `
+3. Use the project's import conventions as shown in the source file and existing tests.
+4. Only import from packages listed in PROJECT DEPENDENCIES. Do not invent packages that are not listed.`
+
+  const tsRule = isTS ? `
+9. TypeScript type safety: all test code must compile without type errors. The TypeScript compiler is the authority — its error messages are exact instructions, not hints.
+   - Use EXACT property/member names from the TYPE DEFINITIONS section and source code. Do not apply naming conventions: if a hook returns { loading, users }, do NOT write isLoading or isUsers.
+   - Import enums, constants, interfaces, and types from the project's existing files. Do NOT redeclare them inline or invent lookalike values.
+   - Never use "as any", "@ts-ignore", or "@ts-expect-error" to suppress type errors.
+   - For vi.fn() / jest.fn(), either let TypeScript infer the type from context or type it explicitly: vi.fn<Parameters<typeof fn>, ReturnType<typeof fn>>().
+   - Use ReturnType<>, Parameters<>, and other utility types to derive mock types from real function signatures.
+   - When accessing optional properties, handle null/undefined correctly.` : ''
+
+  const ruleCount = isTS ? 10 : (isJS ? 9 : 6)
+
+  // ── JS/Vitest-specific output format rules ───────────────────────────────────
+  const jsOutputRules = isJS ? `
+${ruleCount + 2}. Inside <code_output>: output ONLY the test file content (or test file // ---MOCKS_FILE--- mocks file).
+    If you use // ---MOCKS_FILE---, everything AFTER the separator is the mocks file. The mocks file must contain ONLY:
+    vi.fn()/jest.fn() mock definitions, vi.mock() module stubs, shared constants, and beforeEach resets.
+    NEVER put describe(), it(), test(), or expect() calls after the separator.
+${ruleCount + 3}. NEVER output vitest.config.ts, jest.config.js, or any framework configuration. If an import cannot be resolved,
+    fix it by mocking it with vi.mock() — NOT by modifying the test runner configuration.` : ''
+
+  // ── Common failure causes — universal ────────────────────────────────────────
+  const universalCauses = `- Wrong import paths (use the project's conventions — aliases where configured, relative paths otherwise)
+- Importing from test utilities that are not in the dependency list
+- Mocking modules that are already mocked in the setup file
+- Forgetting to await async functions
+- Real HTTP requests: NEVER let a real network call reach the internet. Every function that calls an API must be mocked before the test runs.
+- Error surface mismatch: before writing any error-path test, find the catch block. Does it set state, call a notification, or just log silently? Test only what is actually observable from outside.
+- Code drift — assert what the code ACTUALLY does: before writing any assertion, re-read the relevant section of the source. If it catches an error and returns null, assert null — not a rejection.`
+
+  // ── Common failure causes — JS/Jest/Vitest only ───────────────────────────────
+  const jsCauses = isJSRunner ? `
+- vi.mock() / jest.mock() paths are relative to the TEST FILE, not the source file. Count directories from the test file's location, not the source file's.
+- Missing mock is the silent killer: if expect(mockFn).toHaveBeenCalled() fails but the code path is clearly reached, the mock declaration is missing or uses the wrong path. The real implementation ran instead.
+- Response envelope mismatch (silent empty state): if a hook guards \`if (res.success)\` or destructures \`{ success, data }\`, mocking with a raw array means .success is undefined and state is never populated — silently. Trace each call site individually — different clients in the same hook often have different shapes (one returns \`{ data: [] }\`, another \`{ success, data: { items: [] } }\` with nested access). Never assume a uniform envelope across the whole hook.
+- Barrel file mock miss: mocking a barrel/index file (vi.mock('../components')) will NOT intercept imports of the direct file ('../components/Foo'). Mock the specific module the source actually imports.` : ''
+
+  const vitestCauses = isVitest ? `
+- Never use require() in Vitest: Vitest runs files as ESM — dynamic require() fails at transform time. Always use static ES import + vi.mocked().
+- Shared mock file factory syntax: \`vi.mock('../service', async () => await import('../../test/mocks'))\` — synchronous factory cannot import external files in Vitest.
+- vi.hoisted() for shared mock references: when a mock object is created inside vi.mock() AND configured in beforeEach, use vi.hoisted() so both closures reference the same object instance.
+- Complete hook self-replacement for *.client-importing hooks: when a hook imports *.client services that chain into browser/server-only modules, mock the entire hook — \`vi.mock('../useMyHook', () => ({ useMyHook: vi.fn() }))\` — rather than each sub-dependency.
+- server-only resolution in Next.js: \`Failed to resolve import "server-only"\` is a config issue, not a test issue. Add an alias in vitest.config.ts: \`'server-only': path.resolve(__dirname, './test/empty-module.ts')\` and create that file with \`export default {}\`.
+- Top-level await (TS1378): NEVER use \`await\` at the top level of a test file. Every \`await\` must be inside an async callback: \`it("...", async () => { ... })\`.
+- NEVER call vi.spyOn(global, ...) or vi.spyOn(globalThis, ...) at module level (outside beforeEach/beforeAll). Each Vitest file has its own vi registry. A module-level spy is installed on the shared worker globalThis but setup-file afterEach cleanup (vi.restoreAllMocks) uses a different vi instance and cannot remove it — the spy persists after the file ends and poisons the next file that runs in the same worker. Always create global spies inside beforeEach so they are fresh per test and properly cleaned up:
+  WRONG: const mockFetch = vi.spyOn(global, 'fetch');  // module level — breaks other files
+  RIGHT: let mockFetch: ReturnType<typeof vi.spyOn>;
+         beforeEach(() => { mockFetch = vi.spyOn(global, 'fetch'); });
+- Never write two vi.mock() calls for the same module path in the same file. The second call silently overrides the first — exports from the first mock are lost. If a module exports many things (e.g. lucide-react icons), list them all in a single vi.mock() factory:
+  WRONG: vi.mock('lucide-react', () => ({ Search: () => null }))  ...later...  vi.mock('lucide-react', () => ({ Plus: () => null }))
+  RIGHT: vi.mock('lucide-react', () => ({ Search: () => null, Plus: () => null }))` : ''
+
+  // ── Common failure causes — React/Vue (JS component tests) only ───────────────
+  const reactCauses = isJSRunner ? `
+- React 18 act() async rule: ALWAYS await act() when it wraps async code. Unawaited act() calls cause state to leak across tests, producing "Cannot read properties of null" failures in unrelated tests.
+- Loading state architecture: before asserting a button is disabled during loading, check whether the component unmounts it entirely. If unmounted, getByText("Submit") throws — test for the spinner instead.
+- Unhandled promise rejections: after triggering an action with mockRejectedValueOnce, always await the resulting state change with waitFor() so the rejection is resolved inside the test scope.
+- getByText / getByTestId ambiguity: generic strings and reused icon components often appear multiple times on a complex page. Use getAllByText(...)[0], getByRole, or within(container).getByText(...) to scope queries.
+- Functional state updater assertions: when a component calls setState with an updater function (e.g. setPage(p => p + 1)), toHaveBeenCalledWith(3) always fails. Capture the updater and call it: \`const fn = mockSetPage.mock.calls[0][0]; expect(fn(2)).toBe(3)\`.
+- React 18 act() warning in hook tests: wrap async mock resolutions in \`await act(async () => {})\` at the end of the test to flush pending state updates before the test exits.` : ''
+
+  // ── Good test suite checklist ────────────────────────────────────────────────
+  const hookSuiteNote = isJSRunner
+    ? `\n- For hooks: cover mutations (save, update, delete) and derived/computed state — not just the initial-load lifecycle. Mutations and derived state are where real bugs hide.`
+    : ''
+
   return `You are a senior QA engineer with 10+ years of experience writing production test suites for ${env.language} projects. You use ${env.testRunner} and you take testing seriously.
 
 Your tests catch real bugs. You think about what could go wrong — null inputs, empty arrays, async race conditions, error boundaries, permission checks, off-by-one errors — and you write assertions that would actually fail if the code broke. You never write a test just to hit a coverage number.
 
 RULES — follow every one:
 1. Write tests that verify real behavior: correctness, edge cases, boundary values, and error handling. Never write empty or trivial assertions (e.g. expect(true).toBe(true)).
-2. Match the EXACT import style shown in the existing test file or PROJECT TEST EXAMPLES. If none exists, use the style from the source file.
-3. Use path aliases from the PROJECT TYPESCRIPT CONFIG section in IMPORT statements (e.g. "@/components/Button" not "../../components/Button").
-   EXCEPTION — vi.mock() call paths: use the exact same path string that appears in the SOURCE FILE'S import statement.
-   If a LOCAL IMPORT PATHS section is provided, use those pre-computed relative paths in vi.mock() calls — they are the fallback when aliases cannot be resolved by Vitest.
-   Never second-guess the pre-computed paths. Never convert them back to @/ aliases in vi.mock() calls.
-4. Only import from packages listed in PROJECT DEPENDENCIES. Do not invent packages that are not listed.
-5. When a SHARED MOCK FILE is provided, its exported names are listed under "Available exports". Before writing the test, go through that list and identify every mock that relates to what the source file does (by name, type, or domain). Import and use ALL of those mocks. Never re-create inline vi.fn() / jest.fn() for anything already exported from the mocks file.
-   CRITICAL — never rename or change the casing of existing mock exports. If the mocks file has mockValidationError, use exactly mockValidationError — do NOT change it to MockValidationError or any other variant. Renaming an existing mock breaks every test that already imports it by the original name.
-6. If you need a mock that is missing from the shared mock file, add it to that file AND import it in the test. Return BOTH files separated by exactly one line containing only: // ---MOCKS_FILE---
-7. If a SHARED MOCK FILE (does not exist yet) section is shown — create it for any mocks you need and return it using the // ---MOCKS_FILE--- separator.
-   CRITICAL — the mocks file must contain ONLY: vi.fn()/jest.fn() mock definitions, vi.mock() module stubs, shared mock objects/constants, and beforeEach reset hooks. NEVER write describe(), it(), test(), or expect() calls in the mocks file. Those belong exclusively in the test file. A mocks file that contains test blocks will break the entire test suite.
-8. If a TEST SETUP FILE is shown, assume its globals and matchers are already available (e.g. expect(...).toBeInTheDocument()). Do NOT import or re-declare them.
-9. TypeScript type safety: all test code must compile without type errors. The TypeScript compiler is the authority — its error messages are exact instructions, not hints.
-   - When tsc reports an error, read it literally and apply the precise fix it describes. Never override the compiler with framework conventions or assumptions.
-   - Use EXACT property/member names from the TYPE DEFINITIONS section and source code. Do not apply naming conventions: if a hook returns { loading, users }, do NOT write isLoading or isUsers. Read what is actually declared.
-   - Import enums, constants, interfaces, and types from the project's existing files. Do NOT redeclare them inline or invent lookalike values. Check TYPE DEFINITIONS and the source file's imports for what already exists.
-   - Never use "as any", "@ts-ignore", or "@ts-expect-error" to suppress type errors. Use proper types or generics instead.
-   - For vi.fn() / jest.fn(), either let TypeScript infer the type from context or type it explicitly: vi.fn<Parameters<typeof fn>, ReturnType<typeof fn>>().
-   - Use ReturnType<>, Parameters<>, and other utility types to derive mock types from the real function signatures rather than guessing.
-   - When accessing optional properties, handle null/undefined correctly — do not assume they exist if the type says otherwise.
-10. Every test file MUST contain at least one it() or test() call with real assertions. A file with only imports, describe() blocks, types, or helper functions is invalid and will be rejected. If you cannot write meaningful tests, write a minimal test that exercises the simplest exported function.
-11. Structure ALL output using exactly these two XML blocks — nothing before, nothing after:
-    <thinking>
-    1. WHAT IS NEEDED: What functions/behaviors are untested or broken?
-    2. COMPONENT RENDER MAP (React components only): Before writing any assertion, list what is in the DOM in each relevant state (idle / loading / error / success). Read the JSX — check every ternary, &&, and switch — to determine whether a button is disabled vs unmounted, what text changes, what elements appear. Never assume a button is disabled during loading without verifying this in the JSX.
-    3. WHY IT FAILED (retries only): What is the structural root cause — wrong mock level, missing await, bad import path, type mismatch?
-    4. PLAN: List the exact steps you will take before writing a single line of code.
+2. Match the EXACT import style shown in the existing test file or PROJECT TEST EXAMPLES. If none exists, use the style from the source file.${jsRules}${tsRule}
+${ruleCount}. Every test file MUST contain at least one it() or test() call with real assertions. A file with only imports, describe() blocks, types, or helper functions is invalid and will be rejected.
+${ruleCount + 1}. Structure ALL output using exactly these two XML blocks — nothing before, nothing after:
+    <thinking>${thinkingTemplate}
     </thinking>
     <code_output>
     // complete test file here
     </code_output>
-    CRITICAL: Once you open <code_output>, ALL remaining output must be code. Never continue reasoning, writing bullet points,
-    or restating the problem inside <code_output>. If you are still uncertain, finish your reasoning inside <thinking> first,
-    then commit to a solution and write only code inside <code_output>. Thinking inside <code_output> corrupts the output file.
-12. Inside <code_output>: do NOT wrap in markdown code fences.
-13. Inside <code_output>: output ONLY the test file content (or test file // ---MOCKS_FILE--- mocks file).
-    If you use // ---MOCKS_FILE---, everything AFTER the separator is the mocks file. The mocks file must contain ONLY:
-    vi.fn()/jest.fn() mock definitions, vi.mock() module stubs, shared constants, and beforeEach resets.
-    NEVER put describe(), it(), test(), or expect() calls after the separator — those belong BEFORE it, in the test file.
-    Writing test blocks in the mocks section corrupts the shared mock file for every other test in the project.
-14. NEVER output vitest.config.ts, jest.config.js, or any framework configuration. If an import cannot be resolved,
-    fix it by mocking it with vi.mock() — NOT by modifying the test runner configuration. You cannot modify config
-    files from here, and outputting them will cause the entire mocks file to be discarded.
+    CRITICAL: Once you open <code_output>, ALL remaining output must be code. Finish ALL reasoning inside <thinking> first.
+${ruleCount + 2 <= ruleCount + 1 ? '' : `${ruleCount + 2}. Inside <code_output>: do NOT wrap in markdown code fences.`}${jsOutputRules}
 
 A good test suite you write will have:
 - A happy-path test that confirms the main behavior works
 - At least one edge-case test per function (empty input, zero, null, boundary values)
-- Error-path tests for any function that throws, rejects, or returns an error state
-- Async tests properly awaited — never fire-and-forget
+- Error-path tests for any function that throws, rejects, or returns an error state — but ONLY assert the observable effect. Read the catch block first: does it set state, call a notification, or just log? Test only what's observable.
+- Async tests properly awaited — never fire-and-forget${hookSuiteNote}
 - Clear, descriptive test names that read like a spec ("returns null when user is not authenticated")
 
 Common failure causes to avoid:
-- Wrong import paths (use aliases, not relative ../../ paths if the project uses aliases)
-- Importing from test utils that are not in the dependency list
-- Mocking modules that are already mocked in the setup file
-- Using browser globals without jsdom (only use them if the setup file configures jsdom)
-- Forgetting to await async functions
-- Top-level await (TS1378): NEVER use \`await\` at the top level of a test file. Every \`await\` must be inside an async callback: \`it("...", async () => { ... })\`, \`beforeEach(async () => { ... })\`, etc. Top-level \`await\` is rejected by most TypeScript configurations and will cause a type error even if the tests appear to run.
-- React 18 act() async rule: ALWAYS await act() when it wraps async code — \`await act(async () => { ... })\`. Never store an unawaited act() call in a variable like \`const promise = act(async () => ...)\` without immediately awaiting it. Unawaited act() calls cause React state updates to leak into subsequent tests, producing cascading timeout failures and "Cannot read properties of null" errors in unrelated tests.
-- vi.mock() paths are relative to the TEST FILE, not the source file. If the test is at src/features/auth/__tests__/Login.test.tsx and you need to mock src/components/Button, the mock path is ../../../components/Button — count directories from the TEST file's location, not the source file's.
-- Loading state architecture: before asserting that a button is disabled during loading, check whether the component hides the button entirely and replaces it with a spinner. If the button is unmounted during loading rather than disabled, \`getByText("Submit")\` will throw — test for the spinner instead, or use \`queryByText("Submit")\` with a null assertion.
-- Unhandled promise rejections: when testing error paths with mockRejectedValueOnce, the rejection must be fully resolved inside the test. After triggering the action, always use await waitFor(() => expect(errorElement).toBeInTheDocument()) to tie the rejection to the test scope. Never let a rejected mock promise go unawaited — Vitest will flag it as an unhandled error even if the component catches it internally.
-- Real HTTP requests: NEVER let a real network call reach the internet. If you see a real URL (https://...), a 401/403 error, or a network timeout in test output, your mock is missing or at the wrong level. Every function that calls an API must be mocked before the test runs.
-- Barrel file vi.mock() resolution: if a module is exported from a barrel/index file (e.g. src/components/index.ts re-exports Foo from ./Foo), mock the DIRECT file path, not the barrel. vi.mock('../components') mocks the barrel but the component may import directly from '../components/Foo' — making the mock miss. Always mock the specific module the source file actually imports. If unsure, mock both the direct file AND the barrel.
+${universalCauses}${jsCauses}${vitestCauses}${reactCauses}
 
 Test file pattern for this project: ${env.testFilePattern}
 
@@ -740,9 +825,9 @@ export function buildFixPrompt(args: {
     const nextGuidance = buildNextJsGuidance(analyzeNextJs(sourceCode))
     if (nextGuidance) parts.push(`\n${nextGuidance}`)
 
-    // For fix: skeleton with no function expansion — the test already tells the AI
-    // which function matters; showing signatures is enough to understand the API.
-    const FIX_SKELETON_THRESHOLD = 150
+    // For fix: show the full source so the AI can see exact return shapes, field names,
+    // and mock structure. Only skeleton truly enormous files to stay within token limits.
+    const FIX_SKELETON_THRESHOLD = 600
     const displaySource = sourceCode.split('\n').length > FIX_SKELETON_THRESHOLD
       ? buildSourceSkeleton(sourceCode, [])
       : sourceCode
@@ -805,6 +890,61 @@ export function buildFixPrompt(args: {
   return parts.join('\n')
 }
 
+export function buildPollutionFixPrompt(args: {
+  pollutorFile: string
+  pollutorCode: string
+  victimFile: string
+  victimCode: string
+  victimError: string
+  env: DetectedEnvironment
+}): string {
+  const { pollutorFile, pollutorCode, victimFile, victimCode, victimError } = args
+  const parts: string[] = []
+
+  parts.push('This test file corrupts shared state and causes another test file to fail when run afterwards.')
+  parts.push('Your job: add afterEach() or afterAll() cleanup to reset whatever global state this file mutates.')
+  parts.push('')
+  parts.push('Rules:')
+  parts.push('- DO NOT remove, rewrite, or alter any existing test logic or assertions')
+  parts.push('- ONLY add cleanup hooks — nothing else')
+  parts.push('- The fix must be minimal: add the smallest afterEach/afterAll that resets the leaked state')
+  parts.push('')
+
+  parts.push(`POLLUTING FILE (add cleanup here): ${pollutorFile}`)
+  parts.push('```')
+  parts.push(pollutorCode)
+  parts.push('```')
+  parts.push('')
+
+  parts.push(`VICTIM FILE (fails when run after the polluting file): ${victimFile}`)
+  parts.push('```')
+  parts.push(victimCode)
+  parts.push('```')
+  parts.push('')
+
+  parts.push('ERROR the victim gets when run after this file:')
+  parts.push('```')
+  parts.push(victimError.slice(0, 2000))
+  parts.push('```')
+  parts.push('')
+
+  parts.push('HOW TO DIAGNOSE:')
+  parts.push("1. Read the victim's error — what value is null/undefined/wrong, or what element is missing?")
+  parts.push('2. Search the polluting file for where that thing is set or modified (localStorage, window properties, module singletons, mock state, React context, timers, environment variables)')
+  parts.push('3. Add afterEach (or afterAll) in the polluting file to reset exactly that thing')
+  parts.push('')
+  parts.push('Common cleanup patterns:')
+  parts.push('  afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks() })')
+  parts.push('  afterEach(() => { localStorage.clear(); sessionStorage.clear() })')
+  parts.push('  afterEach(() => { delete (window as any).myProperty })')
+  parts.push('  afterEach(() => { myModuleSingleton.reset() })')
+  parts.push('  afterEach(() => { vi.useRealTimers() })')
+  parts.push('')
+  parts.push('Return the complete modified polluting file in the required <thinking> + <code_output> format.')
+
+  return parts.join('\n')
+}
+
 export interface FailedAttempt {
   attemptNumber: number
   hypothesis: string    // extracted from <thinking> block of the previous attempt
@@ -817,8 +957,18 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
   if (failedAttempts.length > 0) {
     parts.push(`You have already attempted to fix this ${failedAttempts.length} time(s). Do NOT repeat these failed approaches:`)
     for (const a of failedAttempts) {
-      const hyp = a.hypothesis ? `Planned: [${a.hypothesis.slice(0, 300)}]` : '(no plan recorded)'
-      parts.push(`- Attempt ${a.attemptNumber}: ${hyp} → failed with: ${a.failureReason.slice(0, 300)}`)
+      let hypContext = a.hypothesis
+      if (hypContext) {
+        const planMatch = hypContext.match(/(?:4\.\s*WHY IT FAILED|5\.\s*PLAN)[\s\S]*/i)
+        if (planMatch) {
+          hypContext = planMatch[0]
+        } else if (hypContext.length > 800) {
+          hypContext = '...' + hypContext.slice(-800)
+        }
+      }
+      
+      const hyp = hypContext ? `[${hypContext.slice(0, 1000)}]` : '(no plan recorded)'
+      parts.push(`- Attempt ${a.attemptNumber} Reasoning: ${hyp}\n  Failed with: ${a.failureReason.slice(0, 800)}`)
     }
     parts.push('')
   }

@@ -6,11 +6,12 @@ export type WorkerState =
   | { phase: 'writing'; file: string }
   | { phase: 'running'; file: string }
   | { phase: 'retrying'; file: string; attempt: number; max: number }
+  | { phase: 'regenerating'; file: string }
   | { phase: 'passed'; file: string }
   | { phase: 'failed'; file: string }
 
 const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-const ACTIVE: Set<WorkerState['phase']> = new Set(['generating', 'writing', 'running', 'retrying'])
+const ACTIVE: Set<WorkerState['phase']> = new Set(['generating', 'writing', 'running', 'retrying', 'regenerating'])
 // tip rotates every ~5 seconds at 80ms tick interval
 const TIP_TICKS = 62
 
@@ -52,6 +53,13 @@ export class WorkerDisplay {
     const prev = this.states[workerId]
     this.states[workerId] = state
 
+    if (state.phase === 'regenerating') {
+      // Fix failed — now trying regeneration. Undo the failed count so the regen's
+      // final phase (passed/failed) is the single counted outcome for this file.
+      if (prev.phase === 'failed') { this.done--; this.failedCount-- }
+      // Fall through to render the state (don't return early — non-TTY needs the log line)
+    } else
+
     if (prev.phase !== 'passed' && prev.phase !== 'failed') {
       if (state.phase === 'passed') { this.done++; this.passed++ }
       else if (state.phase === 'failed') { this.done++; this.failedCount++ }
@@ -86,8 +94,8 @@ export class WorkerDisplay {
       lines.push(this.formatRow(i, this.states[i], cols))
     }
 
-    const barWidth = Math.min(28, cols - 26)
-    const filled = this.total === 0 ? barWidth : Math.round(barWidth * this.done / this.total)
+    const barWidth = Math.max(1, Math.min(28, cols - 26))
+    const filled = Math.min(barWidth, this.total === 0 ? barWidth : Math.round(barWidth * this.done / this.total))
     const bar = chalk.green('█'.repeat(filled)) + chalk.dim('░'.repeat(barWidth - filled))
     const pct = this.total === 0 ? 100 : Math.round((this.done / this.total) * 100)
     const remaining = this.total - this.done
@@ -152,6 +160,11 @@ export class WorkerDisplay {
         label = chalk.yellow(`retry ${state.attempt}/${state.max}  `.slice(0, 10))
         file = state.file
         break
+      case 'regenerating':
+        icon = chalk.blueBright('↻')
+        label = chalk.blueBright('regen     ')
+        file = state.file
+        break
       case 'passed':
         icon = chalk.green('✓')
         label = chalk.green('passed    ')
@@ -181,9 +194,10 @@ export class WorkerDisplay {
       case 'generating': return `generating  ${state.file}`
       case 'writing':    return `writing     ${state.file}`
       case 'running':    return `running     ${state.file}`
-      case 'retrying':   return `retry ${state.attempt}/${state.max}  ${state.file}`
-      case 'passed':     return `✓ passed    ${state.file}`
-      case 'failed':     return `✗ failed    ${state.file}`
+      case 'retrying':      return `retry ${state.attempt}/${state.max}  ${state.file}`
+      case 'regenerating':  return `↻ regen      ${state.file}`
+      case 'passed':        return `✓ passed    ${state.file}`
+      case 'failed':        return `✗ failed    ${state.file}`
     }
   }
 }

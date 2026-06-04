@@ -1,20 +1,22 @@
-import { readFile, writeFile, mkdir, unlink } from 'fs/promises'
+import { readFile, writeFile, mkdir, unlink, readdir } from 'fs/promises'
 import { join, dirname, basename, extname } from 'path'
 import { access, stat } from 'fs/promises'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
-import { fileTestCommand } from '../lib/detector.js'
+import { fileTestCommand, multiFileTestCommand } from '../lib/detector.js'
 import { runCommand } from '../lib/runner.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 import { buildFixFileContext, computeRelativeImport, collectTypeDefinitions, collectLocalImportPaths, detectReactMajorVersion } from './context.js'
-import { TestGenerator, TruncatedOutputError, OscillationError, TRUNCATION_RETRY_MESSAGE } from './generator.js'
+import { TestGenerator, TruncatedOutputError, OscillationError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
+import { processGap } from './loop.js'
+import type { CoverageGap } from '../lib/coverage/types.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile } from '../lib/typecheck.js'
-import { hasTestFunctions, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent } from '../lib/validate.js'
+import { hasTestFunctions, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -27,6 +29,8 @@ export interface FixOptions {
   targetFile?: string
   workers?: number
   fresh?: boolean
+  regenerateOnFailure?: boolean
+  fixPolluters?: boolean
   log: (msg: string) => void
 }
 
@@ -67,46 +71,83 @@ async function clearFixCache(cwd: string): Promise<void> {
 export interface FixResult {
   filesProcessed: number
   filesFixed: number
+  filesAlreadyPassing: number
+  pollutersFixed: number
+  victimsRegenerated: number
   errors: string[]
 }
 
 // ─── Parse failing test files from runner output ──────────────────────────────
 
-const TEST_FILE_RE = /[\w./\\@-]+\.(?:test|spec)\.(?:tsx|mts|ts|jsx|js)/
+const TEST_FILE_RE = /[\w./\\@\[\]-]+\.(?:test|spec)\.(?:tsx|mts|ts|jsx|js)/
+
+function stripAnsi(s: string): string {
+  // Strip all CSI sequences (ESC [ ... letter), OSC sequences, carriage returns
+  return s.replace(/\x1B\[[0-9;]*[A-Za-z]/g, '').replace(/\x1B\][^\x1B]*/g, '').replace(/\r/g, '')
+}
 
 function parseFailingTestFiles(output: string, runner: string): string[] {
-  const files = new Set<string>()
   const lines = output.split('\n')
 
-  for (const line of lines) {
-    const clean = line.replace(/\x1B\[[0-9;]*m/g, '').trim()
+  // Two separate sets — cross/tick pattern (per-file summary) vs FAIL pattern (per-test details)
+  const crossFiles = new Set<string>()
+  const failFiles = new Set<string>()
 
-    // Vitest: cross character followed by file path (covers multiple cross symbols across versions)
+  for (const line of lines) {
+    const clean = stripAnsi(line).trim()
+
     if (runner === 'vitest' || runner === 'unknown') {
       const m = clean.match(new RegExp(`^[×✗✕✖✘❌]\\s+(${TEST_FILE_RE.source})`))
-      if (m) { files.add(m[1]); continue }
+      if (m) { crossFiles.add(m[1]); continue }
     }
 
-    // "FAIL <path>" — used by Jest and some Vitest reporters/configurations
     if (runner === 'jest' || runner === 'vitest' || runner === 'unknown') {
       const m = clean.match(new RegExp(`^FAIL\\s+(${TEST_FILE_RE.source})`))
-      if (m) { files.add(m[1]); continue }
+      if (m) { failFiles.add(m[1]) }
     }
   }
 
-  // Fallback: if no files matched via primary patterns, extract test file paths from
-  // stack traces. A path in a stack trace always belongs to a file that ran and failed.
-  // Over-inclusive is fine — fixFile re-runs each file first and skips it if already passing.
-  if (files.size === 0) {
+  // Parse the expected failing file count from the runner summary line
+  let expectedCount: number | null = null
+  for (const line of lines) {
+    const clean = stripAnsi(line).trim()
+    const mv = clean.match(/Test Files\s+(\d+)\s+failed/)
+    if (mv) { expectedCount = parseInt(mv[1], 10); break }
+    const mj = clean.match(/Test Suites:\s+(\d+)\s+failed/)
+    if (mj) { expectedCount = parseInt(mj[1], 10); break }
+  }
+
+  const combined = new Set([...crossFiles, ...failFiles])
+
+  if (expectedCount !== null && combined.size > expectedCount) {
+    // Over-detected: prune false positives by preferring files confirmed by both patterns,
+    // then FAIL-only (strong signal — comes from the detailed failures section),
+    // then cross-only last (more likely to include false positives).
+    const pruned = new Set<string>()
+    for (const f of crossFiles) { if (failFiles.has(f)) pruned.add(f) }
+    for (const f of failFiles) { if (pruned.size < expectedCount) pruned.add(f) }
+    for (const f of crossFiles) { if (pruned.size < expectedCount) pruned.add(f) }
+    return [...pruned]
+  }
+
+  // Supplement with stack traces only when primary patterns under-detected
+  const needsSupplement = expectedCount !== null ? combined.size < expectedCount : combined.size === 0
+  if (needsSupplement) {
+    let inTrace = false
     for (const line of lines) {
-      const clean = line.replace(/\x1B\[[0-9;]*m/g, '').trim()
-      // stack trace: at ... (src/foo.test.tsx:42:5) or at src/foo.test.tsx:42
+      const clean = stripAnsi(line).trim()
+      if (!clean || clean.startsWith('●') || clean.startsWith('FAIL') || /^[×✗✕✖✘❌]/.test(clean)) {
+        inTrace = false
+      }
       const m = clean.match(new RegExp(`\\(?(${TEST_FILE_RE.source}):\\d+`))
-      if (m) files.add(m[1])
+      if (m && !combined.has(m[1]) && !inTrace) {
+        combined.add(m[1])
+        inTrace = true
+      }
     }
   }
 
-  return [...files]
+  return [...combined]
 }
 
 // ─── Find the source file that a test file is testing ────────────────────────
@@ -123,7 +164,11 @@ async function findSourceFile(testFilePath: string, cwd: string): Promise<string
 
   const exts = [ext, '.ts', '.tsx', '.js', '.jsx']
   for (const e of exts) {
-    const candidate = join(cwd, sourceDir, `${sourceBase}${e}`)
+    // If sourceDir is absolute (testFilePath was absolute), use it directly.
+    // join(cwd, absoluteDir) doubles the path: /project/home/project/app/... which never exists.
+    const candidate = sourceDir.startsWith('/') || sourceDir.startsWith('\\')
+      ? join(sourceDir, `${sourceBase}${e}`)
+      : join(cwd, sourceDir, `${sourceBase}${e}`)
     try { await access(candidate); return candidate } catch { /* try next */ }
   }
   return null
@@ -137,7 +182,7 @@ async function fixFile(
   generator: TestGenerator,
   onStatus?: (state: WorkerState) => void,
   projectMemory?: string | null,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; skipped?: boolean; error?: string }> {
   const { config, env, cwd, dryRun, verbose, log } = options
   const shortPath = testFilePath.replace(cwd + '/', '')
   const absTestPath = testFilePath.startsWith('/') ? testFilePath : join(cwd, testFilePath)
@@ -148,9 +193,9 @@ async function fixFile(
   // Run just this test file to get focused error output
   const firstRun = await runCommand(fileTestCommand(env, absTestPath), cwd, 60_000)
   if (firstRun.success) {
-    if (!onStatus) log(chalk.green('  Already passing — skipping.'))
+    if (!onStatus) log(chalk.dim('  Already passing — skipping.'))
     onStatus?.({ phase: 'passed', file: shortPath })
-    return { success: true }
+    return { success: true, skipped: true }
   }
 
   let errorOutput = extractTestFailure(firstRun.stdout + '\n' + firstRun.stderr)
@@ -238,6 +283,15 @@ async function fixFile(
         continue
       }
       if (err instanceof OscillationError) {
+        if (attempt < config.maxIterations) {
+          // Iterations remain — give one escape-hatch attempt with fresh oscillation state
+          // and an explicit "completely different approach" message instead of stopping.
+          if (!onStatus) log(chalk.yellow(`\n  ⚠ Agent loop detected — retrying with different strategy...`))
+          onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations })
+          generator.resetOscillationState()
+          errorOutput = OSCILLATION_ESCAPE_MESSAGE
+          continue
+        }
         if (!onStatus) log(chalk.red(`\n  ⚠ Agent loop detected — output identical to a previous attempt. Stopping early.`))
         onStatus?.({ phase: 'failed', file: shortPath })
         await writeFile(absTestPath, testCode, 'utf-8').catch(() => {})
@@ -288,6 +342,8 @@ async function fixFile(
         }
       }
     }
+
+    testFileContent = deduplicateViMocks(testFileContent)
 
     // Catch empty test files before writing
     if (!hasTestFunctions(testFileContent)) {
@@ -349,6 +405,244 @@ async function fixFile(
   }
 }
 
+// ─── Polluter detection ───────────────────────────────────────────────────────
+
+function buildTestFileRegex(pattern: string): RegExp {
+  const filename = pattern.split('/').pop() ?? pattern
+  const regexStr = filename
+    .replace(/\{([^}]+)\}/g, (_: string, g: string) => `(${g.split(',').map((s: string) => s.trim()).join('|')})`)
+    .replace(/\./g, '\\.')
+    .replace(/\*+/g, '[^/]+')
+  return new RegExp(regexStr + '$')
+}
+
+async function discoverTestFiles(cwd: string, env: { testFilePattern: string }): Promise<string[]> {
+  const testRe = buildTestFileRegex(env.testFilePattern)
+  const files: string[] = []
+  const skipDirs = new Set(['node_modules', 'dist', '.git', 'coverage', '.nyc_output', '.lacuna'])
+
+  async function walk(dir: string): Promise<void> {
+    const entries = await readdir(dir, { withFileTypes: true }).catch(() => [])
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (!skipDirs.has(e.name)) await walk(join(dir, e.name))
+      } else if (testRe.test(e.name)) {
+        files.push(join(dir, e.name))
+      }
+    }
+  }
+
+  await walk(cwd)
+  return files.sort()
+}
+
+function victimInFailing(victim: string, failing: string[], cwd: string): boolean {
+  const rel = (p: string) => (p.startsWith(cwd + '/') ? p.slice(cwd.length + 1) : p)
+  const shortVictim = rel(victim)
+  return failing.some(f => {
+    const shortF = rel(f)
+    return shortF === shortVictim || shortVictim.endsWith(shortF) || shortF.endsWith(shortVictim)
+  })
+}
+
+async function victimFailsWithSubset(
+  victim: string,
+  subset: string[],
+  env: import('../lib/detector.js').DetectedEnvironment,
+  cwd: string,
+): Promise<boolean> {
+  if (subset.length === 0) return false
+  const result = await runCommand(multiFileTestCommand(env, [...subset, victim]), cwd, 120_000)
+  if (result.success) return false
+  const failing = parseFailingTestFiles(result.stdout + '\n' + result.stderr, env.testRunner)
+  return victimInFailing(victim, failing, cwd)
+}
+
+async function bisectPolluter(
+  victim: string,
+  candidates: string[],
+  env: import('../lib/detector.js').DetectedEnvironment,
+  cwd: string,
+): Promise<string | null> {
+  if (candidates.length === 0) return null
+
+  if (candidates.length === 1) {
+    const fails = await victimFailsWithSubset(victim, candidates, env, cwd)
+    return fails ? candidates[0] : null
+  }
+
+  const mid = Math.floor(candidates.length / 2)
+  const left = candidates.slice(0, mid)
+  const right = candidates.slice(mid)
+
+  if (await victimFailsWithSubset(victim, left, env, cwd)) return bisectPolluter(victim, left, env, cwd)
+  if (await victimFailsWithSubset(victim, right, env, cwd)) return bisectPolluter(victim, right, env, cwd)
+  return null
+}
+
+async function findAndFixPolluters(
+  victimFiles: string[],
+  options: FixOptions,
+  projectMemory?: string | null,
+): Promise<{ pollutersFixed: number; victimsRegenerated: number }> {
+  const { config, env, cwd, log } = options
+
+  const allTestFiles = await discoverTestFiles(cwd, env)
+  log(chalk.dim(`  Discovered ${allTestFiles.length} test files to search.`))
+
+  const generator = new TestGenerator({ config, env })
+  let pollutersFixed = 0
+  let victimsRegenerated = 0
+  const seenPolluters = new Set<string>()
+  const unresolvedVictims: string[] = []
+
+  for (const victim of victimFiles) {
+    const shortVictim = victim.replace(cwd + '/', '')
+    log(chalk.dim(`\n  Bisecting for: ${chalk.cyan(shortVictim)}`))
+
+    const candidates = allTestFiles.filter(f => f !== victim)
+
+    // Probe: verify the pollution reproduces before spending O(log N) bisect runs.
+    // If it doesn't reproduce here, the pollution requires vitest's default multi-worker
+    // config to manifest and can't be found by this approach.
+    log(chalk.dim(`  Probing (${candidates.length} files + victim)...`))
+    const reproduced = await victimFailsWithSubset(victim, candidates, env, cwd)
+    if (!reproduced) {
+      log(chalk.yellow(`  Pollution did not reproduce in sequential mode — this is concurrency-based globalThis contamination.`))
+      log(chalk.dim(`  A vi.spyOn(global, ...) spy from another file is persisting in the shared worker thread.`))
+      log(chalk.dim(`  Fix: add restoreMocks: true and clearMocks: true to the test: {} block in vitest.config.ts`))
+      log(chalk.dim(`  Also add beforeEach(() => vi.restoreAllMocks()) to your test setup file.`))
+      unresolvedVictims.push(victim)
+      continue
+    }
+
+    const polluter = await bisectPolluter(victim, candidates, env, cwd)
+
+    if (!polluter) {
+      log(chalk.yellow(`  Could not isolate a polluter — file may have an internal spy lifecycle bug.`))
+      unresolvedVictims.push(victim)
+      continue
+    }
+
+    const shortPolluter = polluter.replace(cwd + '/', '')
+    log(`  Found polluter: ${chalk.cyan(shortPolluter)}`)
+
+    if (seenPolluters.has(polluter)) {
+      log(chalk.dim(`  Already processed ${shortPolluter}.`))
+      continue
+    }
+    seenPolluters.add(polluter)
+
+    // Capture the victim's failure output when run after the polluter
+    const errorRun = await runCommand(multiFileTestCommand(env, [polluter, victim]), cwd, 60_000)
+    const victimError = extractTestFailure(errorRun.stdout + '\n' + errorRun.stderr)
+
+    const pollutorCode = await readFile(polluter, 'utf-8').catch(() => null)
+    const victimCode = await readFile(victim, 'utf-8').catch(() => null)
+    if (!pollutorCode || !victimCode) {
+      log(chalk.red(`  Could not read files — skipping ${shortPolluter}`))
+      unresolvedVictims.push(victim)
+      continue
+    }
+
+    log(chalk.dim(`  Sending to ${config.model} for cleanup...`))
+    let fixed: string
+    try {
+      fixed = await generator.fixPollution({
+        pollutorFile: shortPolluter,
+        pollutorCode,
+        victimFile: shortVictim,
+        victimCode,
+        victimError,
+        env,
+      })
+    } catch (err) {
+      log(chalk.red(`  AI error: ${err instanceof Error ? err.message : String(err)}`))
+      unresolvedVictims.push(victim)
+      continue
+    }
+
+    await writeFile(polluter, fixed, 'utf-8')
+    const verifyRun = await runCommand(multiFileTestCommand(env, [polluter, victim]), cwd, 60_000)
+    const verifyFailing = parseFailingTestFiles(verifyRun.stdout + '\n' + verifyRun.stderr, env.testRunner)
+    const victimResolved = !victimInFailing(victim, verifyFailing, cwd)
+
+    if (victimResolved) {
+      log(chalk.green(`  Cleanup applied: ${shortPolluter}`))
+      pollutersFixed++
+    } else {
+      log(chalk.red(`  Cleanup did not resolve the victim — restoring ${shortPolluter}`))
+      await writeFile(polluter, pollutorCode, 'utf-8').catch(() => {})
+      unresolvedVictims.push(victim)
+    }
+  }
+
+  // Phase 2: regenerate victims that bisection couldn't resolve.
+  // These files pass alone but fail in the suite due to internal bugs
+  // (e.g. module-level vi.spyOn, wrong mock structure). A fresh generation
+  // produces properly-structured tests with spies inside beforeEach.
+  if (unresolvedVictims.length > 0 && options.regenerateOnFailure !== false) {
+    log(chalk.bold(`\n  Regenerating ${unresolvedVictims.length} victim file(s) that couldn't be resolved by polluter cleanup...`))
+    for (const victim of unresolvedVictims) {
+      const shortVictim = victim.replace(cwd + '/', '')
+      log(chalk.dim(`\n  Regenerating: ${chalk.cyan(shortVictim)}`))
+      const result = await regenerateFile(victim, options, undefined, projectMemory)
+      if (result.success) {
+        log(chalk.green(`  Regenerated successfully.`))
+        victimsRegenerated++
+      } else {
+        log(chalk.red(`  Regeneration failed: ${result.error?.slice(0, 200) ?? 'unknown error'}`))
+      }
+    }
+  }
+
+  return { pollutersFixed, victimsRegenerated }
+}
+
+// ─── Regeneration fallback ────────────────────────────────────────────────────
+
+async function regenerateFile(
+  testFilePath: string,
+  options: FixOptions,
+  onStatus?: (state: WorkerState) => void,
+  projectMemory?: string | null,
+): Promise<{ success: boolean; error?: string }> {
+  const absTestFile = testFilePath.startsWith('/') ? testFilePath : join(options.cwd, testFilePath)
+
+  // Find the source file so processGap gets the right starting point.
+  // processGap expects gap.filePath to be the SOURCE file, not the test file.
+  const sourceFile = await findSourceFile(absTestFile, options.cwd)
+  if (!sourceFile) {
+    return { success: false, error: `Could not find source file for ${absTestFile}` }
+  }
+
+  // Delete the broken test file before regenerating. If it stays on disk,
+  // buildFileContext reads it as existingTestCode and the generate prompt says
+  // "preserve all existing tests" — locking the AI into the same broken structure.
+  await unlink(absTestFile).catch(() => {})
+
+  const gap: CoverageGap = { filePath: sourceFile, uncoveredLines: [], uncoveredFunctions: [] }
+  const generator = new TestGenerator({ config: options.config, env: options.env })
+
+  // processGap uses gap.filePath (the source file) as its display identifier, but during
+  // regen the worker should stay in 'regenerating' for all intermediate phases and only
+  // flip to passed/failed at the end. This prevents the brief flash where 'regenerating'
+  // gets overwritten by 'generating' (<80ms) as soon as processGap starts.
+  const testShortPath = absTestFile.replace(options.cwd + '/', '')
+  const regenOnStatus = onStatus
+    ? (state: WorkerState) => {
+        if (state.phase === 'passed' || state.phase === 'failed') {
+          onStatus('file' in state ? { ...state, file: testShortPath } : state)
+        } else {
+          onStatus({ phase: 'regenerating', file: testShortPath })
+        }
+      }
+    : undefined
+
+  const result = await processGap(gap, options, generator, true, regenOnStatus, projectMemory)
+  return { success: result.success, error: result.error }
+}
+
 // ─── Worker pool ──────────────────────────────────────────────────────────────
 
 async function runFixWorkers(
@@ -356,12 +650,14 @@ async function runFixWorkers(
   options: FixOptions,
   workerCount: number,
   projectMemory: string | null,
-): Promise<{ filesProcessed: number; filesFixed: number; errors: string[]; stillFailingFiles: string[] }> {
+): Promise<{ filesProcessed: number; filesFixed: number; filesAlreadyPassing: number; errors: string[]; stillFailingFiles: string[]; victimFiles: string[] }> {
   const queue = [...testFiles]
   let filesProcessed = 0
   let filesFixed = 0
+  let filesAlreadyPassing = 0
   const errors: string[] = []
   const stillFailingFiles: string[] = []
+  const victimFiles: string[] = []
 
   const tips = getActiveTips({
     workers: workerCount,
@@ -384,10 +680,25 @@ async function runFixWorkers(
         const file = queue.shift()
         if (!file) break
         const onStatus = (state: WorkerState) => display.update(wi, state)
-        const result = await fixFile(file, { ...options, log: () => {}, verbose: false }, generator, onStatus, projectMemory)
+        const absFile = file.startsWith('/') ? file : join(options.cwd, file)
+        const workerOptions = { ...options, log: () => {}, verbose: false }
+        const result = await fixFile(absFile, workerOptions, generator, onStatus, projectMemory)
         filesProcessed++
-        if (result.success) filesFixed++
-        else {
+        if (result.success) {
+          if (result.skipped) { filesAlreadyPassing++; victimFiles.push(absFile) }
+          else filesFixed++
+        } else if (options.regenerateOnFailure) {
+          // Signal 'regenerating' first — this undoes the 'failed' done-count from fixFile
+          // so the regen's final phase is the single counted outcome for this file.
+          onStatus?.({ phase: 'regenerating', file: absFile.replace(options.cwd + '/', '') })
+          const regenResult = await regenerateFile(absFile, workerOptions, onStatus, projectMemory)
+          if (regenResult.success) {
+            filesFixed++
+          } else {
+            stillFailingFiles.push(file)
+            if (regenResult.error) errors.push(regenResult.error)
+          }
+        } else {
           stillFailingFiles.push(file)
           if (result.error) errors.push(result.error)
         }
@@ -396,7 +707,7 @@ async function runFixWorkers(
   )
 
   display.finish()
-  return { filesProcessed, filesFixed, errors, stillFailingFiles }
+  return { filesProcessed, filesFixed, filesAlreadyPassing, errors, stillFailingFiles, victimFiles }
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
@@ -419,7 +730,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
 
     if (fileResult.success) {
       log(chalk.green('\n  All tests are passing — nothing to fix.'))
-      return { filesProcessed: 0, filesFixed: 0, errors: [] }
+      return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
     }
 
     failingFiles = [absTarget]
@@ -445,7 +756,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
 
       if (suiteResult.success) {
         log(chalk.green('\n  All tests are passing — nothing to fix.'))
-        return { filesProcessed: 0, filesFixed: 0, errors: [] }
+        return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
       }
 
       failingFiles = parseFailingTestFiles(suiteResult.stdout + suiteResult.stderr, env.testRunner)
@@ -463,7 +774,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
           .slice(-20)
           .join('\n')
         if (lastLines) log(chalk.dim('\n  Last output lines:\n' + lastLines.split('\n').map((l) => `    ${l}`).join('\n')))
-        return { filesProcessed: 0, filesFixed: 0, errors: [] }
+        return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
       }
 
       await saveFixCache(cwd, failingFiles)
@@ -482,16 +793,20 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
 
   let filesProcessed: number
   let filesFixed: number
+  let filesAlreadyPassing: number
   let errors: string[]
   let stillFailingFiles: string[]
+  let victimFiles: string[]
 
   if (parallel) {
-    ;({ filesProcessed, filesFixed, errors, stillFailingFiles } = await runFixWorkers(failingFiles, options, workerCount, memorySnapshot))
+    ;({ filesProcessed, filesFixed, filesAlreadyPassing, errors, stillFailingFiles, victimFiles } = await runFixWorkers(failingFiles, options, workerCount, memorySnapshot))
   } else {
     filesProcessed = 0
     filesFixed = 0
+    filesAlreadyPassing = 0
     errors = []
     stillFailingFiles = []
+    victimFiles = []
     const generator = new TestGenerator({ config, env })
     const tips = getActiveTips({
       workers: 1,
@@ -511,8 +826,19 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       const absFile = file.startsWith('/') ? file : join(cwd, file)
       const result = await fixFile(absFile, options, generator, undefined, memory.toPromptSection())
       filesProcessed++
-      if (result.success) filesFixed++
-      else {
+      if (result.success) {
+        if (result.skipped) { filesAlreadyPassing++; victimFiles.push(absFile) }
+        else filesFixed++
+      } else if (options.regenerateOnFailure) {
+        log(chalk.yellow(`  Fix exhausted — falling back to full regeneration...`))
+        const regenResult = await regenerateFile(absFile, options, undefined, memory.toPromptSection())
+        if (regenResult.success) {
+          filesFixed++
+        } else {
+          stillFailingFiles.push(file)
+          if (regenResult.error) errors.push(regenResult.error)
+        }
+      } else {
         stillFailingFiles.push(file)
         if (result.error) errors.push(result.error)
       }
@@ -528,5 +854,14 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
     else await clearFixCache(cwd)
   }
 
-  return { filesProcessed, filesFixed, errors }
+  let pollutersFixed = 0
+  let victimsRegenerated = 0
+  if (options.fixPolluters && victimFiles.length > 0) {
+    log(chalk.bold(`\n  Scanning for test polluters (${victimFiles.length} victim file(s) pass alone but fail in suite)...`))
+    const polluterResult = await findAndFixPolluters(victimFiles, options, memorySnapshot)
+    pollutersFixed = polluterResult.pollutersFixed
+    victimsRegenerated = polluterResult.victimsRegenerated
+  }
+
+  return { filesProcessed, filesFixed, filesAlreadyPassing, pollutersFixed, victimsRegenerated, errors }
 }

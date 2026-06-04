@@ -69,8 +69,8 @@ Works from any subdirectory — lacuna finds the project root automatically.
 
 For **React and Next.js** projects, `lacuna init` also:
 - Installs `@testing-library/react`, `@testing-library/jest-dom`, `@testing-library/user-event`, and `jsdom`
-- Creates `vitest.config.ts` with the correct `environment: 'jsdom'` and `@/` alias (read from your `tsconfig.json`)
-- Creates a setup file pre-loaded with global `vi.mock()` calls for `next/navigation`, `next/headers`, and `next/cache` so individual tests don't need to mock them
+- Creates `vitest.config.ts` with `environment: 'jsdom'`, `@/` alias (read from your `tsconfig.json`), and `restoreMocks: true` + `clearMocks: true` — these run `vi.restoreAllMocks()` at the Vitest worker level before each test, preventing cross-file `globalThis` spy contamination that causes tests to pass alone but fail in the full suite
+- Creates a setup file with global `vi.mock()` calls for `next/navigation`, `next/headers`, and `next/cache`, plus `beforeEach`/`afterEach` mock cleanup hooks so individual tests don't need to handle this themselves
 
 ```bash
 lacuna init
@@ -108,7 +108,7 @@ lacuna generate --format json --output report.json
 ```
 
 ### `lacuna fix`
-Finds all failing tests and repairs them using AI — without rewriting them from scratch. Sends each failing file along with its error output and source code to the model, which surgically fixes what's broken and retries until it passes.
+Finds all failing tests and repairs them using AI. Sends each failing file along with its error output and source code to the model, which surgically fixes what's broken and retries until it passes. If all fix retries fail, lacuna automatically deletes the broken test and regenerates it from the source file — a clean slate rather than another round of patchwork.
 
 ```bash
 lacuna fix
@@ -117,15 +117,19 @@ lacuna fix --file src/utils/math.test.ts   # fix a single test file (skips full 
 lacuna fix --dry-run                       # preview fixes without writing
 lacuna fix --verbose                       # live code panel as model writes each fix
 lacuna fix --fresh                         # re-run the suite even if cache is recent
+lacuna fix --no-regenerate-on-failure      # disable the regen fallback (fix only, no delete)
+lacuna fix --fix-polluters                 # also handle tests that pass alone but fail in suite
 ```
 
-Unlike `lacuna generate`, which creates new tests, `lacuna fix` operates on existing failing tests. It preserves all test logic and only changes what is necessary to make the suite pass.
+Unlike `lacuna generate`, which creates new tests, `lacuna fix` operates on existing failing tests and preserves all test logic where possible.
 
-If all retries fail or the model oscillates (identical output detected), the original file is restored automatically. Your test suite is always left in a coherent state.
+**Regeneration fallback (default on):** When fix retries are exhausted, lacuna deletes the test file and regenerates it from scratch using the generate path. This works better than continued repair for structurally broken tests — the AI starts with a clean conversation and full source context instead of carrying forward a chain of failed hypotheses. Use `--no-regenerate-on-failure` to disable this and get fix-only behaviour.
 
-If a fix attempt breaks an import (causing 0 tests to be collected) or reduces the number of passing tests, lacuna detects the regression and tells the model exactly what the original failure was — so it doesn't waste further iterations trying to recover from the wrong problem.
+**Passing in isolation, failing in suite (`--fix-polluters`):** Some tests pass when run alone but fail in the full suite. `--fix-polluters` handles these in two phases: (1) bisect the test suite to find if another file is leaking state (e.g. an uncleaned mock or global), and fix the polluter; (2) if no polluter can be isolated (the test has an internal spy lifecycle bug), delete and regenerate the victim file directly.
 
-When `--file` is given, lacuna skips the full suite and runs only the target file — much faster for iterating on a single broken test. Without `--file`, the failing-files list is cached for 30 minutes. After a fix run, the cache is updated to contain only the files that are still failing — so re-running `lacuna fix` immediately picks up exactly where the last run left off. Once all files are fixed, the cache is cleared so the next run does a clean suite scan.
+If all retries fail or the model oscillates (identical output detected), the original file is restored automatically. If a fix attempt breaks an import or reduces passing tests, lacuna detects the regression and anchors the next retry to the original error.
+
+When `--file` is given, lacuna skips the full suite and runs only the target file. Without `--file`, the failing-files list is cached for 30 minutes. After a fix run, the cache is updated to contain only the still-failing files — so re-running immediately picks up where the last run left off.
 
 ### `lacuna run`
 Runs your test suite and reports coverage. No AI involved.
@@ -167,7 +171,7 @@ Created by `lacuna init`. All fields are optional with sensible defaults.
 | `testRunner` | auto-detect | `jest` \| `vitest` \| `pytest` \| `mocha` \| `go-test` |
 | `coverageFormat` | `lcov` | `lcov` \| `json-summary` |
 | `coverageDir` | `coverage` | Where your test runner writes coverage |
-| `sourceDir` | `src` | Root directory of source files — set during `lacuna init` |
+| `sourceDir` | `"src"` | Source directory to scan. Accepts a string or an array — `["src", "lib", "utils"]` scans multiple directories |
 | `threshold` | `80` | Minimum line coverage % to pass |
 | `maxIterations` | `3` | How many times to retry a failing generated test |
 | `coverageTimeout` | `300` | Seconds before the test suite is killed (prevents hanging on open handles) |

@@ -151,7 +151,7 @@ async function testFileExists(absSourcePath: string): Promise<boolean> {
 
 export async function findUncoveredFiles(
   report: CoverageReport,
-  sourceDir: string,
+  sourceDir: string | string[],
   cwd: string,
   userIgnore: string[] = [],
 ): Promise<CoverageGap[]> {
@@ -160,9 +160,9 @@ export async function findUncoveredFiles(
   const coveredPaths = new Set(
     report.files.map((f) => (f.path.startsWith('/') ? f.path : join(cwd, f.path))),
   )
-  const absoluteSourceDir = join(cwd, sourceDir)
+  const dirs = (Array.isArray(sourceDir) ? sourceDir : [sourceDir]).map(d => join(cwd, d))
 
-  const allSourceFiles = await walkDir(absoluteSourceDir).catch(() => [] as string[])
+  const allSourceFiles = (await Promise.all(dirs.map(d => walkDir(d).catch(() => [] as string[])))).flat()
 
   const uncovered: CoverageGap[] = []
   for (const absPath of allSourceFiles) {
@@ -192,10 +192,10 @@ const TEST_FILE_RE = /\.(test|spec)\.[^.]+$|^test_[^/]+$|_test\.[^.]+$/
 export async function findTestFiles(
   cwd: string,
   _env: { sourceDir?: string },
-  config: { sourceDir: string; ignore: string[] },
+  config: { sourceDir: string | string[]; ignore: string[] },
 ): Promise<string[]> {
-  const root = join(cwd, config.sourceDir)
-  const all = await walkDir(root).catch(() => [])
+  const dirs = (Array.isArray(config.sourceDir) ? config.sourceDir : [config.sourceDir]).map(d => join(cwd, d))
+  const all = (await Promise.all(dirs.map(d => walkDir(d).catch(() => [] as string[])))).flat()
   return all.filter((f) => {
     const rel = f.replace(cwd + sep, '').replace(cwd + '/', '')
     return TEST_FILE_RE.test(rel) && !shouldIgnore(f, config.ignore)

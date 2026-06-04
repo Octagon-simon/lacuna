@@ -12,6 +12,8 @@ export default class Fix extends Command {
     '$ lacuna fix --workers 4',
     '$ lacuna fix --file src/utils/math.test.ts',
     '$ lacuna fix --dry-run',
+    '$ lacuna fix --regenerate-on-failure',
+    '$ lacuna fix --fix-polluters',
   ]
 
   static flags = {
@@ -39,6 +41,15 @@ export default class Fix extends Command {
     }),
     fresh: Flags.boolean({
       description: 'Re-run the full test suite even if a recent failing-files cache exists',
+      default: false,
+    }),
+    'regenerate-on-failure': Flags.boolean({
+      description: 'If fix exhausts all retries, delete the test and regenerate it from scratch (default: on). Use --no-regenerate-on-failure to disable.',
+      default: true,
+      allowNo: true,
+    }),
+    'fix-polluters': Flags.boolean({
+      description: 'After fixing, bisect the test suite to identify files that corrupt shared state, then use AI to add cleanup',
       default: false,
     }),
   }
@@ -74,6 +85,8 @@ export default class Fix extends Command {
         targetFile: flags.file,
         workers: flags.workers,
         fresh: flags.fresh,
+        regenerateOnFailure: flags['regenerate-on-failure'],
+        fixPolluters: flags['fix-polluters'],
         log: (msg) => this.log(msg),
       })
     } catch (err) {
@@ -85,9 +98,23 @@ export default class Fix extends Command {
     this.log(`  ${chalk.dim('Files processed:')} ${result.filesProcessed}`)
     this.log(`  ${chalk.dim('Files fixed:')}     ${chalk.green(String(result.filesFixed))}`)
 
-    const stillFailing = result.filesProcessed - result.filesFixed
+    if (result.filesAlreadyPassing > 0) {
+      this.log(`  ${chalk.dim('Already passing:')} ${chalk.dim(String(result.filesAlreadyPassing))}`)
+    }
+    if (result.pollutersFixed > 0) {
+      this.log(`  ${chalk.dim('Polluters fixed:')} ${chalk.green(String(result.pollutersFixed))}`)
+    }
+    if (result.victimsRegenerated > 0) {
+      this.log(`  ${chalk.dim('Victims regen:')}   ${chalk.green(String(result.victimsRegenerated))}`)
+    }
+
+    const stillFailing = result.filesProcessed - result.filesFixed - result.filesAlreadyPassing
     if (stillFailing > 0) {
       this.log(`  ${chalk.dim('Still failing:')}  ${chalk.red(String(stillFailing))}`)
+    }
+
+    if (result.filesAlreadyPassing > 0 && !flags['fix-polluters']) {
+      this.log(chalk.dim(`\n  ${result.filesAlreadyPassing} file(s) passed in isolation but fail in the suite. Use --fix-polluters to bisect + regenerate them.`))
     }
 
     if (result.errors.length > 0) {
@@ -100,7 +127,11 @@ export default class Fix extends Command {
 
     if (result.filesProcessed === 0) {
       this.exit(0)
-    } else if (result.filesFixed === result.filesProcessed) {
+    } else if (stillFailing === 0) {
+      if (result.filesAlreadyPassing > 0 && result.filesFixed === 0) {
+        this.log(chalk.yellow(`\n  No tests were repaired — all skipped as already passing. Run lacuna fix --fresh to re-scan.`))
+        this.exit(1)
+      }
       this.log(chalk.green('\n  All failing tests fixed.'))
       this.exit(0)
     } else {

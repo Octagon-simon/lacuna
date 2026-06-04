@@ -118,6 +118,26 @@ export function envForRunner(runner: string): DetectedEnvironment {
   )
 }
 
+// Run multiple test files in a single invocation, with the victim always last.
+// Forces sequential execution in a single thread with shared module registry so that
+// state pollution (module singletons, globals, localStorage) from earlier files is
+// visible to the victim — required for bisect to reproduce ordering failures.
+export function multiFileTestCommand(env: DetectedEnvironment, files: string[]): string {
+  const fileList = files.join(' ')
+  switch (env.testRunner) {
+    case 'vitest':
+      // --poolOptions.threads.singleThread=true: all files run in one worker thread (shared globals)
+      // --no-isolate: all files share the same module registry (shared module singletons)
+      return `npx vitest run --poolOptions.threads.singleThread=true --no-isolate ${fileList}`
+    case 'jest':
+      return `npx jest --runInBand ${fileList}`
+    case 'mocha':
+      return `npx mocha ${fileList}`
+    default:
+      return fileTestCommand(env, files[files.length - 1])
+  }
+}
+
 export function fileTestCommand(env: DetectedEnvironment, testFilePath: string): string {
   switch (env.testRunner) {
     case 'vitest': return `npx vitest run ${testFilePath}`

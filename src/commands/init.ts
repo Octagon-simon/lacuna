@@ -108,7 +108,40 @@ async function findProjectRoot(startDir: string): Promise<string> {
   }
 }
 
-function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svelte' | 'angular' | 'nest' | 'nextjs'): string {
+function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svelte' | 'angular' | 'nest' | 'nextjs', runner: string): string {
+  // Mock cleanup — prevents spy state from leaking across tests and test files.
+  // beforeEach: restores any globalThis spies left by previous files in the same worker
+  //             (works in concert with restoreMocks: true in vitest.config.ts)
+  // afterEach:  belt-and-suspenders cleanup within the file
+  const vitestCleanup = [
+    ``,
+    `// ── Mock cleanup ──────────────────────────────────────────────────────────`,
+    `// restoreMocks/clearMocks in vitest.config.ts handle this automatically,`,
+    `// but explicit hooks here guard against any gaps.`,
+    `// vi is available globally (globals: true in vitest.config.ts).`,
+    ``,
+    `beforeEach(() => {`,
+    `  vi.restoreAllMocks()`,
+    `})`,
+    ``,
+    `afterEach(() => {`,
+    `  vi.restoreAllMocks()`,
+    `  vi.clearAllMocks()`,
+    `})`,
+  ].join('\n')
+
+  const jestCleanup = [
+    ``,
+    `// ── Mock cleanup ──────────────────────────────────────────────────────────`,
+    `// Runs after every test to prevent mock state leaking across test files.`,
+    `afterEach(() => {`,
+    `  jest.restoreAllMocks()`,
+    `  jest.clearAllMocks()`,
+    `})`,
+  ].join('\n')
+
+  const cleanup = runner === 'vitest' ? vitestCleanup : jestCleanup
+
   if (variant === 'react-native') {
     return [
       `// React Native / Expo test setup`,
@@ -119,23 +152,24 @@ function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svel
       ``,
       `// Silence the native animated warning in tests`,
       `jest.mock('react-native/Libraries/Animated/NativeAnimatedHelper')`,
+      jestCleanup,
     ].join('\n') + '\n'
   }
 
   if (variant === 'angular') {
-    return `import 'jest-preset-angular/setup-jest'\n`
+    return `import 'jest-preset-angular/setup-jest'\n` + jestCleanup + '\n'
   }
 
   if (variant === 'nest') {
-    return `// NestJS test setup — no DOM environment needed\n`
+    return `// NestJS test setup — no DOM environment needed\n` + jestCleanup + '\n'
   }
 
   if (variant === 'vue') {
-    return `import '@testing-library/jest-dom'\n`
+    return `import '@testing-library/jest-dom'\n` + cleanup + '\n'
   }
 
   if (variant === 'svelte') {
-    return `import '@testing-library/jest-dom'\n`
+    return `import '@testing-library/jest-dom'\n` + cleanup + '\n'
   }
 
   const lines = [`import '@testing-library/jest-dom'`]
@@ -185,7 +219,11 @@ function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svel
       `vi.mock('next/font/local', () => ({`,
       `  default: vi.fn(() => ({ className: 'font-local', style: { fontFamily: 'local' } })),`,
       `}))`,
+      vitestCleanup,
     )
+  } else {
+    // plain react
+    lines.push(cleanup)
   }
 
   return lines.join('\n') + '\n'
@@ -339,10 +377,22 @@ async function ensureTestRunnerSetup(
         : meta.isVue ? 'vue'
         : meta.isSvelte ? 'svelte'
         : 'react'
-      const setupContent = buildSetupFileContent(setupVariant)
+      const setupContent = buildSetupFileContent(setupVariant, runner)
       await writeFileWithDir(absSetup, setupContent)
       log(chalk.green(`  ✓ Created ${setupFilePath}`))
-      if (meta.isNextJs) log(chalk.dim(`    Includes global mocks for next/navigation, next/headers, next/cache`))
+      if (meta.isNextJs) {
+        log(chalk.dim(`    Includes global mocks for next/navigation, next/headers, next/cache`))
+        // Create the empty module that the server-only alias points to.
+        // Without this file, Vitest crashes when any source file imports 'server-only'.
+        const emptyModulePath = resolve(cwd, 'test/empty-module.ts')
+        try {
+          await access(emptyModulePath)
+        } catch {
+          await writeFileWithDir(emptyModulePath, 'export default {}\n')
+          log(chalk.green(`  ✓ Created test/empty-module.ts`))
+          log(chalk.dim(`    Used as the server-only alias target in vitest.config.ts`))
+        }
+      }
       createdSetupFile = setupFilePath
     }
   }
@@ -365,8 +415,14 @@ async function ensureTestRunnerSetup(
       // to stay consistent with whatever the project has configured.
       // No React plugin needed: Vitest uses esbuild which handles JSX/TSX natively.
       const aliasTarget = meta.isNextJs ? await resolveAtAlias(cwd) : null
+      // Next.js: add server-only alias so Vitest doesn't crash on Next.js server-only imports.
+      // server-only is a Next.js guard that throws at build time if server code leaks to the client;
+      // in Vitest it just needs to resolve to something harmless.
+      const serverOnlyAlias = meta.isNextJs
+        ? `,\n      'server-only': path.resolve(__dirname, './test/empty-module.ts')`
+        : ''
       const aliasBlock = aliasTarget
-        ? `\n  resolve: {\n    alias: { '@': path.resolve(__dirname, '${aliasTarget}') },\n  },`
+        ? `\n  resolve: {\n    alias: { '@': path.resolve(__dirname, '${aliasTarget}')${serverOnlyAlias} },\n  },`
         : ''
       const pathImport = aliasTarget ? `import path from 'path'\n` : ''
       const vuePlugin = meta.isVue ? `\nimport vue from '@vitejs/plugin-vue'` : ''
@@ -382,6 +438,12 @@ async function ensureTestRunnerSetup(
         `export default defineConfig({${aliasBlock}${pluginsBlock}`,
         `  test: {`,
         `    globals: true,${envLine}${setupLine}`,
+        `    // Restore and clear all mocks automatically before each test.`,
+        `    // restoreMocks runs at the Vitest worker level and can restore globalThis spies`,
+        `    // that the module-level vi instance cannot see — preventing cross-file contamination`,
+        `    // when multiple test files share the same worker thread.`,
+        `    restoreMocks: true,`,
+        `    clearMocks: true,`,
         `    coverage: {`,
         `      provider: 'v8',`,
         `      reporter: ['lcov', 'text-summary'],`,
@@ -584,7 +646,7 @@ export default class Init extends Command {
       testRunner: testRunner as LacunaConfig['testRunner'],
       coverageFormat: 'lcov',
       coverageDir: 'coverage',
-      sourceDir,
+      sourceDir: [sourceDir],
       threshold,
       maxIterations: 3,
     }
