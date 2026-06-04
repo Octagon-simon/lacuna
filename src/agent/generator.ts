@@ -2,7 +2,7 @@ import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import type { ModelProvider, ChatMessage } from '../lib/providers/index.js'
 import { createProvider } from '../lib/providers/index.js'
-import { buildSystemPrompt, buildGeneratePrompt, buildFixPrompt, buildRetryPrompt } from './prompts.js'
+import { buildSystemPrompt, buildGeneratePrompt, buildFixPrompt, buildRetryPrompt, buildPollutionFixPrompt } from './prompts.js'
 import type { FailedAttempt } from './prompts.js'
 import type { FileContext } from './context.js'
 import type { CoverageGap } from '../lib/coverage/types.js'
@@ -22,6 +22,17 @@ export class OscillationError extends Error {
     this.name = 'OscillationError'
   }
 }
+
+// Injected as the error message on the retry after oscillation is detected.
+// Tells the model its last approach was a dead end and forces a different strategy.
+export const OSCILLATION_ESCAPE_MESSAGE =
+  'STOP — you have generated IDENTICAL code to a previous attempt. Your current approach is not working.\n' +
+  'Do NOT repeat the same structure, mock setup, or assertion style.\n' +
+  'Try a completely different strategy:\n' +
+  '  - Simplify drastically: fewer tests, focus only on the single most critical behavior\n' +
+  '  - Different mock structure (e.g. mock at a higher level if sub-dependencies are causing issues)\n' +
+  '  - If the component/hook is untestable in its current form, write one minimal smoke test that confirms it mounts/runs without throwing\n' +
+  'ONE passing test is better than zero.'
 
 const GENERATE_TEMPERATURE = 0.4  // some creativity to match existing patterns
 const RETRY_TEMPERATURE = 0.1     // precise and deterministic when fixing errors
@@ -152,6 +163,13 @@ export class TestGenerator {
     this.rawOnToken = cb
   }
 
+  // Clears oscillation history so the next retry() call is treated as a fresh attempt.
+  // Called by the fix/generate loop when giving one final escape-hatch attempt after
+  // OscillationError fires but iterations remain.
+  resetOscillationState() {
+    this.previousCodes = []
+  }
+
   async generate(context: FileContext, gap: CoverageGap, projectMemory?: string | null): Promise<string> {
     this.lastHypothesis = ''
     this.failedAttempts = []
@@ -208,6 +226,27 @@ export class TestGenerator {
       this.rawOnToken ? codeOnlyStream(this.rawOnToken) : undefined,
       this.maxTokens,
       GENERATE_TEMPERATURE,
+    )
+    const { hypothesis, code, truncated } = parseStructuredResponse(response)
+    this.lastHypothesis = hypothesis
+    this.previousCodes.push(normalizeCode(code))
+    this.history.push({ role: 'assistant', content: response })
+    if (truncated) throw new TruncatedOutputError(code)
+    return code
+  }
+
+  async fixPollution(args: Parameters<typeof buildPollutionFixPrompt>[0]): Promise<string> {
+    this.lastHypothesis = ''
+    this.failedAttempts = []
+    this.previousCodes = []
+
+    this.history = [{ role: 'user', content: buildPollutionFixPrompt(args) }]
+    const response = await this.provider.generate(
+      this.history,
+      buildSystemPrompt(this.env),
+      this.rawOnToken ? codeOnlyStream(this.rawOnToken) : undefined,
+      this.maxTokens,
+      RETRY_TEMPERATURE,
     )
     const { hypothesis, code, truncated } = parseStructuredResponse(response)
     this.lastHypothesis = hypothesis

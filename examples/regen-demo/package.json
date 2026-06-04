@@ -1,0 +1,14 @@
+{
+  "name": "lacuna-regen-demo",
+  "version": "1.0.0",
+  "description": "Demo project for observing lacuna fix → regenerate fallback",
+  "scripts": {
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^2",
+    "typescript": "^5",
+    "vitest": "^2"
+  }
+}

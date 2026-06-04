@@ -1,0 +1,8 @@
+{
+  "testRunner": "vitest",
+  "coverageFormat": "lcov",
+  "coverageDir": "coverage",
+  "sourceDir": "src",
+  "threshold": 80,
+  "maxIterations": 1
+}

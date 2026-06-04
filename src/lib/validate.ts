@@ -206,6 +206,127 @@ export function sanitizeMocksContent(raw: string): { code: string; stripped: boo
   return { code: kept.join('\n').trim(), stripped }
 }
 
+// Merges duplicate vi.mock() calls for the same module path into one.
+// The model sometimes emits two vi.mock('lucide-react', ...) blocks when a component
+// imports many icons — the second overrides the first, silently dropping exports.
+// Only merges simple `() => ({...})` factories; complex factories (async imports,
+// function-body returns) are left untouched.
+export function deduplicateViMocks(code: string): string {
+  interface Block {
+    start: number
+    end: number
+    module: string
+    objectBody: string | null  // null = complex factory, skip merging
+  }
+
+  const blocks: Block[] = []
+  let pos = 0
+
+  while (pos < code.length) {
+    const idx = code.indexOf('vi.mock(', pos)
+    if (idx === -1) break
+
+    const afterOpen = idx + 8  // 'vi.mock('.length
+    const q = code[afterOpen]
+    if (q !== "'" && q !== '"' && q !== '`') { pos = idx + 1; continue }
+    const nameEnd = code.indexOf(q, afterOpen + 1)
+    if (nameEnd === -1) { pos = idx + 1; continue }
+    const moduleName = code.slice(afterOpen + 1, nameEnd)
+
+    // Find the full call extent via paren depth
+    let depth = 0
+    let callEnd = -1
+    for (let i = idx + 7; i < code.length; i++) {
+      if (code[i] === '(') depth++
+      else if (code[i] === ')') { depth--; if (depth === 0) { callEnd = i + 1; break } }
+    }
+    if (callEnd === -1) { pos = idx + 1; continue }
+
+    // Only merge factories that use the () => ({...}) form — the paren-wrapped object
+    // literal pattern. Function-body factories (` () => { return {...} }`) are skipped.
+    const factoryRe = /,\s*\(\s*\)\s*=>\s*\(\s*\{/
+    if (!factoryRe.test(code.slice(nameEnd + 1, callEnd))) {
+      blocks.push({ start: idx, end: callEnd, module: moduleName, objectBody: null })
+      pos = callEnd
+      continue
+    }
+
+    // First { after the module name is the object literal opening brace
+    let braceStart = -1
+    for (let i = nameEnd + 1; i < callEnd; i++) {
+      if (code[i] === '{') { braceStart = i; break }
+    }
+    if (braceStart === -1) { pos = callEnd; continue }
+
+    // Track brace depth to find matching }
+    let braceDepth = 0
+    let braceEnd = -1
+    for (let i = braceStart; i < callEnd; i++) {
+      if (code[i] === '{') braceDepth++
+      else if (code[i] === '}') { braceDepth--; if (braceDepth === 0) { braceEnd = i; break } }
+    }
+    if (braceEnd === -1) { pos = callEnd; continue }
+
+    blocks.push({ start: idx, end: callEnd, module: moduleName, objectBody: code.slice(braceStart + 1, braceEnd) })
+    pos = callEnd
+  }
+
+  // Group by module — only process groups where every occurrence has a simple factory
+  const byModule = new Map<string, Block[]>()
+  for (const b of blocks) {
+    const arr = byModule.get(b.module) ?? []
+    arr.push(b)
+    byModule.set(b.module, arr)
+  }
+
+  const toProcess = [...byModule.entries()].filter(
+    ([, list]) => list.length > 1 && list.every(b => b.objectBody !== null)
+  )
+  if (toProcess.length === 0) return code
+
+  const edits: Array<{ start: number; end: number; text: string }> = []
+
+  for (const [module, list] of toProcess) {
+    // Normalize each body: split into lines, trim, re-indent uniformly at 2 spaces.
+    const allLines: string[] = []
+    for (const b of list) {
+      const lines = b.objectBody!.split('\n').map(l => l.trim()).filter(Boolean)
+      for (const line of lines) {
+        allLines.push('  ' + (line.endsWith(',') ? line : line + ','))
+      }
+    }
+
+    // Deduplicate keys across all merged bodies: when the same property appears in
+    // multiple vi.mock() calls, keep only the last occurrence. This matches Vitest's
+    // own override semantics (last vi.mock wins) and avoids duplicate-key objects.
+    const keyLastIdx = new Map<string, number>()
+    for (let i = 0; i < allLines.length; i++) {
+      const m = allLines[i].match(/^\s*(\w+)\s*:/)
+      if (m) keyLastIdx.set(m[1], i)
+    }
+    const deduped = allLines.filter((line, i) => {
+      const m = line.match(/^\s*(\w+)\s*:/)
+      return m ? keyLastIdx.get(m[1]) === i : true
+    })
+
+    const merged = `vi.mock('${module}', () => ({\n${deduped.join('\n')}\n}))`
+    edits.push({ start: list[0].start, end: list[0].end, text: merged })
+
+    for (let i = 1; i < list.length; i++) {
+      let removeStart = list[i].start
+      if (removeStart > 0 && code[removeStart - 1] === '\n') removeStart--
+      edits.push({ start: removeStart, end: list[i].end, text: '' })
+    }
+  }
+
+  edits.sort((a, b) => b.start - a.start)
+  let result = code
+  for (const edit of edits) {
+    result = result.slice(0, edit.start) + edit.text + result.slice(edit.end)
+  }
+  return result
+}
+
 const RULE_DIVIDER = '─'.repeat(60)
 
 // Retry message when a fix attempt caused Vitest to collect 0 tests —

@@ -11,11 +11,11 @@ import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { buildFileContext } from './context.js'
-import { TestGenerator, TruncatedOutputError, OscillationError, TRUNCATION_RETRY_MESSAGE } from './generator.js'
+import { TestGenerator, TruncatedOutputError, OscillationError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile } from '../lib/typecheck.js'
-import { hasTestFunctions, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent } from '../lib/validate.js'
+import { hasTestFunctions, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -49,7 +49,7 @@ async function getCoverageRate(config: LacunaConfig, cwd: string): Promise<numbe
   }
 }
 
-async function processGap(
+export async function processGap(
   gap: CoverageGap,
   options: LoopOptions,
   generator: TestGenerator,
@@ -134,6 +134,13 @@ async function processGap(
         continue
       }
       if (err instanceof OscillationError) {
+        if (attempt < config.maxIterations) {
+          if (!onStatus) log(chalk.yellow(`\n  ⚠ Agent loop detected — retrying with different strategy...`))
+          onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations })
+          generator.resetOscillationState()
+          lastError = OSCILLATION_ESCAPE_MESSAGE
+          continue
+        }
         if (!onStatus) log(chalk.red(`\n  ⚠ Agent loop detected — output identical to a previous attempt. Stopping early.`))
         onStatus?.({ phase: 'failed', file: shortPath })
         await restoreTestFile(context.suggestedTestFile, originalTestContent)
@@ -185,6 +192,8 @@ async function processGap(
         }
       }
     }
+
+    testCode = deduplicateViMocks(testCode)
 
     // Catch empty test files before writing — no point running a file with no tests
     if (!hasTestFunctions(testCode)) {

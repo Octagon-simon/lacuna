@@ -6,7 +6,11 @@ const ConfigSchema = z.object({
   testRunner: z.enum(['jest', 'vitest', 'pytest', 'mocha', 'go-test', 'phpunit', 'pest', 'rspec', 'cargo-test', 'dotnet-test', 'gradle-test', 'maven-test', 'swift-test']).optional(),
   coverageFormat: z.enum(['lcov', 'json-summary', 'cobertura']).default('lcov'),
   coverageDir: z.string().default('coverage'),
-  sourceDir: z.string().default('src'),
+  // sourceDir accepts a string OR an array — both are normalised to string[] internally.
+  // Use an array when source files live in multiple top-level dirs (e.g. ["src", "lib", "utils"]).
+  sourceDir: z.union([z.string(), z.array(z.string())]).default('src').transform(
+    (v): string[] => (Array.isArray(v) ? v : [v]),
+  ),
   threshold: z.number().min(0).max(100).default(80),
   maxIterations: z.number().min(1).max(10).default(3),
   coverageTimeout: z.number().min(30).default(300),   // seconds; kills hung test suite

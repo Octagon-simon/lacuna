@@ -65,6 +65,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
     onToken?: (token: string) => void,
     maxTokens = 16000,
     temperature?: number,
+    _attempt = 0,           // internal retry counter for transient network errors
   ): Promise<string> {
     let content = ''
 
@@ -105,6 +106,14 @@ export class OpenAICompatibleProvider implements ModelProvider {
           )
         }
         throw new Error(`${this.model} API error (HTTP ${e.status ?? '?'}): ${body}`)
+      }
+      // Transient network termination (ECONNRESET, stream aborted, "terminated") —
+      // common when many parallel workers flood a single API endpoint. Retry once
+      // with a short backoff before surfacing the error.
+      const msg = err instanceof Error ? err.message : String(err)
+      if (_attempt === 0 && /terminated|ECONNRESET|ECONNREFUSED|socket hang up|network error|aborted/i.test(msg)) {
+        await new Promise(r => setTimeout(r, 2000 + Math.random() * 1000))
+        return this.generate(messages, system, onToken, maxTokens, temperature, 1)
       }
       throw err
     }
