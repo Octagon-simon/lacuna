@@ -19,14 +19,29 @@ export class AnthropicProvider implements ModelProvider {
   ): Promise<string> {
     let content = ''
 
+    // Mark the first user message as cacheable — it holds the large initial context
+    // (source file, existing test, mocks, type definitions) that stays identical
+    // across all retries for a given file. Cache hits cost 10% of normal input price.
+    const anthropicMessages: Anthropic.Messages.MessageParam[] = messages.map((msg, i) => {
+      if (i === 0 && msg.role === 'user') {
+        return {
+          role: 'user',
+          content: [{ type: 'text' as const, text: msg.content, cache_control: { type: 'ephemeral' } as const }],
+        }
+      }
+      return { role: msg.role, content: msg.content }
+    })
+
     try {
       const stream = this.client.messages.stream({
         model: this.model,
         max_tokens: maxTokens,
         stop_sequences: ['</code_output>'],
         ...(temperature !== undefined ? { temperature } : {}),
-        system,
-        messages,
+        // Cache the system prompt — same ~3000 tokens sent on every generate/fix/retry
+        // call and across all parallel workers. Without caching each call pays full price.
+        system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+        messages: anthropicMessages,
       })
 
       for await (const event of stream) {

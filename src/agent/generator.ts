@@ -37,6 +37,16 @@ export const OSCILLATION_ESCAPE_MESSAGE =
 const GENERATE_TEMPERATURE = 0.4  // some creativity to match existing patterns
 const RETRY_TEMPERATURE = 0.1     // precise and deterministic when fixing errors
 
+// Estimate output token budget from source line count.
+// 2000 tokens reserved for the <thinking> block; ~40 tokens per source line covers
+// ~2-3 generated test lines × ~15 tokens/line. Clamped between 4000 (floor for small
+// files) and the user's configured ceiling.
+function estimateMaxTokens(sourceCode: string | null | undefined, configMax: number): number {
+  if (!sourceCode) return configMax
+  const lines = (sourceCode.match(/\n/g) ?? []).length + 1
+  return Math.min(configMax, Math.max(4000, 2000 + lines * 40))
+}
+
 // Wraps a token callback so that <thinking> content is suppressed.
 // Buffers silently until <code_output> is seen, then streams from there.
 // Falls back to streaming everything if <code_output> never appears (e.g. non-XML response).
@@ -203,7 +213,7 @@ export class TestGenerator {
       this.history,
       buildSystemPrompt(this.env),
       this.rawOnToken ? codeOnlyStream(this.rawOnToken) : undefined,
-      this.maxTokens,
+      estimateMaxTokens(context.sourceCode, this.maxTokens),
       GENERATE_TEMPERATURE,
     )
     const { hypothesis, code, truncated } = parseStructuredResponse(response)
@@ -224,7 +234,7 @@ export class TestGenerator {
       this.history,
       buildSystemPrompt(this.env),
       this.rawOnToken ? codeOnlyStream(this.rawOnToken) : undefined,
-      this.maxTokens,
+      estimateMaxTokens(args.sourceCode, this.maxTokens),
       GENERATE_TEMPERATURE,
     )
     const { hypothesis, code, truncated } = parseStructuredResponse(response)

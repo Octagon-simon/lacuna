@@ -43,9 +43,13 @@ async function readProjectMeta(cwd: string): Promise<ProjectMeta> {
   }
 }
 
-async function isPackageInstalled(pkg: string, cwd: string): Promise<boolean> {
-  // Check all dependency fields in package.json (covers workspaces where the
-  // package is declared in the root manifest but installed at workspace level)
+type InstallState =
+  | 'declared'       // in package.json — fully set up
+  | 'undeclared'     // in node_modules but NOT in package.json — CI will fail without declaring it
+  | 'missing'        // not found anywhere
+
+async function checkPackageInstallState(pkg: string, cwd: string): Promise<InstallState> {
+  // Check package.json first — the source of truth for declared dependencies
   try {
     const json = JSON.parse(await readFile(join(cwd, 'package.json'), 'utf-8')) as Record<string, Record<string, string> | undefined>
     const all = {
@@ -54,17 +58,22 @@ async function isPackageInstalled(pkg: string, cwd: string): Promise<boolean> {
       ...json['peerDependencies'],
       ...json['optionalDependencies'],
     }
-    if (pkg in all) return true
-  } catch { /* fall through to node_modules check */ }
+    if (pkg in all) return 'declared'
+  } catch { /* fall through */ }
 
-  // Fallback: check if the package is present in node_modules (pnpm workspaces,
-  // hoisted installs, or cases where the root manifest differs from what's installed)
+  // Check node_modules — present but undeclared means it was installed on a different
+  // branch or manually, and won't survive a fresh CI checkout
   try {
     await access(join(cwd, 'node_modules', pkg))
-    return true
+    return 'undeclared'
   } catch { /* not found */ }
 
-  return false
+  return 'missing'
+}
+
+// Convenience wrapper used for checking individual extra packages (setupFilePackages)
+async function isPackageInstalled(pkg: string, cwd: string): Promise<boolean> {
+  return (await checkPackageInstallState(pkg, cwd)) !== 'missing'
 }
 
 async function writeFileWithDir(filePath: string, content: string): Promise<void> {
@@ -258,7 +267,7 @@ async function ensureTestRunnerSetup(
   }
 
   const meta = await readProjectMeta(cwd)
-  const alreadyInstalled = await isPackageInstalled(runner, cwd)
+  const installState = await checkPackageInstallState(runner, cwd)
 
   // ── Determine packages to install ─────────────────────────────────────────
 
@@ -327,7 +336,7 @@ async function ensureTestRunnerSetup(
 
   // ── Install missing packages ───────────────────────────────────────────────
 
-  if (!alreadyInstalled) {
+  if (installState === 'missing') {
     const allPackages = [...basePackages, ...setupFilePackages]
     log(chalk.yellow(`\n  ${runner} is not installed.`))
     log(chalk.dim(`  Packages: ${allPackages.join(', ')}`))
@@ -341,6 +350,28 @@ async function ensureTestRunnerSetup(
         execSync(`npm install -D ${allPackages.join(' ')}`, { cwd, stdio: 'inherit' })
       } catch {
         log(chalk.red(`  Install failed. Run manually: npm install -D ${allPackages.join(' ')}`))
+      }
+    }
+  } else if (installState === 'undeclared') {
+    // Package exists in node_modules but is NOT declared in package.json.
+    // This usually means it was installed on a different branch and won't survive
+    // a fresh CI checkout — node_modules is not committed to git.
+    const allPackages = [...basePackages, ...setupFilePackages]
+    log(chalk.yellow(`\n  ${runner} was found in node_modules but is not declared in package.json.`))
+    log(chalk.dim(`  This works locally but will break CI — a fresh checkout won't have node_modules.`))
+
+    const doAdd = await confirm({
+      message: `Add ${allPackages.join(', ')} to package.json? (recommended for CI)`,
+      default: true,
+    })
+    if (!doAdd) {
+      log(chalk.dim(`  Skipped. Add manually: npm install -D ${allPackages.join(' ')}`))
+    } else {
+      log(chalk.dim(`\n  Adding to package.json...`))
+      try {
+        execSync(`npm install -D ${allPackages.join(' ')}`, { cwd, stdio: 'inherit' })
+      } catch {
+        log(chalk.red(`  Failed. Run manually: npm install -D ${allPackages.join(' ')}`))
       }
     }
   } else if ((meta.isNextJs || meta.isReact) && setupFilePackages.length > 0) {

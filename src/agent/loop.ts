@@ -219,12 +219,18 @@ export async function processGap(
     if (runResult.success) {
       const typeErrors = await typeCheckFile(context.suggestedTestFile, cwd, env)
       if (typeErrors) {
-        lastError = `Tests passed but TypeScript type errors were found in the generated file:\n${typeErrors}\n\nFix ALL type errors. Do not use 'as any' or '@ts-ignore'.`
-        if (!onStatus) log(chalk.yellow(`  Type errors found — retrying...`))
-        onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations } as WorkerState)
-        continue
+        if (attempt < config.maxIterations) {
+          lastError = `Tests passed but TypeScript type errors were found in the generated file:\n${typeErrors}\n\nFix ALL type errors. Do not use 'as any' or '@ts-ignore'.`
+          if (!onStatus) log(chalk.yellow(`  Type errors found — retrying...`))
+          onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations } as WorkerState)
+          continue
+        }
+        // Last attempt — tests pass even though type errors remain.
+        // Report as passed rather than discarding a working test file.
+        if (!onStatus) log(chalk.yellow(`  ⚠ Type errors remain — tests pass. Run lacuna fix to clean up types.`))
+      } else {
+        if (!onStatus) log(chalk.green(`  Tests passed.`))
       }
-      if (!onStatus) log(chalk.green(`  Tests passed.`))
       onStatus?.({ phase: 'passed', file: shortPath })
       return { success: true, testCode }
     }

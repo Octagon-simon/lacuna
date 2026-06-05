@@ -67,10 +67,16 @@ Interactive setup wizard. Configures your model, test runner, source directory, 
 
 Works from any subdirectory — lacuna finds the project root automatically.
 
-For **React and Next.js** projects, `lacuna init` also:
+For **React** projects, `lacuna init` also:
 - Installs `@testing-library/react`, `@testing-library/jest-dom`, `@testing-library/user-event`, and `jsdom`
-- Creates `vitest.config.ts` with `environment: 'jsdom'`, `@/` alias (read from your `tsconfig.json`), and `restoreMocks: true` + `clearMocks: true` — these run `vi.restoreAllMocks()` at the Vitest worker level before each test, preventing cross-file `globalThis` spy contamination that causes tests to pass alone but fail in the full suite
-- Creates a setup file with global `vi.mock()` calls for `next/navigation`, `next/headers`, and `next/cache`, plus `beforeEach`/`afterEach` mock cleanup hooks so individual tests don't need to handle this themselves
+- Creates `vitest.config.ts` with `environment: 'jsdom'` and `restoreMocks: true` + `clearMocks: true`
+- Creates a setup file with `@testing-library/jest-dom` and `beforeEach`/`afterEach` mock cleanup hooks
+
+For **Next.js** projects, the setup is different — Next.js and plain React are not compatible:
+- Installs the same testing-library packages but does **not** add `environment: 'jsdom'` to vitest config (Next.js manages its own environment)
+- Adds `@/` alias (from your `tsconfig.json`) and a `server-only` stub alias to vitest config
+- Creates a setup file with global `vi.mock()` calls for `next/navigation`, `next/headers`, `next/cache`, `next/image`, and `next/font` — these are Next.js-specific mocks that would crash a plain React project
+- If test dependencies are found in `node_modules` but not declared in `package.json` (e.g. from a different branch), lacuna will prompt you to add them — undeclared deps break CI on a fresh checkout
 
 ```bash
 lacuna init
@@ -261,7 +267,25 @@ beforeEach(() => {
 lacuna generate
 ```
 
-Every generated test will import from `src/test/mocks.ts` instead of creating its own `vi.fn()` calls. If a test needs a mock that doesn't exist yet, Claude will add it to the mocks file and import it — keeping everything centralized.
+Every generated test will import from `src/test/mocks.ts` instead of creating its own `vi.fn()` calls. If a test needs a mock that doesn't exist yet, lacuna will add it to the mocks file and import it — keeping everything centralized.
+
+### How lacuna reads and updates the shared mock file
+
+Lacuna parses your mock file before every prompt and builds a **mock inventory** — a structured table of every `vi.mock()` call, its line number, and all the keys it exports:
+
+```
+'react-router-dom'  → useNavigate, useParams
+'axios'             → get, post, put, delete
+```
+
+This inventory is injected into every prompt so the AI knows exactly which modules are already mocked and what they export. When the AI needs to add a new export (e.g. a new API client method), it updates the **existing** `vi.mock()` block with the full list of old + new exports — never appending a second block for the same module.
+
+**Structure rules the AI follows:**
+- Module already in inventory → update the existing block (never a duplicate)
+- New mock variable → declare near same-domain exports, reset in existing `beforeEach`
+- New module → append at end before the final `beforeEach`
+
+For fix prompts, the mock file is **compressed** before sending (multi-line React component stub bodies are collapsed to `vi.fn()`) to reduce token cost while preserving all `vi.mock()` blocks and factory functions. For generate prompts, only the inventory and exports list are sent — the raw file is skipped entirely since the AI only needs to know what to import, not re-read every implementation.
 
 ---
 
