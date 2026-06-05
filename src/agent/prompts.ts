@@ -1,5 +1,5 @@
 import type { DetectedEnvironment } from '../lib/detector.js'
-import { buildSourceSkeleton, shouldUseSkeleton } from '../lib/skeleton.js'
+import { buildSourceSkeleton, shouldUseSkeleton, compressSource, filterMockFileForTest, filterMockFileForSource } from '../lib/skeleton.js'
 
 // Extracts module names that are already globally mocked in the setup file.
 // Used to tell the agent "don't mock these again" to avoid double-mock conflicts.
@@ -433,6 +433,69 @@ function buildNetworkMockingGuidance(analysis: NetworkAnalysis, sourceFile: stri
   return lines.join('\n')
 }
 
+// Parses every vi.mock() call in a mocks file and returns a structured inventory
+// of module paths → line numbers → exported key names from the factory body.
+// Used to tell the AI which modules are already mocked and at which line so it
+// edits the existing block instead of appending a second one.
+interface MockInventoryEntry {
+  modulePath: string
+  lineNumber: number   // 1-based
+  exports: string[]    // top-level keys declared in () => ({ ... }) factory
+}
+
+function parseMockInventory(code: string): MockInventoryEntry[] {
+  const entries: MockInventoryEntry[] = []
+  const lines = code.split('\n')
+
+  for (let i = 0; i < lines.length; i++) {
+    const mockMatch = lines[i].match(/\bvi\.mock\(\s*(['"])([^'"]+)\1/)
+    if (!mockMatch) continue
+
+    const modulePath = mockMatch[2]
+    const lineNumber = i + 1
+    const exports: string[] = []
+
+    // Scan forward up to 80 lines to find the factory () => ({ ... })
+    // and extract the top-level key names from the object literal.
+    let braceDepth = 0
+    let inFactory = false
+
+    for (let j = i; j < Math.min(i + 80, lines.length); j++) {
+      const l = lines[j]
+      if (!inFactory && /\(\)\s*=>\s*\(?\s*\{/.test(l)) inFactory = true
+      if (!inFactory) continue
+
+      for (const ch of l) {
+        if (ch === '{') braceDepth++
+        if (ch === '}') braceDepth--
+      }
+
+      // Top-level keys: indented 2+ spaces (multi-line). Capture both key and variable value
+      // so the inventory shows key(Variable) — e.g. ValidationError(MockValidationError).
+      // This lets the AI look up exactly which export to import for a given mocked symbol.
+      const multiLine = l.match(/^\s{2,}(\w+)\s*:\s*(\w+)/)
+      if (multiLine && multiLine[1] !== 'type') {
+        const key = multiLine[1], val = multiLine[2]
+        exports.push(val && val !== key ? `${key}(${val})` : key)
+      }
+      // Inline single-line factory: vi.mock('x', () => ({ key: mockVar, ... }))
+      if (j === i || l.includes('() =>')) {
+        for (const m of l.matchAll(/\b(\w+)\s*:\s*(mock\w+)/gi)) {
+          const key = m[1], val = m[2]
+          const entry = val.toLowerCase() !== `mock${key.toLowerCase()}` ? `${key}(${val})` : key
+          if (!exports.some(e => e === key || e.startsWith(`${key}(`))) exports.push(entry)
+        }
+      }
+
+      if (braceDepth <= 0 && inFactory) break
+    }
+
+    entries.push({ modulePath, lineNumber, exports })
+  }
+
+  return entries
+}
+
 // Extract exported names from a mocks file so the AI sees a concrete inventory.
 function parseMockExports(code: string): string[] {
   const names: string[] = []
@@ -475,7 +538,8 @@ export function buildSystemPrompt(env: DetectedEnvironment): string {
        MOCK PROP INTERFACE: When mocking a child component (e.g. EmptyState, Modal), check how the PARENT calls it — what prop names does the JSX pass? Use those exact names in the mock, not the names from the child's own prop type definition.
     3. COMPONENT RENDER MAP (React/Vue components only): Before writing any assertion, list what is in the DOM in each relevant state (idle / loading / error / success). Read the template/JSX — check every ternary, &&, and conditional — to determine whether a button is disabled vs unmounted, what text changes, what elements appear.
        GUARD CLAUSE AUDIT: Identify every conditional render guard in the component (e.g. payments.length > 0, isLoading, hasPermission). A test that provides data violating a guard will never find the element — the guard hides it. Match mock data to the guard condition required by each test.
-       STALE TEST AUDIT: Check whether any existing test asserts UI or behavior that the current source no longer has. DELETE those tests — do not try to make the component pass a test for features it no longer has.` : `
+       STALE TEST AUDIT: Check whether any existing test asserts UI or behavior that the current source no longer has. DELETE those tests — do not try to make the component pass a test for features it no longer has.
+       BUG-ASSERTING TEST RULE: NEVER write a test that asserts the component/function throws or crashes due to a missing null check, missing guard, or undefined field — unless you have read the source and confirmed the crash path exists. A test named "throws when X is undefined due to missing null check" is testing for a bug, not behavior. If the source handles the case gracefully, test the graceful output instead. If it truly crashes, fix the source — do not write a test to document the bug.` : `
     2. DEPENDENCY AUDIT: List every external dependency the source calls. For each one, determine what needs to be mocked and what return value the code expects. Read every call site — don't infer the expected shape from the type name.
     3. DATA FIXTURE AUDIT: Read the source's selector logic — every filter, find, and field access. Fixture data field names must match what the source reads exactly.`
 
@@ -549,7 +613,12 @@ ${ruleCount + 3}. NEVER output vitest.config.ts, jest.config.js, or any framewor
          beforeEach(() => { mockFetch = vi.spyOn(global, 'fetch'); });
 - Never write two vi.mock() calls for the same module path in the same file. The second call silently overrides the first — exports from the first mock are lost. If a module exports many things (e.g. lucide-react icons), list them all in a single vi.mock() factory:
   WRONG: vi.mock('lucide-react', () => ({ Search: () => null }))  ...later...  vi.mock('lucide-react', () => ({ Plus: () => null }))
-  RIGHT: vi.mock('lucide-react', () => ({ Search: () => null, Plus: () => null }))` : ''
+  RIGHT: vi.mock('lucide-react', () => ({ Search: () => null, Plus: () => null }))
+- vi.resetAllMocks() vs vi.clearAllMocks() — use the right one or tests break under shuffle:
+  clearAllMocks() only wipes call history (mock.calls, mock.results). It does NOT reset mockReturnValue / mockResolvedValue / mockImplementation.
+  resetAllMocks() wipes call history AND resets all implementations back to undefined.
+  RULE: if ANY test in the file calls mockFn.mockImplementation(...) directly (e.g. a loading-state test that uses \`() => new Promise(() => {})\` to freeze async), the beforeEach MUST use vi.resetAllMocks() — otherwise that implementation bleeds into the next test when run in shuffle order, and mockResolvedValue set in beforeEach is silently overridden by the stale mockImplementation.
+  PATTERN: loading-state test sets mockImplementation → test passes → shuffle puts it before the success-state test → success test's beforeEach calls clearAllMocks (history wiped, implementation NOT wiped) → mockResolvedValue set in beforeEach loses to the stale never-resolving implementation → success test gets 0 instead of expected data.` : ''
 
   // ── Common failure causes — React/Vue (JS component tests) only ───────────────
   const reactCauses = isJSRunner ? `
@@ -617,7 +686,6 @@ export function buildGeneratePrompt(args: {
 }): string {
   const {
     sourceFile,
-    sourceCode,
     existingTestCode,
     uncoveredFunctions,
     uncoveredLines,
@@ -632,6 +700,8 @@ export function buildGeneratePrompt(args: {
     reactMajorVersion,
     projectMemory,
   } = args
+
+  const sourceCode = compressSource(args.sourceCode)
 
   const parts: string[] = []
 
@@ -685,11 +755,36 @@ export function buildGeneratePrompt(args: {
       parts.push(`\nSHARED MOCK FILE (import from: '${mocksImportPath}')`)
       if (exports.length > 0) {
         parts.push(`Available exports: ${exports.join(', ')}`)
-        parts.push(`↑ Before writing the test, identify which of these match the source file's domain and import every relevant one. Do NOT create inline mocks for anything already in this list.\n↑ NAMES ARE FROZEN — use each export exactly as spelled above. Never rename, recase, or restructure an existing mock (e.g. do not change mockFoo → MockFoo or const → class). Renaming breaks every other test that imports the original name.`)
+        parts.push(`↑ Every name above ALREADY EXISTS in the mock file — do NOT re-declare any of them in a ---MOCKS_FILE--- block. Only declare names that do NOT appear in this list.\n↑ Before writing the test, identify which of these match the source file's domain and import every relevant one. Do NOT create inline mocks for anything already in this list.\n↑ NAMES ARE FROZEN — use each export exactly as spelled above. Never rename, recase, or restructure an existing mock (e.g. do not change mockFoo → MockFoo or const → class). Renaming breaks every other test that imports the original name.`)
       }
-      parts.push('```')
-      parts.push(mocksCode)
-      parts.push('```')
+      const inventory = parseMockInventory(mocksCode)
+      if (inventory.length > 0) {
+        const maxLen = Math.max(...inventory.map(e => e.modulePath.length))
+        parts.push('\nMOCK MODULE INVENTORY — modules already vi.mocked:')
+        for (const entry of inventory) {
+          const path = `'${entry.modulePath}'`.padEnd(maxLen + 2)
+          const exp = entry.exports.length > 0
+            ? entry.exports.join(', ')
+            : '(no simple key exports)'
+          parts.push(`  ${path} → ${exp}`)
+        }
+        parts.push('MOCK EDITING RULES — follow exactly when returning a ---MOCKS_FILE--- block:')
+        parts.push('• A module in the inventory is ALREADY mocked. To add a new export: write ONE updated vi.mock() block with ALL existing exports PLUS the new one. NEVER write a second vi.mock() for the same path — Vitest only honours the last one, so the second block silently wipes every export from the first.')
+        parts.push('• New export const mockFoo = vi.fn(): declare it near other exports of the same domain. Add its .mockReset() or .mockClear() to the EXISTING beforeEach — do NOT create an extra beforeEach for one variable.')
+        parts.push('• New module (not in inventory): append a new vi.mock() at the END of the file, before the final beforeEach.')
+      }
+      // Generate prompt: send only the sections of the mock file relevant to this source file
+      // (vi.mock() blocks for modules it imports + export declarations for inferred mock names).
+      // Skips unrelated mocks entirely. Falls back to the full file if nothing matches.
+      const relevantMocks = filterMockFileForSource(mocksCode, sourceCode)
+      if (relevantMocks !== mocksCode || relevantMocks.split('\n').length < 80) {
+        // Filtered down or already small — worth sending
+        parts.push('```')
+        parts.push(relevantMocks)
+        parts.push('```')
+      }
+      // If filter returned the full file unchanged AND it's large, skip it —
+      // the exports list + inventory above already cover what the AI needs.
     } else {
       parts.push(`\nSHARED MOCK FILE (does not exist yet) — create it if you need mocks, return it via the // ---MOCKS_FILE--- separator. Path: '${mocksImportPath}'\n⚠ Mocks file must contain ONLY vi.fn()/vi.mock() definitions and beforeEach resets — NEVER describe/it/test/expect blocks.`)
     }
@@ -753,7 +848,8 @@ export function buildFixPrompt(args: {
   reactMajorVersion?: number | null
   projectMemory?: string | null
 }): string {
-  const { testFile, testCode, sourceFile, sourceCode, sourceImportPath, errorOutput, mocksCode, mocksImportPath, setupFileCode, packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, reactMajorVersion, projectMemory } = args
+  const { testFile, testCode, sourceFile, sourceImportPath, errorOutput, mocksCode, mocksImportPath, setupFileCode, packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, reactMajorVersion, projectMemory } = args
+  const sourceCode = args.sourceCode ? compressSource(args.sourceCode) : null
   const parts: string[] = []
 
   parts.push('Your job is to fix a failing test file. Do NOT rewrite it from scratch — preserve every existing test and only change what is necessary to make them pass.')
@@ -802,13 +898,35 @@ export function buildFixPrompt(args: {
   if (mocksImportPath) {
     if (mocksCode) {
       const exports = parseMockExports(mocksCode)
+      // Filter to only the sections this failing test actually imports.
+      // A billing test importing 6 mocks gets ~40 lines instead of 820.
+      // The filter already does the heavy lifting — no compression needed on top.
+      // Line numbers in the inventory refer to lines in THIS filtered slice.
+      const compressed = filterMockFileForTest(mocksCode, args.testCode)
       parts.push(`\nSHARED MOCK FILE (import from: '${mocksImportPath}')`)
       if (exports.length > 0) {
         parts.push(`Available exports: ${exports.join(', ')}`)
-        parts.push(`↑ Check this list against the source file — import every relevant mock. Do NOT create inline mocks for anything already exported here.`)
+        parts.push(`↑ Every name above ALREADY EXISTS in the mock file — do NOT re-declare any of them in a ---MOCKS_FILE--- block. Only declare names that do NOT appear in this list.\n↑ Import every mock that matches the source file's domain. Do NOT create inline mocks for anything already in this list.`)
+      }
+      // Parse inventory from the compressed file so line numbers match what the AI sees below
+      const inventory = parseMockInventory(compressed)
+      if (inventory.length > 0) {
+        const maxLen = Math.max(...inventory.map(e => e.modulePath.length))
+        parts.push('\nMOCK MODULE INVENTORY — modules already vi.mocked (line numbers refer to the file below):')
+        for (const entry of inventory) {
+          const path = `'${entry.modulePath}'`.padEnd(maxLen + 2)
+          const exp = entry.exports.length > 0
+            ? entry.exports.join(', ')
+            : '(no simple key exports)'
+          parts.push(`  Line ${String(entry.lineNumber).padStart(4)}: ${path} → ${exp}`)
+        }
+        parts.push('MOCK EDITING RULES — follow exactly when returning a ---MOCKS_FILE--- block:')
+        parts.push('• A module in the inventory is ALREADY mocked. To add a new export: write ONE updated vi.mock() block with ALL existing exports PLUS the new one. NEVER write a second vi.mock() for the same path — Vitest only honours the last one, so the second block silently wipes every export from the first.')
+        parts.push('• New export const mockFoo = vi.fn(): declare it near other exports of the same domain. Add its .mockReset() or .mockClear() to the EXISTING beforeEach — do NOT create an extra beforeEach for one variable.')
+        parts.push('• New module (not in inventory): append a new vi.mock() at the END of the file, before the final beforeEach.')
       }
       parts.push('```')
-      parts.push(mocksCode)
+      parts.push(compressed)
       parts.push('```')
     } else {
       parts.push(`\nSHARED MOCK FILE (does not exist yet) — create it if you need mocks, return it via the // ---MOCKS_FILE--- separator. Path: '${mocksImportPath}'\n⚠ Mocks file must contain ONLY vi.fn()/vi.mock() definitions and beforeEach resets — NEVER describe/it/test/expect blocks.`)
