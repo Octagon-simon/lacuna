@@ -203,7 +203,11 @@ export function sanitizeMocksContent(raw: string): { code: string; stripped: boo
     stripped = true
   }
 
-  return { code: kept.join('\n').trim(), stripped }
+  const result = kept.join('\n').trim()
+  // Reject content that is only comments/whitespace — no real code to add to the mock file.
+  const hasRealCode = result.split('\n').some(l => l.trim() && !l.trim().startsWith('//') && !l.trim().startsWith('/*') && !l.trim().startsWith('*'))
+  if (!hasRealCode) return { code: '', stripped: true }
+  return { code: result, stripped }
 }
 
 // Merges duplicate vi.mock() calls for the same module path into one.
@@ -223,10 +227,18 @@ export function deduplicateViMocks(code: string): string {
   let pos = 0
 
   while (pos < code.length) {
-    const idx = code.indexOf('vi.mock(', pos)
-    if (idx === -1) break
+    // Match either vi.mock( or jest.mock(
+    const viIdx = code.indexOf('vi.mock(', pos)
+    const jestIdx = code.indexOf('jest.mock(', pos)
+    let idx: number
+    let prefixLen: number
+    if (viIdx === -1 && jestIdx === -1) break
+    if (viIdx === -1) { idx = jestIdx; prefixLen = 10 }
+    else if (jestIdx === -1) { idx = viIdx; prefixLen = 8 }
+    else if (viIdx < jestIdx) { idx = viIdx; prefixLen = 8 }
+    else { idx = jestIdx; prefixLen = 10 }
 
-    const afterOpen = idx + 8  // 'vi.mock('.length
+    const afterOpen = idx + prefixLen
     const q = code[afterOpen]
     if (q !== "'" && q !== '"' && q !== '`') { pos = idx + 1; continue }
     const nameEnd = code.indexOf(q, afterOpen + 1)
@@ -236,7 +248,7 @@ export function deduplicateViMocks(code: string): string {
     // Find the full call extent via paren depth
     let depth = 0
     let callEnd = -1
-    for (let i = idx + 7; i < code.length; i++) {
+    for (let i = idx + prefixLen - 1; i < code.length; i++) {
       if (code[i] === '(') depth++
       else if (code[i] === ')') { depth--; if (depth === 0) { callEnd = i + 1; break } }
     }
@@ -309,7 +321,8 @@ export function deduplicateViMocks(code: string): string {
       return m ? keyLastIdx.get(m[1]) === i : true
     })
 
-    const merged = `vi.mock('${module}', () => ({\n${deduped.join('\n')}\n}))`
+    const mockPrefix = code.slice(list[0].start, list[0].start + 4) === 'jest' ? 'jest' : 'vi'
+    const merged = `${mockPrefix}.mock('${module}', () => ({\n${deduped.join('\n')}\n}))`
     edits.push({ start: list[0].start, end: list[0].end, text: merged })
 
     for (let i = 1; i < list.length; i++) {
@@ -331,26 +344,30 @@ const RULE_DIVIDER = '─'.repeat(60)
 
 // Retry message when a fix attempt caused Vitest to collect 0 tests —
 // the model likely broke an import. Anchors the model to the original error.
+// Error from the broken fix is placed FIRST so it appears in the terminal display
+// (which caps at ~15 lines) before the rules boilerplate.
 export function buildStructureBrokenMessage(initialError: string, currentError: string): string {
   return (
-    `⚠ CRITICAL — Your fix broke the file structure: Vitest found 0 tests.\n\n` +
-    `This means an import is now failing during module collection, or you accidentally removed all test functions.\n` +
-    `Look for: Cannot find module, TypeError, SyntaxError in the error output below.\n\n` +
-    `RULES:\n` +
-    `- Do NOT change any imports unless the import itself caused the original failure\n` +
-    `- Do NOT restructure the describe block or rename other tests\n` +
-    `- ONLY fix the specific assertion that was originally failing\n\n` +
+    `⚠ CRITICAL — Your fix broke the file structure: 0 tests collected.\n` +
+    `An import is failing or all test functions were removed.\n\n` +
+    `Error from your attempted fix:\n` +
+    `${RULE_DIVIDER}\n` +
+    `${currentError}\n` +
+    `${RULE_DIVIDER}\n\n` +
     `Original failing test error (what you were supposed to fix):\n` +
     `${RULE_DIVIDER}\n` +
     `${initialError}\n` +
     `${RULE_DIVIDER}\n\n` +
-    `Error from your attempted fix:\n` +
-    `${currentError}`
+    `RULES:\n` +
+    `- Do NOT change any imports unless the import itself caused the original failure\n` +
+    `- Do NOT restructure the describe block or rename other tests\n` +
+    `- ONLY fix the specific assertion that was originally failing`
   )
 }
 
 // Retry message when a fix attempt reduced the number of passing tests —
 // the model broke previously-passing tests while trying to fix one.
+// Current errors placed FIRST for the same display reason.
 export function buildRegressionMessage(
   initialError: string,
   currentError: string,
@@ -358,14 +375,16 @@ export function buildRegressionMessage(
   currentPass: number,
 ): string {
   return (
-    `⚠ REGRESSION — Your fix made things worse: ${baselinePass} test(s) were passing before, now only ${currentPass} are.\n\n` +
-    `Do NOT modify tests that were already passing.\n` +
-    `ONLY fix the test that was originally failing.\n\n` +
+    `⚠ REGRESSION — Your fix broke passing tests: ${baselinePass} passing before, now only ${currentPass}.\n\n` +
+    `Current errors:\n` +
+    `${RULE_DIVIDER}\n` +
+    `${currentError}\n` +
+    `${RULE_DIVIDER}\n\n` +
     `Original failing test error:\n` +
     `${RULE_DIVIDER}\n` +
     `${initialError}\n` +
     `${RULE_DIVIDER}\n\n` +
-    `Current errors:\n` +
-    `${currentError}`
+    `Do NOT modify tests that were already passing.\n` +
+    `ONLY fix the test that was originally failing.`
   )
 }

@@ -120,7 +120,7 @@ export default class Fix extends Command {
     if (result.errors.length > 0) {
       this.log(chalk.red(`\n  ${result.errors.length} error(s):`))
       for (const err of result.errors) {
-        const lines = err.split('\n').slice(0, 8)
+        const lines = err.split('\n').slice(0, 15)
         this.log(chalk.dim('  ' + lines.join('\n  ')))
       }
     }

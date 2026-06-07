@@ -1,6 +1,10 @@
 import { gunzipSync } from 'node:zlib'
 import OpenAI from 'openai'
 import type { ModelProvider, ChatMessage } from './types.js'
+import { ModelStallError } from './types.js'
+
+const FIRST_TOKEN_TIMEOUT_MS = 30_000
+const STALL_TIMEOUT_MS = 60_000
 
 export class OpenAICompatibleProvider implements ModelProvider {
   private client: OpenAI
@@ -69,27 +73,58 @@ export class OpenAICompatibleProvider implements ModelProvider {
   ): Promise<string> {
     let content = ''
 
+    const controller = new AbortController()
+    let firstTokenReceived = false
+    let lastTokenAt = 0
+
+    const firstTokenTimer = setTimeout(() => {
+      controller.abort('first-token-timeout')
+    }, FIRST_TOKEN_TIMEOUT_MS)
+
+    const stallInterval = setInterval(() => {
+      if (firstTokenReceived && Date.now() - lastTokenAt > STALL_TIMEOUT_MS) {
+        controller.abort('stream-stall')
+      }
+    }, 5_000)
+
     try {
-      const stream = await this.client.chat.completions.create({
-        model: this.model,
-        max_tokens: maxTokens,
-        stop: ['</code_output>'],
-        ...(temperature !== undefined ? { temperature } : {}),
-        stream: true,
-        messages: [
-          { role: 'system', content: system },
-          ...messages.map((m) => ({ role: m.role, content: m.content })),
-        ],
-      })
+      const stream = await this.client.chat.completions.create(
+        {
+          model: this.model,
+          max_tokens: maxTokens,
+          stop: ['</code_output>'],
+          ...(temperature !== undefined ? { temperature } : {}),
+          stream: true,
+          messages: [
+            { role: 'system', content: system },
+            ...messages.map((m) => ({ role: m.role, content: m.content })),
+          ],
+        },
+        { signal: controller.signal },
+      )
 
       for await (const chunk of stream) {
         const token = chunk.choices[0]?.delta?.content ?? ''
         if (token) {
+          if (!firstTokenReceived) {
+            firstTokenReceived = true
+            clearTimeout(firstTokenTimer)
+            lastTokenAt = Date.now()
+          } else {
+            lastTokenAt = Date.now()
+          }
           content += token
           onToken?.(token)
         }
       }
     } catch (err) {
+      if (controller.signal.aborted) {
+        clearTimeout(firstTokenTimer)
+        clearInterval(stallInterval)
+        throw new ModelStallError(
+          (controller.signal.reason as string) === 'first-token-timeout' ? 'first-token-timeout' : 'stream-stall',
+        )
+      }
       if (err != null && typeof err === 'object' && 'status' in err) {
         const e = err as { status?: number; message?: string; error?: { message?: string; type?: string; code?: string } }
         const body = e.error?.message
@@ -111,11 +146,16 @@ export class OpenAICompatibleProvider implements ModelProvider {
       // common when many parallel workers flood a single API endpoint. Retry once
       // with a short backoff before surfacing the error.
       const msg = err instanceof Error ? err.message : String(err)
-      if (_attempt === 0 && /terminated|ECONNRESET|ECONNREFUSED|socket hang up|network error|aborted/i.test(msg)) {
+      if (_attempt === 0 && /terminated|ECONNRESET|ECONNREFUSED|socket hang up|network error/i.test(msg)) {
+        clearTimeout(firstTokenTimer)
+        clearInterval(stallInterval)
         await new Promise(r => setTimeout(r, 2000 + Math.random() * 1000))
         return this.generate(messages, system, onToken, maxTokens, temperature, 1)
       }
       throw err
+    } finally {
+      clearTimeout(firstTokenTimer)
+      clearInterval(stallInterval)
     }
 
     return content.trim()

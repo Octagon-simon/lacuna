@@ -22,6 +22,17 @@ export interface ProviderPreset {
   apiKeyHint: string
 }
 
+export class ModelStallError extends Error {
+  constructor(public readonly reason: 'first-token-timeout' | 'stream-stall') {
+    super(
+      reason === 'first-token-timeout'
+        ? 'No response from model after 30s — connection may be down'
+        : 'Model stream stalled — no tokens received for 60s',
+    )
+    this.name = 'ModelStallError'
+  }
+}
+
 export const PRESETS: Record<string, ProviderPreset> = {
   claude: {
     label: 'Claude (Anthropic) — claude-sonnet-4-6',

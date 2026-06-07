@@ -129,6 +129,25 @@ async function walkDir(dir: string): Promise<string[]> {
   return files
 }
 
+// Walker that descends into __tests__ — used only for test-file discovery,
+// not for source-file discovery (where __tests__ is correctly excluded).
+async function walkDirForTests(dir: string): Promise<string[]> {
+  const entries = await readdir(dir, { withFileTypes: true }).catch(() => [])
+  const files: string[] = []
+  for (const entry of entries) {
+    if (entry.name.startsWith('.')) continue
+    const full = join(dir, entry.name)
+    if (entry.isDirectory()) {
+      if (entry.name !== 'node_modules') {
+        files.push(...(await walkDirForTests(full)))
+      }
+    } else if (SOURCE_EXTENSIONS.has(extname(entry.name))) {
+      files.push(full)
+    }
+  }
+  return files
+}
+
 async function testFileExists(absSourcePath: string): Promise<boolean> {
   const dir = dirname(absSourcePath)
   const ext = extname(absSourcePath)
@@ -194,10 +213,19 @@ export async function findTestFiles(
   _env: { sourceDir?: string },
   config: { sourceDir: string | string[]; ignore: string[] },
 ): Promise<string[]> {
-  const dirs = (Array.isArray(config.sourceDir) ? config.sourceDir : [config.sourceDir]).map(d => join(cwd, d))
-  const all = (await Promise.all(dirs.map(d => walkDir(d).catch(() => [] as string[])))).flat()
+  const sourceDirs = (Array.isArray(config.sourceDir) ? config.sourceDir : [config.sourceDir]).map(d => join(cwd, d))
+  // Also search the cwd root so tests in __tests__/ directories alongside source dirs are found.
+  const searchDirs = [...new Set([cwd, ...sourceDirs])]
+  // Use walkDirForTests so __tests__/ directories are not skipped (walkDir excludes them
+  // intentionally for source-file discovery, but we need to descend into them here).
+  const all = (await Promise.all(searchDirs.map(d => walkDirForTests(d).catch(() => [] as string[])))).flat()
+  const seen = new Set<string>()
   return all.filter((f) => {
+    if (seen.has(f)) return false
+    seen.add(f)
     const rel = f.replace(cwd + sep, '').replace(cwd + '/', '')
-    return TEST_FILE_RE.test(rel) && !shouldIgnore(f, config.ignore)
+    // Only apply user-defined ignores, not the internal IGNORE_DIRS list
+    // (which would exclude __tests__ paths entirely).
+    return TEST_FILE_RE.test(rel) && !config.ignore.some(p => f.includes(p))
   })
 }

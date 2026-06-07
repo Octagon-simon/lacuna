@@ -24,5 +24,5 @@ export async function coverageAgeSeconds(config: LacunaConfig, cwd: string = pro
   }
 }
 
-export { extractGaps, filterTestableGaps, findUncoveredFiles, formatCoverageSummary } from './gaps.js'
+export { extractGaps, filterTestableGaps, findUncoveredFiles, formatCoverageSummary, findTestFiles } from './gaps.js'
 export type { CoverageReport, CoverageGap, FileCoverage } from './types.js'

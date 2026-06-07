@@ -118,45 +118,61 @@ export function envForRunner(runner: string): DetectedEnvironment {
   )
 }
 
+// Wrap a shell argument in single quotes so that parentheses, spaces, and other
+// shell-special characters in file paths (e.g. Expo Router's app/(tabs)/...) are
+// treated as literals by /bin/sh. Escapes any embedded single-quote with '\''.
+function sq(path: string): string {
+  return `'${path.replace(/'/g, "'\\''")}'`
+}
+
+// Escape regex meta-characters in a file path so it can be used as a literal
+// match in Jest's --testPathPattern. Without this, app/(tabs)/... becomes a
+// regex capturing group that matches "app/tabs/..." (no parens) — 0 matches.
+function jestPath(path: string): string {
+  return sq(path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+}
+
 // Run multiple test files in a single invocation, with the victim always last.
 // Forces sequential execution in a single thread with shared module registry so that
 // state pollution (module singletons, globals, localStorage) from earlier files is
 // visible to the victim — required for bisect to reproduce ordering failures.
 export function multiFileTestCommand(env: DetectedEnvironment, files: string[]): string {
-  const fileList = files.join(' ')
   switch (env.testRunner) {
-    case 'vitest':
+    case 'vitest': {
+      const fileList = files.map(sq).join(' ')
       // --poolOptions.threads.singleThread=true: all files run in one worker thread (shared globals)
       // --no-isolate: all files share the same module registry (shared module singletons)
       return `npx vitest run --poolOptions.threads.singleThread=true --no-isolate ${fileList}`
+    }
     case 'jest':
-      return `npx jest --runInBand ${fileList}`
+      return `npx jest --runInBand ${files.map(jestPath).join(' ')}`
     case 'mocha':
-      return `npx mocha ${fileList}`
+      return `npx mocha ${files.map(sq).join(' ')}`
     default:
       return fileTestCommand(env, files[files.length - 1])
   }
 }
 
 export function fileTestCommand(env: DetectedEnvironment, testFilePath: string): string {
+  const q = sq(testFilePath)
   switch (env.testRunner) {
-    case 'vitest': return `npx vitest run ${testFilePath}`
-    case 'jest':   return `npx jest --testPathPattern=${testFilePath}`
-    case 'mocha':  return `npx mocha ${testFilePath}`
-    case 'pytest': return `python -m pytest ${testFilePath} -v`
+    case 'vitest': return `npx vitest run ${q}`
+    case 'jest':   return `npx jest --testPathPattern=${jestPath(testFilePath)}`
+    case 'mocha':  return `npx mocha ${q}`
+    case 'pytest': return `python -m pytest ${q} -v`
     case 'go-test': {
       const dir = testFilePath.includes('/') ? testFilePath.replace(/\/[^/]+$/, '') : '.'
       return `go test ./${dir}/...`
     }
-    case 'phpunit': return `./vendor/bin/phpunit ${testFilePath}`
-    case 'pest':    return `./vendor/bin/pest ${testFilePath}`
-    case 'rspec':   return `bundle exec rspec ${testFilePath}`
+    case 'phpunit': return `./vendor/bin/phpunit ${q}`
+    case 'pest':    return `./vendor/bin/pest ${q}`
+    case 'rspec':   return `bundle exec rspec ${q}`
     case 'cargo-test': return `cargo test`
     case 'dotnet-test': return `dotnet test --filter "${testFilePath.replace(/.*\//, '').replace(/Tests\.cs$/, '')}"`
     case 'gradle-test': return `./gradlew test --tests "${testFilePath.replace(/.*\//, '').replace(/Test\.java$/, '')}"`
     case 'maven-test': return `mvn test -Dtest="${testFilePath.replace(/.*\//, '').replace(/Test\.java$/, '')}"`
     case 'swift-test': return `swift test --filter "${testFilePath.replace(/.*\//, '').replace(/Tests\.swift$/, '')}"`
-    default: return `${env.testCommand} ${testFilePath}`
+    default: return `${env.testCommand} ${q}`
   }
 }
 

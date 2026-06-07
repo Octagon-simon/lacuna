@@ -10,7 +10,7 @@ import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 import { buildFixFileContext, computeRelativeImport, collectTypeDefinitions, collectLocalImportPaths, detectReactMajorVersion } from './context.js'
-import { TestGenerator, TruncatedOutputError, OscillationError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
+import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
 import { processGap } from './loop.js'
 import type { CoverageGap } from '../lib/coverage/types.js'
 import { ProjectMemory } from './project-memory.js'
@@ -79,7 +79,7 @@ export interface FixResult {
 
 // ─── Parse failing test files from runner output ──────────────────────────────
 
-const TEST_FILE_RE = /[\w./\\@\[\]-]+\.(?:test|spec)\.(?:tsx|mts|ts|jsx|js)/
+const TEST_FILE_RE = /[\w./\\@\[\]()-]+\.(?:test|spec)\.(?:tsx|mts|ts|jsx|js)/
 
 function stripAnsi(s: string): string {
   // Strip all CSI sequences (ESC [ ... letter), OSC sequences, carriage returns
@@ -236,14 +236,25 @@ async function fixFile(
   // Build mocks/setup context relative to the actual test file path
   const ctx = await buildFixFileContext(absTestPath, cwd, config).catch(() => null)
 
-  if (!onStatus) log(chalk.dim(`  Sending to ${config.model} for repair...`))
-  onStatus?.({ phase: 'generating', file: shortPath })
+  let stallRetries = 0
+  const MAX_STALL_RETRIES = 2
 
   for (let attempt = 1; attempt <= config.maxIterations; attempt++) {
     if (attempt > 1) {
       if (!onStatus) log(chalk.yellow(`\n  Retry ${attempt}/${config.maxIterations}...`))
-      onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations })
     }
+
+    // Show waiting phase before the model call; transition to generating/retrying on first token
+    onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() })
+    const currentAttempt = attempt
+    generator.setFirstTokenCallback(() => {
+      onStatus?.({
+        phase: currentAttempt === 1 ? 'generating' : 'retrying',
+        file: shortPath,
+        ...(currentAttempt > 1 ? { attempt: currentAttempt, max: config.maxIterations } : {}),
+      } as WorkerState)
+    })
+    if (!onStatus) log(chalk.dim(`  ⌛ Waiting for model response...`))
 
     let viewer: StreamingFileViewer | undefined
     if (verbose && !onStatus) {
@@ -262,6 +273,7 @@ async function fixFile(
             sourceCode,
             sourceImportPath,
             errorOutput,
+            env,
             mocksCode: ctx?.mocksCode ?? null,
             mocksImportPath: ctx?.mocksImportPath ?? null,
             setupFileCode: ctx?.setupFileCode ?? null,
@@ -276,6 +288,17 @@ async function fixFile(
     } catch (err) {
       viewer?.stop()
       generator.setTokenCallback(undefined)
+      generator.setFirstTokenCallback(undefined)
+      if (err instanceof ModelStallError) {
+        if (stallRetries < MAX_STALL_RETRIES) {
+          stallRetries++
+          if (!onStatus) log(chalk.yellow(`\n  ⌛ Model stalled — reconnecting (${stallRetries}/${MAX_STALL_RETRIES})...`))
+          onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() })
+          await new Promise(r => setTimeout(r, 3000))
+          attempt--   // don't consume an AI iteration for a connection stall
+          continue
+        }
+      }
       if (err instanceof TruncatedOutputError) {
         errorOutput = TRUNCATION_RETRY_MESSAGE
         if (!onStatus) log(chalk.yellow(`\n  Output truncated — retrying with shorter output request...`))
@@ -305,6 +328,7 @@ async function fixFile(
 
     viewer?.stop()
     generator.setTokenCallback(undefined)
+    generator.setFirstTokenCallback(undefined)
 
     if (dryRun) {
       if (!onStatus) {
@@ -379,12 +403,16 @@ async function fixFile(
     }
 
     const rawRunOutput = result.stdout + '\n' + result.stderr
-    const extracted = enrichNoTestsError(extractTestFailure(rawRunOutput))
+    const rawExtracted = extractTestFailure(rawRunOutput)
     const structureBroken = isZeroTestsOutput(rawRunOutput)
     const currentPassCount = structureBroken ? 0 : parsePassCount(rawRunOutput)
+    // enrichNoTestsError adds guidance for genuinely missing test functions;
+    // in the structure-broken path the issue is always a broken import, so use
+    // rawExtracted there so the actual module error isn't buried in boilerplate.
+    const extracted = enrichNoTestsError(rawExtracted)
 
     if (structureBroken) {
-      errorOutput = buildStructureBrokenMessage(initialErrorOutput, extracted)
+      errorOutput = buildStructureBrokenMessage(initialErrorOutput, rawExtracted)
       if (!onStatus) log(chalk.red(`  Fix broke file structure — 0 tests collected (attempt ${attempt}/${config.maxIterations})`))
     } else if (currentPassCount < baselinePassCount) {
       errorOutput = buildRegressionMessage(initialErrorOutput, extracted, baselinePassCount, currentPassCount)
