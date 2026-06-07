@@ -17,6 +17,7 @@ export interface FileContext {
   tsconfigPaths: string | null    // path aliases from tsconfig.json
   typeDefinitions: string | null  // interface/type/enum declarations from locally imported files
   localImportPaths: string[] | null  // pre-computed vi.mock() paths (relative from test file to each local dep)
+  localImportContents: string | null // full content (capped) of directly imported local files — hook/service implementations
   reactMajorVersion: number | null   // major React version detected from package.json, or null
 }
 
@@ -264,6 +265,303 @@ export async function collectLocalImportPaths(
   return results.length > 0 ? results : null
 }
 
+// ─── Used-symbols context ─────────────────────────────────────────────────────
+// Builds a targeted map of exactly what the source component uses from its local
+// imports: hook return shapes, service method signatures, type declarations.
+// No arbitrary line cap — output is naturally bounded by what's actually referenced.
+// BFS follows transitive type references (e.g. Draw type used by useDraws hook).
+
+// Extract a brace-balanced block starting at lines[startIdx].
+// Also handles brace-less type aliases by continuing while a continuation is implied.
+function extractBraceBlock(lines: string[], startIdx: number): string {
+  const block: string[] = []
+  let depth = 0
+  let opened = false
+  for (let i = startIdx; i < lines.length; i++) {
+    block.push(lines[i])
+    for (const ch of lines[i]) {
+      if (ch === '{') { depth++; opened = true }
+      else if (ch === '}') depth--
+    }
+    if (opened && depth <= 0) break
+    if (!opened && i > startIdx) {
+      const t = lines[i].trimEnd()
+      const nextStartsCont = (i + 1 < lines.length) && /^\s*[|&]/.test(lines[i + 1])
+      const isCont = t.endsWith('|') || t.endsWith('&') || t.endsWith(',') || t.endsWith('=') || nextStartsCont
+      if (!isCont) break
+    }
+  }
+  return block.join('\n')
+}
+
+const MAX_FN_LINES = 25
+
+// For long functions/hooks: keep signature + "// ..." + last return statement.
+function summariseFunctionBlock(code: string): string {
+  const lines = code.split('\n')
+  if (lines.length <= MAX_FN_LINES) return code
+
+  let bodyOpen = 0
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].includes('{')) { bodyOpen = i; break }
+  }
+
+  let returnStart = -1
+  for (let i = lines.length - 2; i > bodyOpen; i--) {
+    if (/^\s*return\b/.test(lines[i])) { returnStart = i; break }
+  }
+
+  const sig = lines.slice(0, bodyOpen + 1)
+  if (returnStart === -1) return [...sig, '  // ...', '}'].join('\n')
+  return [...sig, '  // ...', ...lines.slice(returnStart)].join('\n')
+}
+
+// For classes: keep declaration + method signatures, collapse all bodies.
+function summariseClassBlock(code: string): string {
+  const lines = code.split('\n')
+  const out: string[] = [lines[0]]
+  let depth = 0
+  for (const ch of lines[0]) {
+    if (ch === '{') depth++
+    else if (ch === '}') depth--
+  }
+  let i = 1
+  while (i < lines.length) {
+    const line = lines[i]
+    const t = line.trim()
+    if (!t || /^[/*]/.test(t) || t === '}') {
+      out.push(line)
+      for (const ch of line) { if (ch === '{') depth++; else if (ch === '}') depth-- }
+      i++; continue
+    }
+    // At class body depth (1): detect method-like lines by presence of '('
+    if (depth === 1 && /\(/.test(t) && !/^\s*\/\//.test(line)) {
+      const sigLines: string[] = []
+      let d = depth
+      let j = i
+      while (j < lines.length) {
+        const l = lines[j]
+        d += (l.match(/\{/g) ?? []).length - (l.match(/\}/g) ?? []).length
+        sigLines.push(l)
+        j++
+        if (d > depth) break  // body opened
+        if (d === depth) break // abstract / no body
+      }
+      // Show sig lines but strip the opening `{` from the last one
+      for (let k = 0; k < sigLines.length - 1; k++) out.push(sigLines[k])
+      const last = sigLines[sigLines.length - 1].replace(/\s*\{[^}]*$/, '').trimEnd()
+      if (last.trim()) out.push(last)
+      if (d > depth) {
+        // Skip method body
+        i = j
+        while (i < lines.length && d > depth) {
+          d += (lines[i].match(/\{/g) ?? []).length - (lines[i].match(/\}/g) ?? []).length
+          i++
+        }
+        depth = d
+        continue
+      }
+      depth = d; i = j; continue
+    }
+    out.push(line)
+    for (const ch of line) { if (ch === '{') depth++; else if (ch === '}') depth-- }
+    i++
+  }
+  return out.join('\n')
+}
+
+// PascalCase identifiers in code that look like local type references.
+const TYPE_REF_BUILTINS = new Set([
+  'React', 'Promise', 'String', 'Number', 'Boolean', 'Array', 'Object', 'Error',
+  'Date', 'Map', 'Set', 'RegExp', 'Function', 'Symbol', 'URL', 'JSON', 'Event',
+  'HTMLElement', 'Element', 'Node', 'Window', 'Document', 'MouseEvent', 'KeyboardEvent',
+  'FC', 'ReactNode', 'ReactElement', 'ComponentProps', 'Dispatch', 'SetStateAction',
+  'MutableRefObject', 'RefObject', 'CSSProperties', 'SyntheticEvent', 'PropsWithChildren',
+  'Partial', 'Required', 'Readonly', 'Record', 'Pick', 'Omit', 'Exclude', 'Extract',
+  'NonNullable', 'ReturnType', 'InstanceType', 'Parameters', 'Awaited',
+  'View', 'Text', 'ScrollView', 'FlatList', 'TouchableOpacity', 'Animated',
+])
+function extractTypeRefs(code: string): string[] {
+  const found = new Set<string>()
+  for (const m of code.matchAll(/\b([A-Z][a-zA-Z0-9]+)\b/g)) {
+    if (!TYPE_REF_BUILTINS.has(m[1])) found.add(m[1])
+  }
+  return [...found]
+}
+
+function extractAllExportNames(code: string): string[] {
+  const names: string[] = []
+  for (const m of code.matchAll(/^export\s+(?:async\s+)?(?:function|const|class|interface|type|enum)\s+(\w+)/gm)) names.push(m[1])
+  for (const m of code.matchAll(/^export\s+\{([^}]+)\}/gm)) {
+    for (const part of m[1].split(',')) {
+      const name = part.trim().split(/\s+as\s+/).pop()?.trim()
+      if (name && /^\w+$/.test(name)) names.push(name)
+    }
+  }
+  return [...new Set(names)]
+}
+
+interface SymbolExtractionResult {
+  code: string
+  reexportPath?: string
+  reexportName?: string
+}
+
+function extractSymbolFromCode(code: string, name: string): SymbolExtractionResult | null {
+  const lines = code.split('\n')
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    if (!/\bexport\b/.test(line)) continue
+
+    // Re-export: export [type] { X as Y } from './path'
+    const reFrom = line.match(/^export\s+(?:type\s+)?\{([^}]+)\}\s+from\s+['"]([^'"]+)['"]/)
+    if (reFrom) {
+      for (const part of reFrom[1].split(',')) {
+        const halves = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/)
+        const exported = (halves[1] ?? halves[0]).trim()
+        if (exported === name) return { code: '', reexportPath: reFrom[2], reexportName: halves[0].trim() }
+      }
+      continue
+    }
+
+    if (name === 'default' && /^\s*export\s+default\b/.test(line)) {
+      return { code: summariseFunctionBlock(extractBraceBlock(lines, i)) }
+    }
+    if (new RegExp(`^\\s*export\\s+(?:async\\s+)?function\\s*\\*?\\s*${name}\\s*[<(]`).test(line)) {
+      return { code: summariseFunctionBlock(extractBraceBlock(lines, i)) }
+    }
+    if (new RegExp(`^\\s*export\\s+const\\s+${name}\\s*[=:]`).test(line)) {
+      return { code: summariseFunctionBlock(extractBraceBlock(lines, i)) }
+    }
+    if (new RegExp(`^\\s*export\\s+(?:abstract\\s+)?class\\s+${name}\\b`).test(line)) {
+      return { code: summariseClassBlock(extractBraceBlock(lines, i)) }
+    }
+    if (new RegExp(`^\\s*export\\s+(?:default\\s+)?(?:interface|type|enum)\\s+${name}\\b`).test(line)) {
+      return { code: extractBraceBlock(lines, i) }
+    }
+  }
+  return null
+}
+
+// Parse which symbols a source file imports from each local dependency.
+// Returns Map<absoluteFilePath, Set<symbolName>> — '*' means namespace import.
+async function parseImportedSymbols(
+  code: string,
+  fromAbsPath: string,
+  cwd: string,
+  aliases: Record<string, string[]>,
+): Promise<Map<string, Set<string>>> {
+  const result = new Map<string, Set<string>>()
+  for (const m of code.matchAll(/^import(?:\s+type)?\s+(.+?)\s+from\s+['"]([^'"]+)['"]/gm)) {
+    const clause = m[1].trim()
+    const base = resolveLocalImport(m[2], fromAbsPath, cwd, aliases)
+    if (!base) continue
+    const file = await resolveToFile(base)
+    if (!file) continue
+    const syms = result.get(file) ?? new Set<string>()
+    result.set(file, syms)
+    if (/\*\s+as\s+/.test(clause)) { syms.add('*'); continue }
+    const namedMatch = clause.match(/\{([^}]+)\}/)
+    if (namedMatch) {
+      for (const part of namedMatch[1].split(',')) {
+        const name = part.trim().replace(/^type\s+/, '').split(/\s+as\s+/)[0].trim()
+        if (/^\w+$/.test(name)) syms.add(name)
+      }
+    }
+    const stripped = clause.replace(/\{[^}]*\}/, '').replace(/\*\s+as\s+\w+/, '').trim()
+    const def = stripped.match(/^(\w+)/)
+    if (def && def[1] !== 'type') syms.add('default')
+  }
+  return result
+}
+
+const MAX_SYMBOLS_TOTAL_CHARS = 14000
+
+// Builds targeted context from only the symbols the source component actually uses.
+// For each imported symbol: extracts its declaration, collapses function bodies to
+// signature + return, collapses class bodies to method signatures.
+// Transitively follows PascalCase type references through their import chains (BFS).
+export async function collectUsedSymbolsContext(
+  sourceCode: string,
+  absoluteSourcePath: string,
+  cwd: string,
+): Promise<string | null> {
+  const aliases = await readTsconfigAliases(cwd)
+  const directImports = await parseImportedSymbols(sourceCode, absoluteSourcePath, cwd, aliases)
+
+  type QItem = { file: string; symbols: Set<string> }
+  const queue: QItem[] = []
+  for (const [file, syms] of directImports) queue.push({ file, symbols: new Set(syms) })
+
+  const visited = new Set<string>()  // `${file}::${symbol}`
+  const fileSections: string[] = []
+  let totalChars = 0
+
+  while (queue.length > 0 && totalChars < MAX_SYMBOLS_TOTAL_CHARS) {
+    const { file, symbols } = queue.shift()!
+    let fileContent: string
+    try { fileContent = await readFile(file, 'utf-8') } catch { continue }
+
+    const toProcess = symbols.has('*') ? new Set(extractAllExportNames(fileContent)) : symbols
+    const fileBlocks: string[] = []
+    const typeRefs = new Set<string>()
+
+    for (const sym of toProcess) {
+      const key = `${file}::${sym}`
+      if (visited.has(key)) continue
+      visited.add(key)
+
+      const result = extractSymbolFromCode(fileContent, sym)
+      if (!result) continue
+
+      if (result.reexportPath) {
+        const base = resolveLocalImport(result.reexportPath, file, cwd, aliases)
+        if (base) {
+          const reFile = await resolveToFile(base)
+          if (reFile) {
+            const reSym = result.reexportName ?? sym
+            if (!visited.has(`${reFile}::${reSym}`)) queue.push({ file: reFile, symbols: new Set([reSym]) })
+          }
+        }
+        continue
+      }
+
+      if (result.code) {
+        fileBlocks.push(result.code)
+        for (const ref of extractTypeRefs(result.code)) typeRefs.add(ref)
+      }
+    }
+
+    // Follow type references: first check same file, then follow cross-file imports
+    if (typeRefs.size > 0) {
+      // Same-file types (defined in this file but not yet extracted)
+      for (const ref of typeRefs) {
+        const key = `${file}::${ref}`
+        if (visited.has(key)) continue
+        const local = extractSymbolFromCode(fileContent, ref)
+        if (local?.code) {
+          visited.add(key)
+          fileBlocks.push(local.code)
+        }
+      }
+      // Cross-file types (imported by this file from another local file)
+      const typeImports = await parseImportedSymbols(fileContent, file, cwd, aliases)
+      for (const [typeFile, typeSyms] of typeImports) {
+        const relevant = new Set([...typeSyms].filter(s => typeRefs.has(s)))
+        if (relevant.size > 0) queue.push({ file: typeFile, symbols: relevant })
+      }
+    }
+
+    if (fileBlocks.length > 0) {
+      const section = `// from ${relative(cwd, file)}\n${fileBlocks.join('\n\n')}`
+      fileSections.push(section)
+      totalChars += section.length
+    }
+  }
+
+  return fileSections.length > 0 ? fileSections.join('\n\n') : null
+}
+
 // Reads the React major version from package.json, or null if React is not a dependency.
 export async function detectReactMajorVersion(cwd: string): Promise<number | null> {
   try {
@@ -424,11 +722,12 @@ export async function buildFileContext(
     } catch { /* setup file not found — skip */ }
   }
 
-  const [packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, reactMajorVersion] = await Promise.all([
+  const [packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, localImportContents, reactMajorVersion] = await Promise.all([
     readPackageDeps(cwd),
     readTsconfigPaths(cwd),
     collectTypeDefinitions(sourceCode, absoluteSource, cwd),
     collectLocalImportPaths(sourceCode, absoluteSource, suggestedTestFile, cwd),
+    collectUsedSymbolsContext(sourceCode, absoluteSource, cwd),
     detectReactMajorVersion(cwd),
   ])
 
@@ -446,6 +745,7 @@ export async function buildFileContext(
     tsconfigPaths,
     typeDefinitions,
     localImportPaths,
+    localImportContents,
     reactMajorVersion,
   }
 }

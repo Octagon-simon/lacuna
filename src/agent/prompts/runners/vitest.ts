@@ -1,0 +1,22 @@
+export function buildVitestCauses(): string {
+  return `
+- Never use require() in Vitest: Vitest runs files as ESM — dynamic require() fails at transform time. Always use static ES import + vi.mocked().
+- vi.mock() ORDERING: write all import statements first, then vi.mock() calls after them. Vitest hoists vi.mock() at runtime, but ESLint's import/first rule errors if vi.mock() appears before any import in the source. WRONG: \`vi.mock(...); import React from 'react'\` — RIGHT: \`import React from 'react'; ... vi.mock(...)\`
+- Shared mock file factory syntax: \`vi.mock('../service', async () => await import('../../test/mocks'))\` — synchronous factory cannot import external files in Vitest.
+- vi.hoisted() for shared mock references: when a mock object is created inside vi.mock() AND configured in beforeEach, use vi.hoisted() so both closures reference the same object instance. CONSTRUCTABLE MOCK PATTERN: if the source calls \`new Module()\` (especially at module scope in the imported file, e.g. \`const resend = new Resend(key)\`), the vi.mock() factory must return something constructable. Arrow functions are NOT constructable — \`new (() => {})()\` throws "not a constructor". Use vi.hoisted() to define the mock outside the factory, then use a regular function expression (not an arrow function) in mockImplementation: \`const MockResend = vi.hoisted(() => vi.fn().mockImplementation(function() { return { emails: { send: mockSend } }; }))\` — regular function expressions ARE constructable with \`new\`. Then reference MockResend inside the vi.mock() factory.
+- Complete hook self-replacement for *.client-importing hooks: when a hook imports *.client services that chain into browser/server-only modules, mock the entire hook — \`vi.mock('../useMyHook', () => ({ useMyHook: vi.fn() }))\` — rather than each sub-dependency.
+- server-only resolution in Next.js: \`Failed to resolve import "server-only"\` is a config issue, not a test issue. Add an alias in vitest.config.ts: \`'server-only': path.resolve(__dirname, './test/empty-module.ts')\` and create that file with \`export default {}\`.
+- Top-level await (TS1378): NEVER use \`await\` at the top level of a test file. Every \`await\` must be inside an async callback: \`it("...", async () => { ... })\`.
+- NEVER call vi.spyOn(global, ...) or vi.spyOn(globalThis, ...) at module level (outside beforeEach/beforeAll). Each Vitest file has its own vi registry. A module-level spy is installed on the shared worker globalThis but setup-file afterEach cleanup (vi.restoreAllMocks) uses a different vi instance and cannot remove it — the spy persists after the file ends and poisons the next file that runs in the same worker. Always create global spies inside beforeEach so they are fresh per test and properly cleaned up:
+  WRONG: const mockFetch = vi.spyOn(global, 'fetch');  // module level — breaks other files
+  RIGHT: let mockFetch: ReturnType<typeof vi.spyOn>;
+         beforeEach(() => { mockFetch = vi.spyOn(global, 'fetch'); });
+- Never write two vi.mock() calls for the same module path in the same file. The second call silently overrides the first — exports from the first mock are lost. If a module exports many things (e.g. lucide-react icons), list them all in a single vi.mock() factory:
+  WRONG: vi.mock('lucide-react', () => ({ Search: () => null }))  ...later...  vi.mock('lucide-react', () => ({ Plus: () => null }))
+  RIGHT: vi.mock('lucide-react', () => ({ Search: () => null, Plus: () => null }))
+- vi.resetAllMocks() vs vi.clearAllMocks() — use the right one or tests break under shuffle:
+  clearAllMocks() only wipes call history (mock.calls, mock.results). It does NOT reset mockReturnValue / mockResolvedValue / mockImplementation.
+  resetAllMocks() wipes call history AND resets all implementations back to undefined.
+  RULE: if ANY test in the file calls mockFn.mockImplementation(...) directly (e.g. a loading-state test that uses \`() => new Promise(() => {})\` to freeze async), the beforeEach MUST use vi.resetAllMocks() — otherwise that implementation bleeds into the next test when run in shuffle order, and mockResolvedValue set in beforeEach is silently overridden by the stale mockImplementation.
+  PATTERN: loading-state test sets mockImplementation → test passes → shuffle puts it before the success-state test → success test's beforeEach calls clearAllMocks (history wiped, implementation NOT wiped) → mockResolvedValue set in beforeEach loses to the stale never-resolving implementation → success test gets 0 instead of expected data.`
+}

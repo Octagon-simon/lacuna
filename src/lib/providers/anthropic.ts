@@ -1,5 +1,9 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { ModelProvider, ChatMessage } from './types.js'
+import { ModelStallError } from './types.js'
+
+const FIRST_TOKEN_TIMEOUT_MS = 30_000
+const STALL_TIMEOUT_MS = 60_000
 
 export class AnthropicProvider implements ModelProvider {
   private client: Anthropic
@@ -32,25 +36,54 @@ export class AnthropicProvider implements ModelProvider {
       return { role: msg.role, content: msg.content }
     })
 
+    const controller = new AbortController()
+    let firstTokenReceived = false
+    let lastTokenAt = 0
+
+    const firstTokenTimer = setTimeout(() => {
+      controller.abort('first-token-timeout')
+    }, FIRST_TOKEN_TIMEOUT_MS)
+
+    const stallInterval = setInterval(() => {
+      if (firstTokenReceived && Date.now() - lastTokenAt > STALL_TIMEOUT_MS) {
+        controller.abort('stream-stall')
+      }
+    }, 5_000)
+
     try {
-      const stream = this.client.messages.stream({
-        model: this.model,
-        max_tokens: maxTokens,
-        stop_sequences: ['</code_output>'],
-        ...(temperature !== undefined ? { temperature } : {}),
-        // Cache the system prompt — same ~3000 tokens sent on every generate/fix/retry
-        // call and across all parallel workers. Without caching each call pays full price.
-        system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
-        messages: anthropicMessages,
-      })
+      const stream = this.client.messages.stream(
+        {
+          model: this.model,
+          max_tokens: maxTokens,
+          stop_sequences: ['</code_output>'],
+          ...(temperature !== undefined ? { temperature } : {}),
+          // Cache the system prompt — same ~3000 tokens sent on every generate/fix/retry
+          // call and across all parallel workers. Without caching each call pays full price.
+          system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+          messages: anthropicMessages,
+        },
+        { signal: controller.signal },
+      )
 
       for await (const event of stream) {
         if (event.type === 'content_block_delta' && event.delta.type === 'text_delta') {
+          if (!firstTokenReceived) {
+            firstTokenReceived = true
+            clearTimeout(firstTokenTimer)
+            lastTokenAt = Date.now()
+          } else {
+            lastTokenAt = Date.now()
+          }
           content += event.delta.text
           onToken?.(event.delta.text)
         }
       }
     } catch (err) {
+      if (controller.signal.aborted) {
+        throw new ModelStallError(
+          (controller.signal.reason as string) === 'first-token-timeout' ? 'first-token-timeout' : 'stream-stall',
+        )
+      }
       const msg = err instanceof Error ? err.message : String(err)
 
       if (/prompt is too long|max_tokens.*exceed|too many tokens/i.test(msg)) {
@@ -73,6 +106,9 @@ export class AnthropicProvider implements ModelProvider {
       }
 
       throw err
+    } finally {
+      clearTimeout(firstTokenTimer)
+      clearInterval(stallInterval)
     }
 
     return content.trim()

@@ -23,16 +23,18 @@ lacuna analyze / lacuna generate            lacuna fix
   │                                           └── For each failing test file:
   └── For each gap: (generate only)                 ├── Runs file alone → captures error output
         ├── Reads source + existing tests           ├── Reads the test file + its source file
-        ├── Reads imported type definitions         ├── Reads imported type definitions
-        ├── Reads tsconfig paths, deps,             ├── Reads tsconfig paths, deps, setup file
-        │   and test setup file                     ├── Detects network mocking issues
-        ├── Sends full context to AI model          ├── AI reasons in <thinking>, writes fix
-        ├── AI reasons then writes tests            ├── Writes the fixed file
-        ├── Runs the tests                          ├── ✅ Pass → next file
-        ├── ✅ Pass → next file                     └── ❌ Fail → records what failed,
-        └── ❌ Fail → records what failed,                       detects oscillation (stops early),
-                      detects oscillation (stops early),         retries with negative constraints
-                      retries with negative constraints          restores original on final failure
+        ├── Extracts used symbol definitions        ├── Reads imported type definitions
+        │   (hook return shapes, service            ├── Reads tsconfig paths, deps, setup file
+        │   method sigs, transitive types)          ├── Detects network mocking issues
+        ├── Reads tsconfig paths, deps,             ├── AI reasons in <thinking>, writes fix
+        │   and test setup file                     ├── Writes the fixed file
+        ├── Sends full context to AI model          ├── ✅ Pass → next file
+        ├── AI reasons then writes tests            └── ❌ Fail → records what failed,
+        ├── Runs the tests                                       detects oscillation (stops early),
+        ├── ✅ Pass → next file                                  retries with negative constraints
+        └── ❌ Fail → records what failed,                       restores original on final failure
+                      detects oscillation (stops early),
+                      retries with negative constraints
                       restores original on final failure
 ```
 
@@ -57,6 +59,33 @@ lacuna init        # interactive setup wizard — installs test runner if missin
 lacuna analyze     # see what's uncovered (read-only)
 lacuna generate    # AI fills the gaps
 ```
+
+---
+
+## Supported stacks
+
+Lacuna's AI prompts are tuned for frameworks that have been field-tested. Runner support (coverage collection + test generation) exists for other languages, but prompt guidance quality will vary.
+
+### Tested — works well
+
+| Stack | Test runner | What's tuned |
+|---|---|---|
+| **TypeScript / JavaScript** (utilities, services, hooks) | Vitest, Jest | Hook return shape extraction, service method verification, TypeScript type-safety rules (`T[]` not `Array<T>`, no `as any` on mock shapes), mock structure (object vs factory), `jest.mocked()` / `vi.mocked()` pattern, factory hoisting rules |
+| **React** | Vitest, Jest | RTL query hierarchy, `act()` async rules, loading state (unmounted vs disabled button), unhandled rejection handling, mock lifecycle (`mockResolvedValueOnce`), `findBy` over `waitFor` preference |
+| **React Native** / Expo | Jest (`jest-expo`) | RNTL v14 async contract (`render()` + `fireEvent` must be awaited), infra mocks (Reanimated, AsyncStorage, safe area, vector icons), compound component factories, mock shape accuracy (hook destructure matching, service method names), dynamic text template resolution, toast vs screen text, icon-only button handling, `useFocusEffect` mocking, test cascade detection |
+| **Next.js** | Vitest | Server/client boundary mocks, `next/navigation`, `next/headers`, `next/cache`, server actions, `'use client'`/`'use server'` directive detection |
+
+### Supported — not yet field-tested
+
+| Stack | Test runner | Status |
+|---|---|---|
+| Vue | Vitest | Runner works. `@testing-library/vue` guidance included. Field-testing pending. |
+| Python | pytest | Runner + coverage detection works. AI prompt guidance is generic — framework-specific tuning (pytest-django, FastAPI, etc.) will be added once field-tested. |
+| PHP | PHPUnit, Pest | Runner + coverage detection works. Framework-specific prompt tuning coming once field-tested. |
+
+### Runner support only
+
+Go, Ruby (RSpec), Rust (cargo test), C# (dotnet test), Java (Gradle / Maven), Swift — lacuna can run their suites and collect coverage, but AI prompt guidance is not yet tuned for these.
 
 ---
 
@@ -473,7 +502,12 @@ lacuna/
 │   │   ├── fix-loop.ts    # fix → run → retry loop for failing tests
 │   │   ├── context.ts     # builds context for the AI (source + tests + mocks + type definitions)
 │   │   ├── generator.ts   # calls the AI model, manages conversation history
-│   │   └── prompts.ts     # system prompt + user prompt templates
+│   │   └── prompts/       # prompt builders split by framework
+│   │       ├── index.ts           # system prompt + generate/fix/retry prompt assembly
+│   │       ├── react-native.ts    # RNTL v14 rules, infra mock guidance, error detectors
+│   │       ├── nextjs.ts          # Next.js boundary analysis, server action mocks
+│   │       ├── react.ts           # React web testing rules (act, RTL, timers)
+│   │       └── vue.ts             # Vue testing guidance
 │   ├── lib/
 │   │   ├── config.ts      # cosmiconfig loader + zod schema
 │   │   ├── detector.ts    # auto-detects test runner and language

@@ -5,13 +5,13 @@ import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import { fileTestCommand } from '../lib/detector.js'
 import { runCommand } from '../lib/runner.js'
-import { loadCoverage, coverageAgeSeconds, extractGaps, filterTestableGaps, findUncoveredFiles } from '../lib/coverage/index.js'
+import { loadCoverage, coverageAgeSeconds, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles } from '../lib/coverage/index.js'
 import type { CoverageGap, CoverageReport } from '../lib/coverage/types.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { buildFileContext } from './context.js'
-import { TestGenerator, TruncatedOutputError, OscillationError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
+import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile } from '../lib/typecheck.js'
@@ -97,21 +97,27 @@ export async function processGap(
   let lastError: string | null = null
   let firstError: string | null = null      // error from attempt 1, kept as anchor for regressions
   let firstPassCount = 0                    // passing tests on attempt 1
+  let stallRetries = 0
+  const MAX_STALL_RETRIES = 2
 
   for (let attempt = 1; attempt <= config.maxIterations; attempt++) {
     if (!onStatus) {
       if (attempt > 1) {
         log(chalk.yellow(`\n  Retry ${attempt}/${config.maxIterations} — fixing failures...`))
-      } else {
-        log(chalk.dim(`\n  Generating tests via ${config.model}...`))
       }
     }
 
-    onStatus?.({
-      phase: attempt === 1 ? 'generating' : 'retrying',
-      file: shortPath,
-      ...(attempt > 1 ? { attempt, max: config.maxIterations } : {}),
-    } as WorkerState)
+    // Show waiting phase before the model call; transition to generating/retrying on first token
+    onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() })
+    const currentAttempt = attempt
+    generator.setFirstTokenCallback(() => {
+      onStatus?.({
+        phase: currentAttempt === 1 ? 'generating' : 'retrying',
+        file: shortPath,
+        ...(currentAttempt > 1 ? { attempt: currentAttempt, max: config.maxIterations } : {}),
+      } as WorkerState)
+    })
+    if (!onStatus) log(chalk.dim(`\n  ⌛ Waiting for model response...`))
 
     let viewer: StreamingFileViewer | undefined
     if (verbose && !onStatus) {
@@ -127,6 +133,17 @@ export async function processGap(
     } catch (err) {
       viewer?.stop()
       generator.setTokenCallback(undefined)
+      generator.setFirstTokenCallback(undefined)
+      if (err instanceof ModelStallError) {
+        if (stallRetries < MAX_STALL_RETRIES) {
+          stallRetries++
+          if (!onStatus) log(chalk.yellow(`\n  ⌛ Model stalled — reconnecting (${stallRetries}/${MAX_STALL_RETRIES})...`))
+          onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() })
+          await new Promise(r => setTimeout(r, 3000))
+          attempt--   // don't consume an AI iteration for a connection stall
+          continue
+        }
+      }
       if (err instanceof TruncatedOutputError) {
         lastError = TRUNCATION_RETRY_MESSAGE
         if (!onStatus) log(chalk.yellow(`\n  Output truncated — retrying with shorter output request...`))
@@ -154,6 +171,7 @@ export async function processGap(
 
     viewer?.stop()
     generator.setTokenCallback(undefined)
+    generator.setFirstTokenCallback(undefined)
 
     if (dryRun) {
       if (!onStatus) {
@@ -236,7 +254,8 @@ export async function processGap(
     }
 
     const rawRunOutput = runResult.stdout + '\n' + runResult.stderr
-    const extracted = enrichNoTestsError(extractTestFailure(rawRunOutput))
+    const rawExtracted = extractTestFailure(rawRunOutput)
+    const extracted = enrichNoTestsError(rawExtracted)
     const passCount = parsePassCount(rawRunOutput)
 
     if (attempt === 1) {
@@ -245,7 +264,7 @@ export async function processGap(
       lastError = extracted
       if (!onStatus) log(chalk.red(`  Tests failed (attempt ${attempt}/${config.maxIterations})`))
     } else if (isZeroTestsOutput(rawRunOutput)) {
-      lastError = buildStructureBrokenMessage(firstError!, extracted)
+      lastError = buildStructureBrokenMessage(firstError!, rawExtracted)
       if (!onStatus) log(chalk.red(`  Fix broke file structure — 0 tests collected (attempt ${attempt}/${config.maxIterations})`))
     } else if (passCount < firstPassCount) {
       lastError = buildRegressionMessage(firstError!, extracted, firstPassCount, passCount)
@@ -394,42 +413,58 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
 
   // ─── Full suite path ──────────────────────────────────────────────────────────
 
-  const ageSeconds = await coverageAgeSeconds(config, cwd)
-  const useCached = !options.fresh && ageSeconds !== null && ageSeconds < COVERAGE_CACHE_TTL_S
+  const existingTests = await findTestFiles(cwd, {}, config)
+  let hasTests = existingTests.length > 0
 
-  if (useCached) {
-    log(chalk.dim(`  Using cached coverage report (${Math.round(ageSeconds)}s old). Pass --fresh to re-run the suite.`))
+  let report: CoverageReport = { files: [], totalLineRate: 0, totalFunctionRate: 0 }
+  if (!hasTests) {
+    log(chalk.dim('  No test files yet — scanning source files for coverage gaps.'))
   } else {
-    const spinner = startCoverageSpinner(chalk.dim('  Running test suite to collect coverage...'), env.testRunner)
-    const coverageResult = await runCommand(env.coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine)
-    spinner.stop()
+    const ageSeconds = await coverageAgeSeconds(config, cwd)
+    const useCached = !options.fresh && ageSeconds !== null && ageSeconds < COVERAGE_CACHE_TTL_S
 
-    if (coverageResult.timedOut) {
-      throw new Error(
-        `Test suite timed out after ${config.coverageTimeout}s.\n\n` +
-        `This usually means a test has an open handle (unclosed server, timer, or connection).\n` +
-        `Try running: ${env.testCommand} --reporter=verbose\n` +
-        `Or increase the timeout in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`,
-      )
+    if (useCached) {
+      log(chalk.dim(`  Using cached coverage report (${Math.round(ageSeconds)}s old). Pass --fresh to re-run the suite.`))
+    } else {
+      const spinner = startCoverageSpinner(chalk.dim('  Running test suite to collect coverage...'), env.testRunner)
+      const coverageResult = await runCommand(env.coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine)
+      spinner.stop()
+
+      if (coverageResult.timedOut) {
+        throw new Error(
+          `Test suite timed out after ${config.coverageTimeout}s.\n\n` +
+          `This usually means a test has an open handle (unclosed server, timer, or connection).\n` +
+          `Try running: ${env.testCommand} --reporter=verbose\n` +
+          `Or increase the timeout in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`,
+        )
+      }
+
+      const coverageOutput = coverageResult.stdout + coverageResult.stderr
+
+      if (/Tests:\s+0 total/i.test(coverageOutput)) {
+        throw new Error(
+          `Your test suites are failing before any tests run.\n\n` +
+          `This usually means a missing environment variable, broken import, or setup file error.\n` +
+          `Run: ${env.testCommand} 2>&1 | head -80\nto see the actual error.`,
+        )
+      }
+
+      // When ALL tests are failing (0 passed), the lcov data is unreliable —
+      // failing tests still execute source lines, inflating coverage to 50–100%.
+      // Fall back to source-file scanning so gaps are found correctly.
+      // The user should run `lacuna fix` to repair failing tests afterward.
+      if (parsePassCount(coverageOutput) === 0) {
+        hasTests = false
+      }
     }
 
-    const zeroTests = /Tests:\s+0 total|no tests found/i.test(
-      coverageResult.stdout + coverageResult.stderr,
-    )
-    if (zeroTests) {
-      throw new Error(
-        `Your test suites are failing before any tests run.\n\n` +
-        `This usually means a missing environment variable, broken import, or setup file error.\n` +
-        `Run: ${env.testCommand} 2>&1 | head -80\nto see the actual error.`,
-      )
+    if (hasTests) {
+      try {
+        report = await loadCoverage(config, cwd)
+      } catch {
+        throw new Error(`Could not read coverage report from ./${config.coverageDir}/`)
+      }
     }
-  }
-
-  let report: CoverageReport
-  try {
-    report = await loadCoverage(config, cwd)
-  } catch {
-    throw new Error(`Could not read coverage report from ./${config.coverageDir}/`)
   }
 
   const coverageBefore = report.totalLineRate * 100
@@ -442,7 +477,13 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   }
 
   if (gaps.length === 0) {
-    log(chalk.green(`\nAll files already meet the ${config.threshold}% threshold.`))
+    if (coverageBefore < config.threshold) {
+      log(chalk.yellow(`\n⚠ Coverage is ${coverageBefore.toFixed(1)}% — below the ${config.threshold}% threshold.`))
+      log(chalk.dim('  Every source file already has a test file, so there is nothing new to generate.'))
+      log(chalk.dim('  Run `lacuna fix` to repair the failing tests and raise coverage.'))
+    } else {
+      log(chalk.green(`\nAll files already meet the ${config.threshold}% threshold.`))
+    }
     return { filesProcessed: 0, testsWritten: 0, coverageBefore, coverageAfter: coverageBefore, hasCoverage: true, errors: [] }
   }
 
@@ -465,7 +506,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   if (parallel) {
     ;({ filesProcessed, testsWritten, errors } = await runWorkerPool(gaps, options, workerCount, memorySnapshot))
 
-    if (!options.dryRun) {
+    if (!options.dryRun && testsWritten > 0) {
       const finalSpinner = startCoverageSpinner(chalk.dim('\n  Running full suite for final coverage measurement...'), env.testRunner)
       await runCommand(env.coverageCommand, cwd, config.coverageTimeout * 1000, finalSpinner.onLine)
       finalSpinner.stop()
@@ -506,7 +547,9 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     }
   }
 
-  const coverageAfter = options.dryRun ? coverageBefore : await getCoverageRate(config, cwd)
+  // Only measure coverage after if at least one test was written — otherwise the failing
+  // generated files execute source code and report misleading 100% coverage.
+  const coverageAfter = (options.dryRun || testsWritten === 0) ? coverageBefore : await getCoverageRate(config, cwd)
 
   return { filesProcessed, testsWritten, coverageBefore, coverageAfter, hasCoverage: true, errors }
 }

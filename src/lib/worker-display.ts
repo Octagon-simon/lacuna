@@ -2,6 +2,7 @@ import chalk from 'chalk'
 
 export type WorkerState =
   | { phase: 'idle' }
+  | { phase: 'waiting'; file: string; since: number }
   | { phase: 'generating'; file: string }
   | { phase: 'writing'; file: string }
   | { phase: 'running'; file: string }
@@ -11,7 +12,7 @@ export type WorkerState =
   | { phase: 'failed'; file: string }
 
 const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
-const ACTIVE: Set<WorkerState['phase']> = new Set(['generating', 'writing', 'running', 'retrying', 'regenerating'])
+const ACTIVE: Set<WorkerState['phase']> = new Set(['waiting', 'generating', 'writing', 'running', 'retrying', 'regenerating'])
 // tip rotates every ~5 seconds at 80ms tick interval
 const TIP_TICKS = 62
 
@@ -28,6 +29,8 @@ export class WorkerDisplay {
   private tips: string[]
   private tipIndex = 0
   private successLabel: string
+  private winchHandler: (() => void) | null = null
+  private lastRenderedText = ''
 
   constructor(workerCount: number, total: number, tips: string[] = [], successLabel = 'passed') {
     this.states = Array.from({ length: workerCount }, () => ({ phase: 'idle' }) as WorkerState)
@@ -47,6 +50,15 @@ export class WorkerDisplay {
       }
       this.render()
     }, 80)
+
+    this.winchHandler = () => {
+      if (this.lastRenderedText) {
+        const newCols = Math.max(60, process.stdout.columns ?? 80)
+        this.rendered = this.countVisualLines(this.lastRenderedText, newCols)
+      }
+      this.render()
+    }
+    process.on('SIGWINCH', this.winchHandler)
   }
 
   update(workerId: number, state: WorkerState) {
@@ -74,6 +86,7 @@ export class WorkerDisplay {
 
   finish() {
     if (this.timer) { clearInterval(this.timer); this.timer = null }
+    if (this.winchHandler) { process.off('SIGWINCH', this.winchHandler); this.winchHandler = null }
     if (this.isTTY && this.rendered > 0) {
       process.stdout.write(`\x1B[${this.rendered}A\x1B[0J`)
       this.rendered = 0
@@ -123,7 +136,19 @@ export class WorkerDisplay {
 
     const out = lines.join('\n')
     process.stdout.write(out)
-    this.rendered = (out.match(/\n/g) ?? []).length
+    this.lastRenderedText = out
+    this.rendered = this.countVisualLines(out, cols)
+  }
+
+  private countVisualLines(text: string, cols: number): number {
+    const lines = text.split('\n')
+    const countTo = text.endsWith('\n') ? lines.length - 1 : lines.length
+    let total = 0
+    for (let i = 0; i < countTo; i++) {
+      const visLen = lines[i].replace(/\x1B\[[0-9;]*[\p{L}]/gu, '').length
+      total += Math.max(1, Math.ceil(visLen / cols))
+    }
+    return total
   }
 
   private formatRow(id: number, state: WorkerState, cols: number): string {
@@ -140,6 +165,13 @@ export class WorkerDisplay {
         icon = chalk.dim('○')
         label = chalk.dim('idle      ')
         break
+      case 'waiting': {
+        const elapsed = Math.floor((Date.now() - state.since) / 1000)
+        icon = chalk.dim('⌛')
+        label = chalk.dim(('wait ' + elapsed + 's').padEnd(10))
+        file = state.file
+        break
+      }
       case 'generating':
         icon = chalk.cyan(frame)
         label = chalk.cyan('generating')
@@ -191,6 +223,7 @@ export class WorkerDisplay {
   private plainLabel(state: WorkerState): string {
     switch (state.phase) {
       case 'idle':       return 'idle'
+      case 'waiting':    return `waiting     ${state.file}`
       case 'generating': return `generating  ${state.file}`
       case 'writing':    return `writing     ${state.file}`
       case 'running':    return `running     ${state.file}`

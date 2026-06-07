@@ -76,6 +76,30 @@ async function isPackageInstalled(pkg: string, cwd: string): Promise<boolean> {
   return (await checkPackageInstallState(pkg, cwd)) !== 'missing'
 }
 
+// Resolves the jest version range that a preset (e.g. jest-expo) declares as its
+// peer dependency, so we install a compatible jest rather than whatever is latest.
+// Falls back to bare 'jest' if the lookup fails (offline, registry unavailable, etc).
+function resolveJestVersionForPreset(preset: string, cwd: string): { pkg: string; warned: boolean } {
+  // 1. Check if preset is already installed locally — no network needed
+  try {
+    const localPkg = JSON.parse(execSync(`cat node_modules/${preset}/package.json 2>/dev/null`, { cwd, encoding: 'utf-8', stdio: 'pipe' }))
+    const range: string | undefined = localPkg?.peerDependencies?.jest
+    const major = range?.match(/\d+/)?.[0]
+    if (major) return { pkg: `jest@${major}`, warned: false }
+  } catch { /* not installed yet */ }
+
+  // 2. Fall back to npm registry lookup
+  try {
+    const out = execSync(`npm info ${preset} peerDependencies.jest 2>/dev/null`, { cwd, encoding: 'utf-8', stdio: 'pipe' }).trim()
+    const cleaned = out.replace(/^['"]|['"]$/g, '')
+    const major = cleaned.match(/\d+/)?.[0]
+    if (major) return { pkg: `jest@${major}`, warned: false }
+  } catch { /* registry unreachable */ }
+
+  // 3. Could not resolve — warn so the user knows to check manually
+  return { pkg: 'jest', warned: true }
+}
+
 async function writeFileWithDir(filePath: string, content: string): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true })
   await writeFile(filePath, content)
@@ -117,7 +141,7 @@ async function findProjectRoot(startDir: string): Promise<string> {
   }
 }
 
-function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svelte' | 'angular' | 'nest' | 'nextjs', runner: string): string {
+function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svelte' | 'angular' | 'nest' | 'nextjs', runner: string, isExpo = false): string {
   // Mock cleanup — prevents spy state from leaking across tests and test files.
   // beforeEach: restores any globalThis spies left by previous files in the same worker
   //             (works in concert with restoreMocks: true in vitest.config.ts)
@@ -152,15 +176,68 @@ function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svel
   const cleanup = runner === 'vitest' ? vitestCleanup : jestCleanup
 
   if (variant === 'react-native') {
+    const expoMocks = isExpo ? [
+      ``,
+      `// ── Expo module mocks ─────────────────────────────────────────────────────`,
+      `jest.mock('expo-constants', () => ({`,
+      `  default: { expoConfig: { name: 'App', slug: 'app' } },`,
+      `}))`,
+      ``,
+      `jest.mock('expo-router', () => ({`,
+      `  useRouter: jest.fn(() => ({ push: jest.fn(), replace: jest.fn(), back: jest.fn() })),`,
+      `  useLocalSearchParams: jest.fn(() => ({})),`,
+      `  usePathname: jest.fn(() => '/'),`,
+      `  useSegments: jest.fn(() => []),`,
+      `  Link: jest.fn(({ children }: { children: React.ReactNode }) => children),`,
+      `  router: { push: jest.fn(), replace: jest.fn(), back: jest.fn() },`,
+      `}))`,
+      ``,
+      `jest.mock('expo-status-bar', () => ({`,
+      `  StatusBar: jest.fn(() => null),`,
+      `}))`,
+    ] : []
+
     return [
       `// React Native / Expo test setup`,
-      `// @testing-library/react-native matchers`,
-      `import '@testing-library/react-native/extend-expect'`,
+      `import React from 'react'`,
       ``,
-      `import { jest } from '@jest/globals'`,
+      `// ── Native module mocks ───────────────────────────────────────────────────`,
+      `// These modules rely on native code that is unavailable in the Jest environment.`,
       ``,
-      `// Silence the native animated warning in tests`,
-      `jest.mock('react-native/Libraries/Animated/NativeAnimatedHelper')`,
+      `// Safe area context — provides insets/frame for components that use useSafeAreaInsets`,
+      `jest.mock('react-native-safe-area-context', () => ({`,
+      `  SafeAreaProvider: jest.fn(({ children }: { children: React.ReactNode }) => children),`,
+      `  SafeAreaView: jest.fn(({ children }: { children: React.ReactNode }) => children),`,
+      `  useSafeAreaInsets: jest.fn(() => ({ top: 0, bottom: 0, left: 0, right: 0 })),`,
+      `  useSafeAreaFrame: jest.fn(() => ({ x: 0, y: 0, width: 390, height: 844 })),`,
+      `}))`,
+      ``,
+      `// Gesture handler — required by react-navigation and many UI libraries`,
+      `jest.mock('react-native-gesture-handler', () => {`,
+      `  const RN = jest.requireActual('react-native')`,
+      `  return {`,
+      `    ...RN,`,
+      `    GestureHandlerRootView: jest.fn(({ children }: { children: React.ReactNode }) => children),`,
+      `    PanGestureHandler: jest.fn(({ children }: { children: React.ReactNode }) => children),`,
+      `    TapGestureHandler: jest.fn(({ children }: { children: React.ReactNode }) => children),`,
+      `    Swipeable: jest.fn(({ children }: { children: React.ReactNode }) => children),`,
+      `  }`,
+      `})`,
+      ``,
+      `// AsyncStorage — native async key-value store`,
+      `jest.mock('@react-native-async-storage/async-storage', () =>`,
+      `  jest.requireActual('@react-native-async-storage/async-storage/jest/async-storage-mock')`,
+      `)`,
+      ``,
+      `// React Navigation — mock the navigation hooks to avoid needing a real NavigationContainer`,
+      `jest.mock('@react-navigation/native', () => ({`,
+      `  ...jest.requireActual('@react-navigation/native'),`,
+      `  useNavigation: jest.fn(() => ({ navigate: jest.fn(), goBack: jest.fn(), push: jest.fn(), replace: jest.fn() })),`,
+      `  useRoute: jest.fn(() => ({ params: {} })),`,
+      `  useFocusEffect: jest.fn((cb: () => void) => cb()),`,
+      `  useIsFocused: jest.fn(() => true),`,
+      `}))`,
+      ...expoMocks,
       jestCleanup,
     ].join('\n') + '\n'
   }
@@ -189,7 +266,7 @@ function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svel
       `// ── Next.js global mocks ──────────────────────────────────────────────────`,
       `// These run before every test so individual test files don't need to mock them.`,
       ``,
-      `import { vi } from 'vitest'`,
+      `import { vi, beforeEach, afterEach } from 'vitest'`,
       ``,
       `// next/navigation — useRouter, usePathname, etc. are server-side and fail in jsdom`,
       `vi.mock('next/navigation', () => ({`,
@@ -293,10 +370,20 @@ async function ensureTestRunnerSetup(
     }
     // @vitejs/plugin-react is NOT needed for Vitest — esbuild handles JSX/TSX natively.
   } else if (runner === 'jest') {
-    if (meta.isTypeScript) {
+    if (meta.isReactNative) {
+      // Use the jest version that the preset actually supports — resolved at init time
+      // so this stays correct when jest-expo bumps its peer dep in the future.
+      const rnPreset = meta.isExpo ? 'jest-expo' : '@react-native/jest-preset'
+      const { pkg: jestPkg, warned } = resolveJestVersionForPreset(rnPreset, cwd)
+      if (warned) {
+        log(chalk.yellow(`  ⚠ Could not resolve compatible jest version for ${rnPreset}. Installing latest — if tests fail with version mismatch errors, pin jest to the version in ${rnPreset}'s peerDependencies.`))
+      }
+      const jestMajor = jestPkg.includes('@') ? jestPkg.split('@')[1] : ''
+      basePackages.push(jestPkg, jestMajor ? `@types/jest@${jestMajor}` : '@types/jest')
+    } else if (meta.isTypeScript) {
       basePackages.push('jest', '@types/jest', 'ts-jest')
     } else {
-      basePackages.push('jest')
+      basePackages.push('jest', '@types/jest')
     }
     if (meta.isReactNative) {
       // Don't add jest-environment-jsdom for RN
@@ -408,7 +495,7 @@ async function ensureTestRunnerSetup(
         : meta.isVue ? 'vue'
         : meta.isSvelte ? 'svelte'
         : 'react'
-      const setupContent = buildSetupFileContent(setupVariant, runner)
+      const setupContent = buildSetupFileContent(setupVariant, runner, meta.isExpo)
       await writeFileWithDir(absSetup, setupContent)
       log(chalk.green(`  ✓ Created ${setupFilePath}`))
       if (meta.isNextJs) {
@@ -496,17 +583,19 @@ async function ensureTestRunnerSetup(
       log(chalk.dim(`  jest.config.js already exists — skipping.`))
     } catch {
       const setupLine = createdSetupFile
-        ? `\n  setupFilesAfterFramework: ['<rootDir>/${createdSetupFile}'],`
+        ? `\n  setupFilesAfterEnv: ['<rootDir>/${createdSetupFile}'],`
         : ''
       const needsJsdom = (meta.isReact || meta.isVue || meta.isSvelte) && !meta.isReactNative && !meta.isAngular && !meta.isNestJs
       const envLine = needsJsdom ? `\n  testEnvironment: 'jsdom',` : ''
-      const tsLines = meta.isTypeScript
+      // React Native / Expo: babel-preset-expo already handles TypeScript — don't override transform
+      // or it replaces the preset's JS transform and setup.js files fail to parse.
+      const tsLines = meta.isTypeScript && !meta.isReactNative
         ? `\n  transform: { '^.+\\\\.tsx?$': 'ts-jest' },`
         : ''
       const rnPreset = meta.isExpo ? 'jest-expo' : 'react-native'
       const presetLine = meta.isReactNative ? `\n  preset: '${rnPreset}',` : ''
       const transformIgnoreLine = meta.isReactNative
-        ? `\n  transformIgnorePatterns: ['node_modules/(?!(react-native|@react-native|@react-navigation|expo|@expo|@testing-library)/)',],`
+        ? `\n  transformIgnorePatterns: ['node_modules/(?!(.pnpm/[^/]*/node_modules/)?(react-native(-[^/]+)?|@react-native|@react-navigation|expo(-[^/]+)?|@expo|@testing-library)/)'],`
         : ''
       const angularPreset = meta.isAngular ? `\n  preset: 'jest-preset-angular',` : ''
       const content = [
@@ -659,7 +748,7 @@ export default class Init extends Command {
     if (hasMocks) {
       mocksFile = await input({
         message: 'Path to shared mock file:',
-        default: `${sourceDir}/test/mocks.ts`,
+        default: (await readProjectMeta(cwd)).isReactNative ? `${sourceDir}/test/mock.tsx` : `${sourceDir}/test/mocks.ts`,
       })
     }
 

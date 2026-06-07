@@ -5,9 +5,12 @@ import { loadConfig } from '../lib/config.js'
 import { detectEnvironment } from '../lib/detector.js'
 import { runCommand } from '../lib/runner.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
-import { loadCoverage, extractGaps, filterTestableGaps, findUncoveredFiles } from '../lib/coverage/index.js'
+import { loadCoverage, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles } from '../lib/coverage/index.js'
 import { reportTerminal, buildJsonReport, buildMarkdownReport, getExitCode } from '../lib/reporter.js'
 import type { ReportInput } from '../lib/reporter.js'
+import type { CoverageReport } from '../lib/coverage/index.js'
+
+const EMPTY_REPORT: CoverageReport = { files: [], totalLineRate: 0, totalFunctionRate: 0 }
 
 export default class Analyze extends Command {
   static description = 'Analyze test coverage and show gaps — no files are changed'
@@ -61,40 +64,51 @@ export default class Analyze extends Command {
       this.log(`${chalk.dim('Threshold:')} ${threshold}%\n`)
     }
 
-    const spinner = startCoverageSpinner(chalk.dim(`  Running: ${env.coverageCommand}`), env.testRunner)
-    const result = await runCommand(env.coverageCommand, process.cwd(), config.coverageTimeout * 1000, spinner.onLine)
-    spinner.stop()
+    // Check if there are any test files before running the coverage command
+    const existingTests = await findTestFiles(process.cwd(), {}, config)
+    const hasTests = existingTests.length > 0
 
-    if (result.timedOut) {
-      this.log(chalk.red(`\nTest suite timed out after ${config.coverageTimeout}s.`))
-      this.log(chalk.yellow('\nThis usually means a test has an open handle (unclosed server, timer, or connection).'))
-      this.log(chalk.dim(`\nIncrease the timeout in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`))
-      this.exit(2)
-    }
+    let report: CoverageReport = EMPTY_REPORT
 
-    // only bail if literally zero tests ran (suites crashed on load)
-    const zeroTests = /Tests:\s+0 total|no tests found/i.test(result.stdout + result.stderr)
-    if (zeroTests) {
-      this.log(chalk.red('\nYour test suites are failing before any tests run.'))
-      this.log(chalk.yellow('\nThis usually means:'))
-      this.log('  • A missing environment variable (check .env / .env.test)')
-      this.log('  • A broken import or missing module')
-      this.log('  • A setup file failing (DB connection, mock config, etc.)\n')
-      this.log(chalk.dim('Run this to see the actual error:'))
-      this.log(chalk.cyan(`  ${env.testCommand} 2>&1 | head -80`))
-      this.exit(2)
-    }
-    // partial failures are fine — coverage is still collected for passing tests
+    if (!hasTests) {
+      if (flags.format === 'terminal') {
+        this.log(chalk.dim('  No test files yet — scanning source files for coverage gaps.\n'))
+      }
+    } else {
+      const spinner = startCoverageSpinner(chalk.dim(`  Running: ${env.coverageCommand}`), env.testRunner)
+      const result = await runCommand(env.coverageCommand, process.cwd(), config.coverageTimeout * 1000, spinner.onLine)
+      spinner.stop()
 
-    let report
-    try {
-      report = await loadCoverage(config)
-    } catch {
-      this.log(chalk.red(`Could not read coverage report from ./${config.coverageDir}/\n`))
-      this.log(chalk.yellow('Make sure your vitest config has coverage enabled:'))
-      this.log(chalk.dim('  // vitest.config.ts'))
-      this.log(chalk.dim('  test: { coverage: { reporter: ["lcov", "text-summary"] } }'))
-      this.exit(2)
+      if (result.timedOut) {
+        this.log(chalk.red(`\nTest suite timed out after ${config.coverageTimeout}s.`))
+        this.log(chalk.yellow('\nThis usually means a test has an open handle (unclosed server, timer, or connection).'))
+        this.log(chalk.dim(`\nIncrease the timeout in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`))
+        this.exit(2)
+      }
+
+      // bail if suites crashed on load (test files exist but zero tests ran)
+      const combined = result.stdout + result.stderr
+      if (/Tests:\s+0 total/i.test(combined)) {
+        this.log(chalk.red('\nYour test suites are failing before any tests run.'))
+        this.log(chalk.yellow('\nThis usually means:'))
+        this.log('  • A missing environment variable (check .env / .env.test)')
+        this.log('  • A broken import or missing module')
+        this.log('  • A setup file failing (DB connection, mock config, etc.)\n')
+        this.log(chalk.dim('Run this to see the actual error:'))
+        this.log(chalk.cyan(`  ${env.testCommand} 2>&1 | head -80`))
+        this.exit(2)
+      }
+      // partial failures are fine — coverage is still collected for passing tests
+
+      try {
+        report = await loadCoverage(config)
+      } catch {
+        this.log(chalk.red(`Could not read coverage report from ./${config.coverageDir}/\n`))
+        this.log(chalk.yellow('Make sure your vitest config has coverage enabled:'))
+        this.log(chalk.dim('  // vitest.config.ts'))
+        this.log(chalk.dim('  test: { coverage: { reporter: ["lcov", "text-summary"] } }'))
+        this.exit(2)
+      }
     }
 
     const gaps = await filterTestableGaps(extractGaps(report, threshold), config.ignore)

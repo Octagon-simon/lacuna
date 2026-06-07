@@ -2,8 +2,9 @@ import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import type { ModelProvider, ChatMessage } from '../lib/providers/index.js'
 import { createProvider } from '../lib/providers/index.js'
-import { buildSystemPrompt, buildGeneratePrompt, buildFixPrompt, buildRetryPrompt, buildPollutionFixPrompt } from './prompts.js'
-import type { FailedAttempt } from './prompts.js'
+export { ModelStallError } from '../lib/providers/types.js'
+import { buildSystemPrompt, buildGeneratePrompt, buildFixPrompt, buildRetryPrompt, buildPollutionFixPrompt } from './prompts/index.js'
+import type { FailedAttempt } from './prompts/index.js'
 import type { FileContext } from './context.js'
 import type { CoverageGap } from '../lib/coverage/types.js'
 
@@ -80,9 +81,11 @@ export interface GeneratorOptions {
 }
 
 const TRUNCATION_RETRY_MESSAGE =
-  'Your previous output was cut off before the code was complete (unmatched braces or incomplete expression detected). ' +
-  'Write a shorter, more focused test file. Cover the most important behaviors only — skip exhaustive edge cases if needed. ' +
-  'Every function body must be closed.'
+  'Your previous output produced no valid code — either it was cut off before completion, or your thinking block was not closed ' +
+  'before writing code (a <thinking> block was detected but no <code_output> section followed). ' +
+  'IMMEDIATELY write the code — do NOT plan in a <thinking> block this time. ' +
+  'Write a short, focused test file. Cover the most important behaviors only — skip exhaustive edge cases. ' +
+  'Every function body must be closed. Use <code_output> tags.'
 
 // Detect syntactically incomplete code — a strong signal that output was cut off mid-generation.
 function isCodeIncomplete(code: string): boolean {
@@ -110,6 +113,19 @@ function isCodeIncomplete(code: string): boolean {
 // The stop sequence </code_output> is registered with the API, so the closing tag
 // is normally absent from the raw response — that is a clean stop, not truncation.
 // True truncation (model hit max_tokens mid-code) is detected syntactically.
+// Strip thinking-bleed artifacts: </thinking> or <thinking>...</thinking> blocks that
+// leaked into the code output. The model occasionally forgets to close the thinking block
+// before opening <code_output>, so the code starts with stray XML closing tags or prose.
+function stripThinkingBleed(code: string): string {
+  // Remove any </thinking> closing tag (with optional whitespace / newlines around it)
+  let s = code.replace(/^\s*<\/thinking>\s*/i, '')
+  // Remove any complete <thinking>...</thinking> block left at the top
+  s = s.replace(/^\s*<thinking>[\s\S]*?<\/thinking>\s*/i, '')
+  // Remove an unclosed <thinking> block — model got stuck looping, no real code follows
+  s = s.replace(/^\s*<thinking>[\s\S]*/i, '')
+  return s
+}
+
 function parseStructuredResponse(raw: string): { hypothesis: string; code: string; truncated: boolean } {
   const thinkingMatch = raw.match(/<thinking>([\s\S]*?)<\/thinking>/i)
   const hypothesis = thinkingMatch ? thinkingMatch[1].trim() : ''
@@ -125,11 +141,11 @@ function parseStructuredResponse(raw: string): { hypothesis: string; code: strin
     const openEnd = openMatch.index + openMatch[0].length
     const closeMatch = lineAnchoredClose.exec(raw.slice(openEnd))
     if (closeMatch) {
-      const code = raw.slice(openEnd, openEnd + closeMatch.index).trim()
+      const code = stripThinkingBleed(raw.slice(openEnd, openEnd + closeMatch.index).trim())
       return { hypothesis, code, truncated: isCodeIncomplete(code) }
     }
     // No closing tag — normal when stop sequence fires cleanly
-    const code = raw.slice(openEnd).trim()
+    const code = stripThinkingBleed(raw.slice(openEnd).trim())
     return { hypothesis, code, truncated: isCodeIncomplete(code) }
   }
 
@@ -138,14 +154,14 @@ function parseStructuredResponse(raw: string): { hypothesis: string; code: strin
   // settling on a final answer; the last block is the intended output.
   const fenceMatches = [...raw.matchAll(/```(?:typescript|tsx?|javascript|jsx?|python|go)?\s*\n([\s\S]*?)```/g)]
   if (fenceMatches.length > 0) {
-    const code = fenceMatches[fenceMatches.length - 1][1].trim()
+    const code = stripThinkingBleed(fenceMatches[fenceMatches.length - 1][1].trim())
     return { hypothesis, code, truncated: isCodeIncomplete(code) }
   }
   // No fenced blocks at all — strip any single fence pair and use as code
   let fallback = raw.trim()
   fallback = fallback.replace(/^```(?:typescript|tsx?|javascript|jsx?|python|go)?\s*\n/, '')
   fallback = fallback.replace(/\n```\s*$/, '')
-  const code = fallback.trim()
+  const code = stripThinkingBleed(fallback.trim())
   return { hypothesis, code, truncated: isCodeIncomplete(code) }
 }
 
@@ -153,6 +169,7 @@ export class TestGenerator {
   private provider: ModelProvider
   private env: DetectedEnvironment
   private rawOnToken?: (token: string) => void   // unwrapped callback; filter recreated per call
+  private rawFirstTokenCallback?: () => void
   private maxTokens: number
   private history: ChatMessage[] = []
   private lastHypothesis: string = ''
@@ -171,6 +188,29 @@ export class TestGenerator {
   // so calling this resets streaming state automatically.
   setTokenCallback(cb: ((token: string) => void) | undefined) {
     this.rawOnToken = cb
+  }
+
+  // Register a one-shot callback that fires on the very first token of the next provider call.
+  // Used by the loop to transition the worker display from 'waiting' to 'generating' as soon
+  // as the model starts responding.
+  setFirstTokenCallback(cb: (() => void) | undefined) {
+    this.rawFirstTokenCallback = cb
+  }
+
+  // Build a combined onToken handler that fires the first-token callback immediately (before
+  // any codeOnlyStream filtering) and routes display tokens through codeOnlyStream as usual.
+  private buildOnToken(): ((token: string) => void) | undefined {
+    const { rawOnToken, rawFirstTokenCallback } = this
+    if (!rawOnToken && !rawFirstTokenCallback) return undefined
+    const display = rawOnToken ? codeOnlyStream(rawOnToken) : undefined
+    let firstFired = false
+    return (token: string) => {
+      if (!firstFired) {
+        firstFired = true
+        rawFirstTokenCallback?.()
+      }
+      display?.(token)
+    }
   }
 
   // Clears oscillation history so the next retry() call is treated as a fresh attempt.
@@ -203,6 +243,7 @@ export class TestGenerator {
           tsconfigPaths: context.tsconfigPaths,
           typeDefinitions: context.typeDefinitions,
           localImportPaths: context.localImportPaths,
+          localImportContents: context.localImportContents,
           reactMajorVersion: context.reactMajorVersion,
           projectMemory,
         }),
@@ -212,7 +253,7 @@ export class TestGenerator {
     const response = await this.provider.generate(
       this.history,
       buildSystemPrompt(this.env),
-      this.rawOnToken ? codeOnlyStream(this.rawOnToken) : undefined,
+      this.buildOnToken(),
       estimateMaxTokens(context.sourceCode, this.maxTokens),
       GENERATE_TEMPERATURE,
     )
@@ -233,7 +274,7 @@ export class TestGenerator {
     const response = await this.provider.generate(
       this.history,
       buildSystemPrompt(this.env),
-      this.rawOnToken ? codeOnlyStream(this.rawOnToken) : undefined,
+      this.buildOnToken(),
       estimateMaxTokens(args.sourceCode, this.maxTokens),
       GENERATE_TEMPERATURE,
     )
@@ -254,7 +295,7 @@ export class TestGenerator {
     const response = await this.provider.generate(
       this.history,
       buildSystemPrompt(this.env),
-      this.rawOnToken ? codeOnlyStream(this.rawOnToken) : undefined,
+      this.buildOnToken(),
       this.maxTokens,
       RETRY_TEMPERATURE,
     )
@@ -293,7 +334,7 @@ export class TestGenerator {
     const response = await this.provider.generate(
       this.history,
       buildSystemPrompt(this.env),
-      this.rawOnToken ? codeOnlyStream(this.rawOnToken) : undefined,
+      this.buildOnToken(),
       this.maxTokens,
       RETRY_TEMPERATURE,
     )

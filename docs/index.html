@@ -293,6 +293,17 @@
       color: var(--text-2);
       background: var(--bg-2);
     }
+    .tag-tested {
+      border-color: rgba(74,222,128,0.35);
+      color: var(--green);
+      background: rgba(74,222,128,0.07);
+    }
+    .stack-row {
+      display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; justify-content: center;
+    }
+    .stack-label {
+      color: var(--text-3); font-size: 0.8125rem; font-weight: 500; white-space: nowrap;
+    }
 
     /* ── SECTION COMMON ───────────────────────────────── */
     section { padding: 6rem 2rem; }
@@ -558,18 +569,27 @@
   </div>
 </section>
 
-<!-- ── RUNNER SUPPORT ────────────────────────────────────── -->
-<div class="social-row">
-  <p>Works with</p>
-  <div class="runner-tags">
-    <span class="tag">Vitest</span>
-    <span class="tag">Jest</span>
-    <span class="tag">Mocha</span>
-    <span class="tag">Pytest</span>
-    <span class="tag">Go Test</span>
-    <span class="tag">TypeScript</span>
-    <span class="tag">JavaScript</span>
-    <span class="tag">Python</span>
+<!-- ── STACK SUPPORT ─────────────────────────────────────── -->
+<div class="social-row" style="flex-direction:column;gap:1.25rem;">
+  <div class="stack-row">
+    <p class="stack-label">Field-tested ✓</p>
+    <div class="runner-tags">
+      <span class="tag tag-tested">React</span>
+      <span class="tag tag-tested">React Native / Expo</span>
+      <span class="tag tag-tested">Next.js</span>
+    </div>
+  </div>
+  <div class="stack-row">
+    <p class="stack-label">Runner support</p>
+    <div class="runner-tags">
+      <span class="tag">Vitest</span>
+      <span class="tag">Jest</span>
+      <span class="tag">Pytest</span>
+      <span class="tag">PHPUnit / Pest</span>
+      <span class="tag">Go Test</span>
+      <span class="tag">RSpec</span>
+      <span class="tag">and more</span>
+    </div>
   </div>
 </div>
 
