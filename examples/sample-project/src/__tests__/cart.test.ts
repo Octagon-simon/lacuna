@@ -1,4 +1,4 @@
-import { Cart, CartItem } from '../src/cart'
+import { Cart, CartItem } from '../cart'
 
 describe('Cart', () => {
   let cart: Cart
