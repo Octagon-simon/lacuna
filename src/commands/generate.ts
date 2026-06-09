@@ -6,6 +6,7 @@ import { detectEnvironment } from '../lib/detector.js'
 import { runAgentLoop } from '../agent/loop.js'
 import { reportTerminal, buildJsonReport, buildMarkdownReport, getExitCode } from '../lib/reporter.js'
 import type { ReportInput } from '../lib/reporter.js'
+import { showStarNudge, showIssueNudge } from '../lib/feedback.js'
 
 export default class Generate extends Command {
   static description = 'Run the full agent loop: analyze gaps, generate tests, verify they pass'
@@ -124,6 +125,11 @@ export default class Generate extends Command {
       }
     } else {
       reportTerminal(input)
+    }
+
+    if (!flags['dry-run'] && flags.format === 'terminal') {
+      showStarNudge(loopResult.testsWritten)
+      showIssueNudge(loopResult.errors.length, 'generate')
     }
 
     this.exit(getExitCode(input))

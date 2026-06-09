@@ -3,6 +3,7 @@ import chalk from 'chalk'
 import { loadConfig, applyModelOverride } from '../lib/config.js'
 import { detectEnvironment } from '../lib/detector.js'
 import { runFixLoop } from '../agent/fix-loop.js'
+import { showStarNudge, showIssueNudge } from '../lib/feedback.js'
 
 export default class Fix extends Command {
   static description = 'Find and fix failing tests using AI — preserves existing tests, only repairs what is broken'
@@ -123,6 +124,11 @@ export default class Fix extends Command {
         const lines = err.split('\n').slice(0, 15)
         this.log(chalk.dim('  ' + lines.join('\n  ')))
       }
+    }
+
+    if (!flags['dry-run']) {
+      showStarNudge(result.filesFixed + result.victimsRegenerated)
+      showIssueNudge(stillFailing, 'fix')
     }
 
     if (result.filesProcessed === 0) {
