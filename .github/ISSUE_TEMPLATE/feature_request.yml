@@ -1,0 +1,57 @@
+name: Feature Request
+description: Suggest an improvement or new capability for lacuna
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        We read every feature request. The more context you give, the better we can prioritise.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What limitation or gap are you running into with lacuna today?
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How would you like lacuna to behave? Be as specific as you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds you've tried, or other approaches you considered
+
+  - type: dropdown
+    id: impact
+    attributes:
+      label: How much does this affect your workflow?
+      options:
+        - Blocking — I can't use lacuna without this
+        - High — significantly limits usefulness
+        - Medium — would save meaningful time
+        - Low — minor quality-of-life improvement
+    validations:
+      required: true
+
+  - type: dropdown
+    id: stack
+    attributes:
+      label: Stack / framework (if relevant)
+      options:
+        - All stacks
+        - TypeScript / JavaScript
+        - React
+        - React Native / Expo
+        - Next.js
+        - Vue
+        - Python
+        - Other

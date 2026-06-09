@@ -550,6 +550,10 @@ npm run build
 npm link          # makes `lacuna` available globally from your local build
 ```
 
+**Reporting a bug?** Use the bug report template — it asks for your test runner, model, lacuna version, and terminal output, which are the four things we need to reproduce any issue fast.
+
+**Suggesting a feature?** Use the feature request template and describe the workflow problem it solves.
+
 ---
 
 ## License
