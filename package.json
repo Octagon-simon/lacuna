@@ -1,6 +1,6 @@
 {
   "name": "lacuna-cli",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Agentic CLI that finds coverage gaps, generates tests, and verifies them in a loop",
   "keywords": [
     "testing",
@@ -59,7 +59,11 @@
     "commands": "./dist/commands",
     "plugins": [],
     "topicSeparator": " ",
-    "additionalVersionFlags": ["-V"],
-    "additionalHelpFlags": ["-h"]
+    "additionalVersionFlags": [
+      "-V"
+    ],
+    "additionalHelpFlags": [
+      "-h"
+    ]
   }
 }
