@@ -42,6 +42,6 @@ export function buildReactCauses(isJSRunner: boolean, mockApi: string): string {
 
     - Infinite retry guard: never generate recursive waitFor → trigger → waitFor chains. If a condition does not resolve within a single waitFor block, fail explicitly.
 
-    - React 18 act() flush rule: wrap async mock resolutions in await act(async () => {}) before test exit to flush pending updates.
+    - React 18 act() flush rule: when an event handler awaits a service mock and then calls setState, do NOT try to wrap the event in await act(async () => { ... }) — act flushes only one microtask level and misses multi-hop mockResolvedValue chains. The correct fix is await waitFor(() => expect(element).toBeInTheDocument()) after the triggering event. waitFor polls inside act until the assertion passes, draining all async hops.
 `
 }

@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir, unlink, readdir } from 'fs/promises'
-import { join, dirname, basename, extname } from 'path'
+import { join, dirname, basename, extname, isAbsolute } from 'path'
 import { access, stat } from 'fs/promises'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
@@ -9,14 +9,14 @@ import { runCommand } from '../lib/runner.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
-import { buildFixFileContext, computeRelativeImport, collectTypeDefinitions, collectLocalImportPaths, detectReactMajorVersion } from './context.js'
+import { buildFixFileContext, computeRelativeImport, collectTypeDefinitions, collectLocalImportPaths, detectReactMajorVersion, findFileByName } from './context.js'
 import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
 import { processGap } from './loop.js'
 import type { CoverageGap } from '../lib/coverage/types.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile } from '../lib/typecheck.js'
-import { hasTestFunctions, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks } from '../lib/validate.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -152,25 +152,72 @@ function parseFailingTestFiles(output: string, runner: string): string[] {
 
 // ─── Find the source file that a test file is testing ────────────────────────
 
-async function findSourceFile(testFilePath: string, cwd: string): Promise<string | null> {
+async function findSourceFile(testFilePath: string, cwd: string, configSourceDirs: string | string[] = 'src'): Promise<string | null> {
   const ext = extname(testFilePath)
   const base = basename(testFilePath, ext)
   const dir = dirname(testFilePath)
 
-  // strip test suffix: Button.test → Button, Button.spec → Button
   const sourceBase = base.replace(/\.(test|spec)$/, '').replace(/^test_/, '').replace(/_test$/, '')
-  // if inside __tests__ dir, source is in parent
-  const sourceDir = basename(dir) === '__tests__' ? dirname(dir) : dir
-
   const exts = [ext, '.ts', '.tsx', '.js', '.jsx']
-  for (const e of exts) {
-    // If sourceDir is absolute (testFilePath was absolute), use it directly.
-    // join(cwd, absoluteDir) doubles the path: /project/home/project/app/... which never exists.
-    const candidate = sourceDir.startsWith('/') || sourceDir.startsWith('\\')
-      ? join(sourceDir, `${sourceBase}${e}`)
-      : join(cwd, sourceDir, `${sourceBase}${e}`)
-    try { await access(candidate); return candidate } catch { /* try next */ }
+  const srcDirs = Array.isArray(configSourceDirs) ? configSourceDirs : [configSourceDirs]
+
+  async function tryCandidates(targetDir: string): Promise<string | null> {
+    const resolved = isAbsolute(targetDir) ? targetDir : join(cwd, targetDir)
+    for (const e of exts) {
+      try { await access(join(resolved, `${sourceBase}${e}`)); return join(resolved, `${sourceBase}${e}`) } catch { /* next */ }
+    }
+    return null
   }
+
+  // Attempt 1: same directory as test file, or parent of __tests__
+  const sameDir = basename(dir) === '__tests__' ? dirname(dir) : dir
+  const attempt1 = await tryCandidates(sameDir)
+  if (attempt1) return attempt1
+
+  // Attempt 2: replace test directory segment with sourceDir
+  // Handles monorepo layouts like:  packages/server/test/unit/adapters/Foo.test.ts
+  //                              →  packages/server/src/adapters/Foo.ts
+  const TEST_SEGMENT_RE = /^(.*[/\\])(?:tests?|specs?)[/\\](?:(?:unit|integration|e2e|functional|features?)[/\\])?(.*)$/i
+  const match = dir.match(TEST_SEGMENT_RE)
+  if (match) {
+    const [, prefix, suffix] = match
+    for (const srcDir of srcDirs) {
+      // Strategy A: relative srcDir appended to the test root prefix
+      // Works when sourceDir is short ("src") and test is nested under same package root
+      const a = await tryCandidates(join(prefix, srcDir, suffix))
+      if (a) return a
+      // Strategy B: absolute resolved srcDir + relative suffix
+      // Works when sourceDir is explicit ("packages/server/src")
+      const absSrc = isAbsolute(srcDir) ? srcDir : join(cwd, srcDir)
+      const b = await tryCandidates(join(absSrc, suffix))
+      if (b) return b
+    }
+  }
+
+  // Attempt 3: recursive filename search.
+  // Handles extra segments between src/ and the file (e.g. test/unit/interactors/Foo.test.ts
+  // → src/lib/interactors/Foo.ts — the "lib" is invisible to the mirror logic above).
+  // Search roots: (a) package prefix + srcDir (most targeted, e.g. packages/server/src/),
+  // then (b) absolute srcDir from config (for flat repos).
+  const searchRoots: string[] = []
+  if (match) {
+    const [, prefix] = match
+    for (const srcDir of srcDirs) {
+      searchRoots.push(join(prefix, srcDir))
+    }
+  }
+  for (const srcDir of srcDirs) {
+    const abs = isAbsolute(srcDir) ? srcDir : join(cwd, srcDir)
+    if (!searchRoots.includes(abs)) searchRoots.push(abs)
+  }
+  for (const e of exts) {
+    const filename = `${sourceBase}${e}`
+    for (const root of searchRoots) {
+      const found = await findFileByName(root, filename)
+      if (found) return found
+    }
+  }
+
   return null
 }
 
@@ -214,7 +261,7 @@ async function fixFile(
   }
 
   // Find and read the source file being tested
-  const sourceFilePath = await findSourceFile(testFilePath, cwd)
+  const sourceFilePath = await findSourceFile(testFilePath, cwd, config.sourceDir)
   let sourceCode: string | null = null
   if (sourceFilePath) {
     sourceCode = await readFile(sourceFilePath, 'utf-8').catch(() => null)
@@ -283,6 +330,7 @@ async function fixFile(
             localImportPaths,
             reactMajorVersion,
             projectMemory,
+            existingTestLineCount: testCode.split('\n').length,
           })
         : await generator.retry(errorOutput)
     } catch (err) {
@@ -339,6 +387,28 @@ async function fixFile(
       return { success: true }
     }
 
+    // Patch mode: apply surgical edits against the current file on disk
+    if (generator.isPatch) {
+      const currentContent = await readFile(absTestPath, 'utf-8').catch(() => null) ?? testCode
+      const patched = tryApplyPatch(currentContent, fixed)
+      if (patched !== null) {
+        fixed = patched
+      } else {
+        // Anchor(s) not found — do NOT write raw patch markers to disk
+        errorOutput =
+          'PATCH APPLICATION FAILED: one or more anchor strings in your patch were not found in the test file.\n' +
+          'Anchors must be copied character-for-character (including quote style) from the CURRENT TEST FILE shown above.\n' +
+          'Checklist:\n' +
+          '  • REPLACE_TEST / DELETE_TEST anchor = exact it/test name already in the file\n' +
+          '  • ADD_AFTER_DESCRIBE anchor = exact describe() name already in the file\n' +
+          '  • For a brand-new test, use ADD_AFTER_DESCRIBE with the enclosing describe name\n' +
+          'Re-read the test file, find the exact anchor names, and rewrite your patch.'
+        if (!onStatus) log(chalk.yellow(`  Patch anchors not found — retrying...`))
+        onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations })
+        continue
+      }
+    }
+
     // Strip thinking/prose that leaked before the first real code line.
     const { code: cleanFixed, stripped: bleedText } = stripLeadingProse(fixed)
     if (bleedText !== null) {
@@ -348,8 +418,32 @@ async function fixFile(
 
     // Split out mocks file if AI returned one
     const MOCKS_SEPARATOR = '// ---MOCKS_FILE---'
+    const MOCKS_PATCH_SEPARATOR = '// ---MOCKS_PATCH---'
     let testFileContent = fixed
-    if (fixed.includes(MOCKS_SEPARATOR) && config.mocksFile) {
+
+    if (fixed.includes(MOCKS_PATCH_SEPARATOR) && config.mocksFile) {
+      // Surgical patch mode: model only emits the changed sections
+      const [newTestCode, patchContent] = fixed.split(MOCKS_PATCH_SEPARATOR)
+      testFileContent = newTestCode.trim()
+      if (patchContent?.trim()) {
+        const absoluteMocksFile = join(cwd, config.mocksFile)
+        let existing = ''
+        try { existing = await readFile(absoluteMocksFile, 'utf-8') } catch { /* new file — patch can't apply */ }
+        if (existing) {
+          const applied = tryApplyMocksPatch(existing, patchContent.trim())
+          if (applied) {
+            if (applied.failedOps.length > 0) {
+              const anchors = applied.failedOps.map(op => `"${op.oldText.slice(0, 60).replace(/\n/g, '↵')}"`).join(', ')
+              errorOutput = `MOCKS PATCH FAILED: the following REPLACE anchor(s) were not found in the mock file:\n${anchors}\nAnchors must be copied character-for-character from the SHARED MOCK FILE shown above. Re-read it and rewrite your ---MOCKS_PATCH--- block.`
+              if (!onStatus) log(chalk.yellow(`  ⚠ Mock patch anchors not found — retrying...`))
+              continue
+            }
+            await writeFile(absoluteMocksFile, applied.result, 'utf-8')
+            if (!onStatus) log(chalk.dim(`  Patched mocks file: ${config.mocksFile}`))
+          }
+        }
+      }
+    } else if (fixed.includes(MOCKS_SEPARATOR) && config.mocksFile) {
       const [newTestCode, newMocksCode] = fixed.split(MOCKS_SEPARATOR)
       testFileContent = newTestCode.trim()
       if (newMocksCode?.trim()) {
@@ -390,6 +484,19 @@ async function fixFile(
     const result = await runCommand(fileTestCommand(env, absTestPath), cwd, 60_000)
 
     if (result.success) {
+      if (hasPlaceholderBodies(testFileContent)) {
+        errorOutput =
+          'ERROR: One or more test bodies contain placeholder comments (e.g. `// body`, `// TODO`) with no real assertions.\n' +
+          'Every test must have complete, working expectations:\n' +
+          '  it(\'description\', async () => {\n' +
+          '    const result = await subject.doThing(...);\n' +
+          '    expect(result).toEqual(expectedValue);\n' +
+          '  })\n' +
+          'Replace every `// body` placeholder with real arrange-act-assert code.'
+        if (!onStatus) log(chalk.yellow('  Placeholder test bodies detected — retrying...'))
+        onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations })
+        continue
+      }
       const typeErrors = await typeCheckFile(absTestPath, cwd, env)
       if (typeErrors) {
         errorOutput = `Tests passed but TypeScript type errors were found:\n${typeErrors}\n\nFix ALL type errors. Do not use 'as any' or '@ts-ignore'.`
@@ -639,7 +746,7 @@ async function regenerateFile(
 
   // Find the source file so processGap gets the right starting point.
   // processGap expects gap.filePath to be the SOURCE file, not the test file.
-  const sourceFile = await findSourceFile(absTestFile, options.cwd)
+  const sourceFile = await findSourceFile(absTestFile, options.cwd, options.config.sourceDir)
   if (!sourceFile) {
     return { success: false, error: `Could not find source file for ${absTestFile}` }
   }
@@ -667,7 +774,7 @@ async function regenerateFile(
       }
     : undefined
 
-  const result = await processGap(gap, options, generator, true, regenOnStatus, projectMemory)
+  const result = await processGap(gap, options, generator, true, regenOnStatus, projectMemory, absTestFile)
   return { success: result.success, error: result.error }
 }
 

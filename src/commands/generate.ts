@@ -67,8 +67,10 @@ export default class Generate extends Command {
     const config = await loadConfig()
     if (flags.model) applyModelOverride(config, flags.model)
     if (flags.threshold) config.threshold = flags.threshold
+    if (config.testEnv) Object.assign(process.env, config.testEnv)
 
     const env = await detectEnvironment(process.cwd(), config.testRunner)
+    if (config.testCommand) env.testCommand = config.testCommand
 
     this.log(chalk.bold('\nlacuna generate\n'))
     this.log(`${chalk.dim('Model:')}      ${chalk.cyan(config.model)}`)

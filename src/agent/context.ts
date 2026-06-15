@@ -1,4 +1,4 @@
-import { readFile, access, mkdir } from 'fs/promises'
+import { readFile, access, mkdir, readdir } from 'fs/promises'
 import { join, dirname, basename, extname, relative } from 'path'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import type { LacunaConfig } from '../lib/config.js'
@@ -39,10 +39,56 @@ async function dirExists(path: string): Promise<boolean> {
   }
 }
 
+// Candidate test-directory roots for mirrored project layouts (test/unit/…, etc.)
+const MIRROR_TEST_ROOTS = ['test/unit', 'test/integration', 'test', 'tests/unit', 'tests', 'spec']
+
+// Recursively search dir for a file matching filename, up to maxDepth levels deep.
+// Returns the first absolute path found, or null.
+export async function findFileByName(dir: string, filename: string, depth = 0, maxDepth = 6): Promise<string | null> {
+  if (depth > maxDepth) return null
+  let entries: import('fs').Dirent<string>[]
+  try { entries = await readdir(dir, { withFileTypes: true, encoding: 'utf-8' }) } catch { return null }
+  for (const entry of entries) {
+    if (entry.name === filename) return join(dir, entry.name)
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+      const found = await findFileByName(join(dir, entry.name), filename, depth + 1, maxDepth)
+      if (found) return found
+    }
+  }
+  return null
+}
+
+// Given source file path (relative to cwd) and a list of configured sourceDirs,
+// returns { srcDirParent, relPath } when the source file sits inside one of the
+// sourceDirs — the building blocks for mirrored test path resolution.
+function mirrorParts(
+  sourceFile: string,
+  sourceDirs: string[],
+): { srcDirParent: string; relPath: string } | null {
+  const norm = sourceFile.replace(/\\/g, '/')
+  for (const srcDir of sourceDirs) {
+    const nd = srcDir.replace(/\\/g, '/').replace(/\/$/, '')
+    // Case 1: sourceDir is a prefix of the path ("packages/server/src/adapters/...")
+    if (norm.startsWith(nd + '/')) {
+      return { srcDirParent: '', relPath: norm.slice(nd.length + 1) }
+    }
+    // Case 2: sourceDir appears as a path segment ("packages/server/src/adapters/...")
+    // with sourceDir = "src" → srcDirParent = "packages/server/", relPath = "adapters/..."
+    const idx = norm.indexOf('/' + nd + '/')
+    if (idx !== -1) {
+      return { srcDirParent: norm.slice(0, idx + 1), relPath: norm.slice(idx + nd.length + 2) }
+    }
+  }
+  return null
+}
+
 async function inferTestFilePath(
   sourceFile: string,
   cwd: string,
   env: DetectedEnvironment,
+  sourceDirs: string[] = ['src'],
 ): Promise<string> {
   const dir = dirname(sourceFile)
   const ext = extname(sourceFile)
@@ -62,29 +108,97 @@ async function inferTestFilePath(
     return join(dir, `${base}.test${ext}`)
   }
 
+  // Sibling convention: scan other source files in the same directory.
+  // If their tests are in a __tests__/ subfolder or co-located, follow that pattern
+  // rather than deferring to mirror roots (which can pick up a wrong project-level test/).
+  const srcAbsDir = join(cwd, dir)
+  let siblingConventionDir: string | null = null
+  try {
+    const sibEntries = await readdir(srcAbsDir, { withFileTypes: true })
+    sibLoop: for (const entry of sibEntries) {
+      if (!entry.isFile()) continue
+      const sibExt = extname(entry.name)
+      if (!['.ts', '.tsx', '.js', '.jsx'].includes(sibExt)) continue
+      const sibBase = basename(entry.name, sibExt)
+      if (sibBase === base || TEST_SUFFIXES.some(s => entry.name.endsWith(`${s}${sibExt}`))) continue
+      // __tests__ subdirectory (check first — preferred convention in React Native)
+      for (const s of TEST_SUFFIXES) {
+        try { await access(join(srcAbsDir, '__tests__', `${sibBase}${s}${sibExt}`)); siblingConventionDir = join(dir, '__tests__'); break sibLoop } catch { /* next */ }
+      }
+      // co-located test next to the source file
+      for (const s of TEST_SUFFIXES) {
+        try { await access(join(srcAbsDir, `${sibBase}${s}${sibExt}`)); siblingConventionDir = dir; break sibLoop } catch { /* next */ }
+      }
+    }
+  } catch { /* readdir failed — fall through */ }
+
+  if (siblingConventionDir !== null) {
+    await mkdir(join(cwd, siblingConventionDir), { recursive: true })
+    return join(siblingConventionDir, `${base}.test${ext}`)
+  }
+
+  // Mirror test directory: if this project uses a separate test/ tree, place the
+  // new test there rather than creating a co-located __tests__ folder.
+  const parts = mirrorParts(sourceFile, sourceDirs)
+  if (parts) {
+    const { srcDirParent, relPath } = parts
+    for (const testRoot of MIRROR_TEST_ROOTS) {
+      const testRootAbs = join(cwd, srcDirParent, testRoot)
+      if (await dirExists(testRootAbs)) {
+        const targetDir = join(testRootAbs, dirname(relPath))
+        await mkdir(targetDir, { recursive: true })
+        return join(srcDirParent, testRoot, dirname(relPath), `${base}.test${ext}`)
+      }
+    }
+  }
+
   const testsDir = join(cwd, dir, '__tests__')
   await mkdir(testsDir, { recursive: true })
   return join(dir, '__tests__', `${base}.test${ext}`)
 }
 
-async function findExistingTestFile(sourceFile: string, cwd: string): Promise<string | null> {
+async function findExistingTestFile(sourceFile: string, cwd: string, sourceDirs: string[] = ['src']): Promise<string | null> {
   const ext = extname(sourceFile)
   const base = basename(sourceFile, ext)
   const dir = dirname(sourceFile)
 
+  // Attempt 1: co-located (next to source, or inside __tests__ sibling)
   const candidates = [
     ...TEST_SUFFIXES.map((s) => join(cwd, dir, '__tests__', `${base}${s}${ext}`)),
     ...TEST_SUFFIXES.map((s) => join(cwd, dir, `${base}${s}${ext}`)),
     join(cwd, dir, `test_${base}${ext}`),
     join(cwd, dir, `${base}_test${ext}`),
   ]
-
   for (const candidate of candidates) {
-    try {
-      await readFile(candidate)
-      return candidate
-    } catch { /* not found */ }
+    try { await readFile(candidate); return candidate } catch { /* not found */ }
   }
+
+  // Attempt 2: mirrored test directory tree (exact path mirror)
+  // Finds: packages/server/src/adapters/auth/Foo.ts → packages/server/test/unit/adapters/auth/Foo.test.ts
+  const parts = mirrorParts(sourceFile, sourceDirs)
+  if (parts) {
+    const { srcDirParent, relPath } = parts
+    const relDir = dirname(relPath)
+    for (const testRoot of MIRROR_TEST_ROOTS) {
+      for (const s of TEST_SUFFIXES) {
+        const candidate = join(cwd, srcDirParent, testRoot, relDir, `${base}${s}${ext}`)
+        try { await readFile(candidate); return candidate } catch { /* not found */ }
+      }
+    }
+  }
+
+  // Attempt 3: filename search within known test root directories
+  // Handles projects where test path doesn't exactly mirror source path
+  // (e.g. src/lib/interactors/Foo.ts → test/unit/interactors/Foo.test.ts — "lib" dropped)
+  const srcDirParent = parts?.srcDirParent ?? ''
+  for (const testRoot of MIRROR_TEST_ROOTS) {
+    const searchRoot = join(cwd, srcDirParent, testRoot)
+    for (const s of TEST_SUFFIXES) {
+      const found = await findFileByName(searchRoot, `${base}${s}${ext}`)
+      if (found) return found
+    }
+  }
+
   return null
 }
 
@@ -425,7 +539,9 @@ function extractSymbolFromCode(code: string, name: string): SymbolExtractionResu
     }
 
     if (name === 'default' && /^\s*export\s+default\b/.test(line)) {
-      return { code: summariseFunctionBlock(extractBraceBlock(lines, i)) }
+      const block = extractBraceBlock(lines, i)
+      const isClass = /^\s*export\s+default\s+(?:abstract\s+)?class\b/.test(line)
+      return { code: isClass ? summariseClassBlock(block) : summariseFunctionBlock(block) }
     }
     if (new RegExp(`^\\s*export\\s+(?:async\\s+)?function\\s*\\*?\\s*${name}\\s*[<(]`).test(line)) {
       return { code: summariseFunctionBlock(extractBraceBlock(lines, i)) }
@@ -695,11 +811,12 @@ export async function buildFileContext(
   const absoluteSource = join(cwd, sourceFilePath)
   const sourceCode = await readFile(absoluteSource, 'utf-8')
 
-  const existingTestFile = await findExistingTestFile(sourceFilePath, cwd)
+  const srcDirs = config?.sourceDir ? (Array.isArray(config.sourceDir) ? config.sourceDir : [config.sourceDir]) : ['src']
+  const existingTestFile = await findExistingTestFile(sourceFilePath, cwd, srcDirs)
   const existingTestCode = existingTestFile ? await readFile(existingTestFile, 'utf-8') : null
 
   const suggestedTestFile =
-    existingTestFile ?? join(cwd, await inferTestFilePath(sourceFilePath, cwd, env))
+    existingTestFile ?? join(cwd, await inferTestFilePath(sourceFilePath, cwd, env, srcDirs))
 
   const sourceImportPath = computeRelativeImport(suggestedTestFile, absoluteSource)
 

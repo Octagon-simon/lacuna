@@ -39,7 +39,16 @@ export function reportTerminal(input: ReportInput): void {
     console.log(`  Threshold: ${threshold}%   Status: ${status}\n`)
 
     if (r.gaps.length === 0) {
-      console.log(chalk.green('  All files meet the threshold.'))
+      if (r.passed) {
+        console.log(chalk.green('  All files meet the threshold.'))
+      } else {
+        // Overall coverage is below threshold even though no per-file gaps were found.
+        // This happens when many source files are never imported by any test — they
+        // don't appear in the LCOV report individually but pull down the overall rate.
+        console.log(chalk.yellow(`  Overall coverage is ${r.coveragePct.toFixed(1)}% — below the ${r.threshold}% threshold.`))
+        console.log(chalk.dim(`  No per-file gaps were found in the coverage report.`))
+        console.log(chalk.dim(`  Try running ${chalk.cyan('lacuna generate')} to find and cover untested source files.\n`))
+      }
       return
     }
 

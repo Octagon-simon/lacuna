@@ -28,7 +28,8 @@
     "format": "prettier --write 'src/**/*.ts'",
     "test": "node --loader ts-node/esm --test src/**/*.test.ts",
     "prepack": "npm run build",
-    "dev": "ts-node --esm src/index.ts"
+    "dev": "ts-node --esm src/index.ts",
+    "release": "bash scripts/release.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",

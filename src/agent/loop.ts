@@ -15,7 +15,7 @@ import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError,
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile } from '../lib/typecheck.js'
-import { hasTestFunctions, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks } from '../lib/validate.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -56,6 +56,7 @@ export async function processGap(
   parallel: boolean,
   onStatus?: (state: WorkerState) => void,
   projectMemory?: string | null,
+  overrideTestFile?: string,
 ): Promise<{ success: boolean; error?: string; testCode?: string }> {
   const { config, env, cwd, dryRun, verbose, log } = options
 
@@ -76,6 +77,15 @@ export async function processGap(
     if (!onStatus) log(chalk.red(`  ${msg}`))
     onStatus?.({ phase: 'failed', file: shortPath })
     return { success: false, error: msg }
+  }
+
+  // When called from regenerateFile the original test was deleted so inferTestFilePath
+  // mirrors the source path (including any extra segments like lib/) instead of using
+  // the real test location. The caller passes the original path to pin the write target.
+  if (overrideTestFile) {
+    context.suggestedTestFile = overrideTestFile
+    context.existingTestCode = null
+    context.existingTestFile = null
   }
 
   if (!onStatus) {
@@ -183,6 +193,27 @@ export async function processGap(
       return { success: true, testCode: generatedCode }
     }
 
+    // Patch mode: model returned surgical edits — apply them to get the complete file
+    if (generator.isPatch && context.existingTestCode) {
+      const patched = tryApplyPatch(context.existingTestCode, generatedCode)
+      if (patched !== null) {
+        generatedCode = patched
+      } else {
+        // Anchor(s) not found — do NOT write raw patch markers to disk
+        lastError =
+          'PATCH APPLICATION FAILED: one or more anchor strings in your patch were not found in the test file.\n' +
+          'Anchors must be copied character-for-character (including quote style) from the CURRENT TEST FILE shown above.\n' +
+          'Checklist:\n' +
+          '  • REPLACE_TEST / DELETE_TEST anchor = exact it/test name already in the file\n' +
+          '  • ADD_AFTER_DESCRIBE anchor = exact describe() name already in the file\n' +
+          '  • For a brand-new test, use ADD_AFTER_DESCRIBE with the enclosing describe name\n' +
+          'Re-read the test file, find the exact anchor names, and rewrite your patch.'
+        if (!onStatus) log(chalk.yellow(`  Patch anchors not found — retrying...`))
+        onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations } as WorkerState)
+        continue
+      }
+    }
+
     // Strip thinking/prose that leaked before the first real code line.
     // Happens under retry pressure when the model bleeds reasoning into <code_output>.
     const { code: cleanCode, stripped: bleedText } = stripLeadingProse(generatedCode)
@@ -192,8 +223,34 @@ export async function processGap(
     }
 
     const MOCKS_SEPARATOR = '// ---MOCKS_FILE---'
+    const MOCKS_PATCH_SEPARATOR = '// ---MOCKS_PATCH---'
     let testCode = generatedCode
-    if (generatedCode.includes(MOCKS_SEPARATOR) && config.mocksFile) {
+
+    if (generatedCode.includes(MOCKS_PATCH_SEPARATOR) && config.mocksFile) {
+      // Surgical patch mode: model only emits the changed sections
+      const [newTestCode, patchContent] = generatedCode.split(MOCKS_PATCH_SEPARATOR)
+      testCode = newTestCode.trim()
+      if (patchContent?.trim()) {
+        const absoluteMocksFile = join(cwd, config.mocksFile)
+        let existing = ''
+        try { existing = await readFile(absoluteMocksFile, 'utf-8') } catch { /* new file — patch can't apply */ }
+        if (existing) {
+          const applied = tryApplyMocksPatch(existing, patchContent.trim())
+          if (applied) {
+            if (applied.failedOps.length > 0) {
+              const anchors = applied.failedOps.map(op => `"${op.oldText.slice(0, 60).replace(/\n/g, '↵')}"`).join(', ')
+              lastError = `MOCKS PATCH FAILED: the following REPLACE anchor(s) were not found in the mock file:\n${anchors}\nAnchors must be copied character-for-character from the SHARED MOCK FILE shown above. Re-read it and rewrite your ---MOCKS_PATCH--- block.`
+              if (!onStatus) log(chalk.yellow(`  ⚠ Mock patch anchors not found — retrying...`))
+              onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations } as WorkerState)
+              continue
+            }
+            await writeFile(absoluteMocksFile, applied.result, 'utf-8')
+            if (!onStatus) log(chalk.dim(`  Patched mocks file: ${config.mocksFile}`))
+          }
+        }
+      }
+    } else if (generatedCode.includes(MOCKS_SEPARATOR) && config.mocksFile) {
+      // Full-rewrite mode (new mock file or explicit full replacement)
       const [newTestCode, newMocksCode] = generatedCode.split(MOCKS_SEPARATOR)
       testCode = newTestCode.trim()
       if (newMocksCode?.trim()) {
@@ -235,6 +292,21 @@ export async function processGap(
     const runResult = await runCommand(testCmd, cwd)
 
     if (runResult.success) {
+      // Reject placeholder test bodies — `{ // body }` passes vitest (no assertions)
+      // but produces zero coverage value. Force a retry with an explicit error.
+      if (hasPlaceholderBodies(testCode)) {
+        lastError =
+          'ERROR: One or more test bodies contain placeholder comments (e.g. `// body`, `// TODO`) with no real assertions.\n' +
+          'Every test must have complete, working expectations:\n' +
+          '  it(\'description\', async () => {\n' +
+          '    const result = await subject.doThing(...);\n' +
+          '    expect(result).toEqual(expectedValue);\n' +
+          '  })\n' +
+          'Replace every `// body` placeholder with real arrange-act-assert code.'
+        if (!onStatus) log(chalk.yellow(`  Placeholder test bodies detected — retrying...`))
+        onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations } as WorkerState)
+        continue
+      }
       const typeErrors = await typeCheckFile(context.suggestedTestFile, cwd, env)
       if (typeErrors) {
         if (attempt < config.maxIterations) {
@@ -282,7 +354,7 @@ export async function processGap(
     await restoreTestFile(context.suggestedTestFile, originalTestContent)
   } else {
     // New file — keep the last attempt on disk so `lacuna fix` can repair it
-    if (!onStatus) log(chalk.yellow(`\n  Last attempt kept at ${shortPath} — run ${chalk.cyan('lacuna fix')} to repair it`))
+    if (!onStatus) log(chalk.yellow(`\n  Last attempt kept at ${context.suggestedTestFile.replace(cwd + '/', '')} — run ${chalk.cyan('lacuna fix')} to repair it`))
   }
   return {
     success: false,

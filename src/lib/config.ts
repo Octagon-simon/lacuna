@@ -25,6 +25,15 @@ const ConfigSchema = z.object({
   baseURL: z.string().default('https://api.deepseek.com/v1'),
   apiKeyEnv: z.string().default('DEEPSEEK_API_KEY'),
   maxTokens: z.number().min(1024).max(128000).default(16000),
+  // Override the test command lacuna uses to scan for failures / run coverage.
+  // By default lacuna auto-detects (e.g. "npx jest", "npx vitest run --coverage").
+  // Use this when you want to add flags: { "testCommand": "npx jest --no-coverage" }
+  testCommand: z.string().optional(),
+  // Environment variables injected into every test-runner invocation.
+  // Useful for monorepos where the test suite needs NODE_CONFIG_DIR, APP_ENV, etc.
+  // set to values that differ from the lacuna process environment.
+  // Example: { "NODE_CONFIG_DIR": "packages/server/config" }
+  testEnv: z.record(z.string()).default({}),
 })
 
 export type LacunaConfig = z.infer<typeof ConfigSchema>
