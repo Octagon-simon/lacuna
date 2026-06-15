@@ -60,8 +60,10 @@ export default class Fix extends Command {
 
     const config = await loadConfig()
     if (flags.model) applyModelOverride(config, flags.model)
+    if (config.testEnv) Object.assign(process.env, config.testEnv)
 
     const env = await detectEnvironment(process.cwd(), config.testRunner)
+    if (config.testCommand) env.testCommand = config.testCommand
 
     this.log(chalk.bold('\nlacuna fix\n'))
     this.log(`${chalk.dim('Model:')}   ${chalk.cyan(config.model)}`)

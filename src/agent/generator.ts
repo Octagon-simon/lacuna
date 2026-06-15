@@ -49,23 +49,26 @@ function estimateMaxTokens(sourceCode: string | null | undefined, configMax: num
 }
 
 // Wraps a token callback so that <thinking> content is suppressed.
-// Buffers silently until <code_output> is seen, then streams from there.
-// Falls back to streaming everything if <code_output> never appears (e.g. non-XML response).
+// Buffers silently until <code_output> or <code_patch> is seen, then streams from there.
+// Falls back to streaming everything if neither tag appears (e.g. non-XML response).
 function codeOnlyStream(onToken: (t: string) => void): (t: string) => void {
   let buf = ''
   let streaming = false
   return (token: string) => {
     if (streaming) { onToken(token); return }
     buf += token
-    const idx = buf.indexOf('<code_output>')
-    if (idx !== -1) {
+    const outputIdx = buf.includes('<code_output>') ? buf.indexOf('<code_output>') : Infinity
+    const patchIdx = buf.includes('<code_patch>') ? buf.indexOf('<code_patch>') : Infinity
+    const idx = Math.min(outputIdx, patchIdx)
+    if (idx < Infinity) {
       streaming = true
-      const after = buf.slice(idx + '<code_output>'.length)
+      const marker = outputIdx <= patchIdx ? '<code_output>' : '<code_patch>'
+      const after = buf.slice(idx + marker.length)
       if (after) onToken(after)
       buf = ''
       return
     }
-    // If no <code_output> after 3000 chars the model skipped the XML wrapper — flush and stream
+    // If no <code_output> or <code_patch> after 3000 chars the model skipped the XML wrapper — flush and stream
     if (buf.length > 3000) { streaming = true; onToken(buf); buf = '' }
   }
 }
@@ -86,6 +89,19 @@ const TRUNCATION_RETRY_MESSAGE =
   'IMMEDIATELY write the code — do NOT plan in a <thinking> block this time. ' +
   'Write a short, focused test file. Cover the most important behaviors only — skip exhaustive edge cases. ' +
   'Every function body must be closed. Use <code_output> tags.'
+
+// Detect a prose repetition loop: the model wrote the same planning sentence 3+ times
+// without ever producing code. Only applied to the fallback path (no XML/fence tags).
+function isRepetitionLoop(text: string): boolean {
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 45)
+  const seen = new Map<string, number>()
+  for (const line of lines) {
+    const count = (seen.get(line) ?? 0) + 1
+    seen.set(line, count)
+    if (count >= 3) return true
+  }
+  return false
+}
 
 // Detect syntactically incomplete code — a strong signal that output was cut off mid-generation.
 function isCodeIncomplete(code: string): boolean {
@@ -117,18 +133,30 @@ function isCodeIncomplete(code: string): boolean {
 // leaked into the code output. The model occasionally forgets to close the thinking block
 // before opening <code_output>, so the code starts with stray XML closing tags or prose.
 function stripThinkingBleed(code: string): string {
-  // Remove any </thinking> closing tag (with optional whitespace / newlines around it)
-  let s = code.replace(/^\s*<\/thinking>\s*/i, '')
-  // Remove any complete <thinking>...</thinking> block left at the top
-  s = s.replace(/^\s*<thinking>[\s\S]*?<\/thinking>\s*/i, '')
-  // Remove an unclosed <thinking> block — model got stuck looping, no real code follows
-  s = s.replace(/^\s*<thinking>[\s\S]*/i, '')
+  // Claude uses <thinking>...</thinking>; DeepSeek R1 uses <think>...</think>.
+  // Handle both tag names, plus unclosed variants where the model looped without finishing.
+  let s = code
+  // Remove stray closing tags
+  s = s.replace(/^\s*<\/(thinking|think)>\s*/i, '')
+  // Remove complete blocks
+  s = s.replace(/^\s*<(thinking|think)>[\s\S]*?<\/\1>\s*/i, '')
+  // Remove unclosed blocks (model got stuck — no real code follows)
+  s = s.replace(/^\s*<(thinking|think)>[\s\S]*/i, '')
   return s
 }
 
-function parseStructuredResponse(raw: string): { hypothesis: string; code: string; truncated: boolean } {
-  const thinkingMatch = raw.match(/<thinking>([\s\S]*?)<\/thinking>/i)
+function parseStructuredResponse(raw: string): { hypothesis: string; code: string; truncated: boolean; isPatch: boolean } {
+  const thinkingMatch = raw.match(/<(?:thinking|think)>([\s\S]*?)<\/(?:thinking|think)>/i)
   const hypothesis = thinkingMatch ? thinkingMatch[1].trim() : ''
+
+  // Check for <code_patch> FIRST — patch blocks are individually complete, skip truncation check.
+  const lineAnchoredPatch = /(?:^|\n)<code_patch>[ \t]*(?:\n|$)/i
+  const patchMatch = lineAnchoredPatch.exec(raw)
+  if (patchMatch) {
+    const patchEnd = patchMatch.index + patchMatch[0].length
+    const code = stripThinkingBleed(raw.slice(patchEnd).trim())
+    return { hypothesis, code, truncated: false, isPatch: true }
+  }
 
   // The real <code_output> delimiter is always on its own line (preceded by \n or start-of-string).
   // References to it inside planning text ("output in <code_output> tags") appear mid-sentence,
@@ -142,27 +170,34 @@ function parseStructuredResponse(raw: string): { hypothesis: string; code: strin
     const closeMatch = lineAnchoredClose.exec(raw.slice(openEnd))
     if (closeMatch) {
       const code = stripThinkingBleed(raw.slice(openEnd, openEnd + closeMatch.index).trim())
-      return { hypothesis, code, truncated: isCodeIncomplete(code) }
+      return { hypothesis, code, truncated: isCodeIncomplete(code), isPatch: false }
     }
     // No closing tag — normal when stop sequence fires cleanly
     const code = stripThinkingBleed(raw.slice(openEnd).trim())
-    return { hypothesis, code, truncated: isCodeIncomplete(code) }
+    return { hypothesis, code, truncated: isCodeIncomplete(code), isPatch: false }
   }
 
   // No XML tags — extract the last fenced code block if present.
   // Gemini and other models sometimes emit prose + multiple draft blocks before
   // settling on a final answer; the last block is the intended output.
+  // After extracting, check whether the content looks like patch ops (// @@@ headers) —
+  // models that skip <code_patch> tags but follow the @@@-format still get patch mode.
   const fenceMatches = [...raw.matchAll(/```(?:typescript|tsx?|javascript|jsx?|python|go)?\s*\n([\s\S]*?)```/g)]
   if (fenceMatches.length > 0) {
     const code = stripThinkingBleed(fenceMatches[fenceMatches.length - 1][1].trim())
-    return { hypothesis, code, truncated: isCodeIncomplete(code) }
+    const isPatch = /^\/\/ @@@ (REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):/m.test(code)
+    return { hypothesis, code, truncated: isCodeIncomplete(code), isPatch }
   }
-  // No fenced blocks at all — strip any single fence pair and use as code
+  // No fenced blocks at all — strip any single fence pair and use as code.
+  // Also catch repetition loops: if the raw text has the same prose sentence 3+ times,
+  // the model was looping instead of writing code — treat as truncated so the
+  // TRUNCATION_RETRY_MESSAGE fires and forces immediate code output next turn.
   let fallback = raw.trim()
   fallback = fallback.replace(/^```(?:typescript|tsx?|javascript|jsx?|python|go)?\s*\n/, '')
   fallback = fallback.replace(/\n```\s*$/, '')
   const code = stripThinkingBleed(fallback.trim())
-  return { hypothesis, code, truncated: isCodeIncomplete(code) }
+  const isPatch = /^\/\/ @@@ (REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):/m.test(code)
+  return { hypothesis, code, truncated: isCodeIncomplete(code) || isRepetitionLoop(raw), isPatch }
 }
 
 export class TestGenerator {
@@ -175,6 +210,7 @@ export class TestGenerator {
   private lastHypothesis: string = ''
   private failedAttempts: FailedAttempt[] = []
   private previousCodes: string[] = []  // normalized codes from all attempts, for oscillation detection
+  private lastIsPatch = false
 
   constructor(options: GeneratorOptions) {
     this.provider = createProvider(options.config)
@@ -220,6 +256,8 @@ export class TestGenerator {
     this.previousCodes = []
   }
 
+  get isPatch(): boolean { return this.lastIsPatch }
+
   async generate(context: FileContext, gap: CoverageGap, projectMemory?: string | null): Promise<string> {
     this.lastHypothesis = ''
     this.failedAttempts = []
@@ -246,6 +284,7 @@ export class TestGenerator {
           localImportContents: context.localImportContents,
           reactMajorVersion: context.reactMajorVersion,
           projectMemory,
+          existingTestLineCount: context.existingTestCode?.split('\n').length ?? 0,
         }),
       },
     ]
@@ -257,8 +296,9 @@ export class TestGenerator {
       estimateMaxTokens(context.sourceCode, this.maxTokens),
       GENERATE_TEMPERATURE,
     )
-    const { hypothesis, code, truncated } = parseStructuredResponse(response)
+    const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response)
     this.lastHypothesis = hypothesis
+    this.lastIsPatch = isPatch
     this.previousCodes.push(normalizeCode(code))
     this.history.push({ role: 'assistant', content: response })
     if (truncated) throw new TruncatedOutputError(code)
@@ -278,8 +318,9 @@ export class TestGenerator {
       estimateMaxTokens(args.sourceCode, this.maxTokens),
       GENERATE_TEMPERATURE,
     )
-    const { hypothesis, code, truncated } = parseStructuredResponse(response)
+    const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response)
     this.lastHypothesis = hypothesis
+    this.lastIsPatch = isPatch
     this.previousCodes.push(normalizeCode(code))
     this.history.push({ role: 'assistant', content: response })
     if (truncated) throw new TruncatedOutputError(code)
@@ -299,8 +340,9 @@ export class TestGenerator {
       this.maxTokens,
       RETRY_TEMPERATURE,
     )
-    const { hypothesis, code, truncated } = parseStructuredResponse(response)
+    const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response)
     this.lastHypothesis = hypothesis
+    this.lastIsPatch = isPatch
     this.previousCodes.push(normalizeCode(code))
     this.history.push({ role: 'assistant', content: response })
     if (truncated) throw new TruncatedOutputError(code)
@@ -338,8 +380,9 @@ export class TestGenerator {
       this.maxTokens,
       RETRY_TEMPERATURE,
     )
-    const { hypothesis, code, truncated } = parseStructuredResponse(response)
+    const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response)
     this.lastHypothesis = hypothesis
+    this.lastIsPatch = isPatch
     this.history.push({ role: 'assistant', content: response })
     if (truncated) throw new TruncatedOutputError(code)
 

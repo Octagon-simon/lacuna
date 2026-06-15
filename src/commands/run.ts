@@ -22,7 +22,9 @@ export default class Run extends Command {
   async run(): Promise<void> {
     const { flags } = await this.parse(Run)
     const config = await loadConfig()
+    if (config.testEnv) Object.assign(process.env, config.testEnv)
     const env = await detectEnvironment(process.cwd(), config.testRunner)
+    if (config.testCommand) env.testCommand = config.testCommand
 
     this.log(chalk.bold('\nlacuna run\n'))
 

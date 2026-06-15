@@ -308,11 +308,25 @@ export function buildSystemPrompt(env: DetectedEnvironment): string {
 4. Only import from packages listed in PROJECT DEPENDENCIES. Do not invent packages that are not listed.
 5. When a SHARED MOCK FILE is provided, its exported names are listed under "Available exports". Before writing the test, go through that list and identify every mock that relates to what the source file does. Import and use ALL of those mocks. Never re-create inline ${mockApi}.fn() for anything already exported from the mocks file.
    CRITICAL — never rename or change the casing of existing mock exports.
-6. If you need a mock that is missing from the shared mock file, add it to that file AND import it in the test. Return BOTH files separated by exactly one line containing only: // ---MOCKS_FILE---
-   CRITICAL — if you have NO new mocks to add, OMIT the // ---MOCKS_FILE--- separator entirely. Do NOT write a comment-only or placeholder mock file (e.g. "// No mocks needed"). Either add real code or omit the separator.
-   CRITICAL — when writing the mocks file, you receive the FULL EXISTING content. You MUST write the complete merged result. Never add a second import statement for a module that is already imported — merge all named imports from the same module into one statement. WRONG: line 2 has \`import { View } from 'react-native'\` and you add line 28 \`import { View, Text } from 'react-native'\`. RIGHT: update line 2 to \`import { View, Text } from 'react-native'\` and omit the duplicate.
-7. If a SHARED MOCK FILE (does not exist yet) section is shown — create it for any mocks you need and return it using the // ---MOCKS_FILE--- separator.
+6. If you need to add or change mocks in the shared mock file:
+   - When the SHARED MOCK FILE already EXISTS: use // ---MOCKS_PATCH--- (surgical patch — preferred, avoids rewriting the whole file).
+     After the separator, emit only the sections that change using these operations:
+       // @@@ REPLACE:
+       <exact existing text copied verbatim from the mock file>
+       // @@@ WITH:
+       <replacement text>
+       // @@@ END
+       // @@@ APPEND_EXPORT:
+       export const mockNewThing = ${mockApi}.fn()
+       // @@@ END
+       // @@@ ADD_TO_BEFOREEACH:
+       mockNewThing.mockReset()
+       // @@@ END
+     REPLACE anchor must match character-for-character — copy it from the SHARED MOCK FILE shown above.
+     If you have NO changes to the mock file, OMIT both separators entirely.
+   - When the SHARED MOCK FILE does NOT exist yet: use // ---MOCKS_FILE--- to return the full new file content.
    CRITICAL — the mocks file must contain ONLY: ${mockApi}.fn() mock definitions, ${mockApi}.mock() module stubs, shared mock objects/constants, and beforeEach reset hooks. NEVER write describe(), it(), test(), or expect() calls in the mocks file.
+7. If a SHARED MOCK FILE (does not exist yet) section is shown — create it for any mocks you need and return it using the // ---MOCKS_FILE--- separator.
 8. If a TEST SETUP FILE is shown, assume its globals and matchers are already available. Do NOT import or re-declare them.` : `
 3. Use the project's import conventions as shown in the source file and existing tests.
 4. Only import from packages listed in PROJECT DEPENDENCIES. Do not invent packages that are not listed.`
@@ -322,10 +336,11 @@ export function buildSystemPrompt(env: DetectedEnvironment): string {
   const ruleCount = isTS ? 10 : (isJS ? 9 : 6)
 
   const jsOutputRules = isJS ? `
-${ruleCount + 2}. Inside <code_output>: output ONLY the test file content (or test file // ---MOCKS_FILE--- mocks file).
-    If you use // ---MOCKS_FILE---, everything AFTER the separator is the mocks file. The mocks file must contain ONLY:
-    ${mockApi}.fn() mock definitions, ${mockApi}.mock() module stubs, shared constants, and beforeEach resets.
-    NEVER put describe(), it(), test(), or expect() calls after the separator.
+${ruleCount + 2}. Inside <code_output>: output ONLY the test file, optionally followed by mock file changes.
+    - To patch an EXISTING mock file: append // ---MOCKS_PATCH--- then the patch ops (REPLACE/APPEND_EXPORT/ADD_TO_BEFOREEACH blocks).
+    - To create a NEW mock file: append // ---MOCKS_FILE--- then the full file content.
+    - If no mock changes needed: omit both separators.
+    NEVER put describe(), it(), test(), or expect() calls after either separator.
 ${ruleCount + 3}. NEVER output vitest.config.ts, jest.config.js, or any framework configuration. If an import cannot be resolved,
     fix it by mocking it with ${mockApi}.mock() — NOT by modifying the test runner configuration.` : ''
 
@@ -398,11 +413,13 @@ export function buildGeneratePrompt(args: {
   localImportContents?: string | null
   reactMajorVersion?: number | null
   projectMemory?: string | null
+  existingTestLineCount?: number
 }): string {
   const {
     sourceFile, env, existingTestCode, uncoveredFunctions, uncoveredLines,
     sourceImportPath, mocksCode, mocksImportPath, setupFileCode, packageDeps,
     tsconfigPaths, typeDefinitions, localImportPaths, localImportContents, reactMajorVersion, projectMemory,
+    existingTestLineCount,
   } = args
 
   const sourceCode = compressSource(args.sourceCode)
@@ -440,7 +457,7 @@ export function buildGeneratePrompt(args: {
   }
 
   if (localImportContents) {
-    parts.push('\nUSED SYMBOL DEFINITIONS (extracted from files the component imports — only the specific symbols used, with function bodies collapsed to signature + return and class bodies collapsed to method signatures. Use this to find exact hook return shapes, service method names, and type definitions. Cross-check every hook mock against the hook\'s actual return statement here):')
+    parts.push('\nUSED SYMBOL DEFINITIONS (extracted from files the component imports — only the specific symbols used, with function bodies collapsed to signature + return and class bodies collapsed to method signatures. Use this to find exact hook return shapes, service method names, and type definitions. Cross-check every hook mock against the hook\'s actual return statement here):\nCRITICAL — when writing mocks for any service class or hook: list ONLY the methods/keys that appear in this section. Do NOT invent method names based on what sounds plausible. A fabricated method name causes "X.method is not a function" or "undefined.then(...)" crashes that break every test in the file.')
     parts.push('```typescript')
     parts.push(localImportContents)
     parts.push('```')
@@ -463,7 +480,7 @@ export function buildGeneratePrompt(args: {
       parts.push(`\nSHARED MOCK FILE (import from: '${mocksImportPath}')`)
       if (exports.length > 0) {
         parts.push(`Available exports: ${exports.join(', ')}`)
-        parts.push(`↑ Every name above ALREADY EXISTS in the mock file — do NOT re-declare any of them in a ---MOCKS_FILE--- block. Only declare names that do NOT appear in this list.\n↑ Before writing the test, identify which of these match the source file's domain and import every relevant one. Do NOT create inline mocks for anything already in this list.\n↑ NAMES ARE FROZEN — use each export exactly as spelled above. Never rename, recase, or restructure an existing mock (e.g. do not change mockFoo → MockFoo or const → class). Renaming breaks every other test that imports the original name.`)
+        parts.push(`↑ Every name above ALREADY EXISTS in the mock file — do NOT re-declare any of them. Only declare names that do NOT appear in this list.\n↑ Before writing the test, identify which of these match the source file's domain and import every relevant one. Do NOT create inline mocks for anything already in this list.\n↑ NAMES ARE FROZEN — use each export exactly as spelled above. Never rename, recase, or restructure an existing mock (e.g. do not change mockFoo → MockFoo or const → class). Renaming breaks every other test that imports the original name.\n↑ CLASS MOCKS (Mock-prefixed exports, e.g. MockWalletService) are the canonical mock for their named service. If the source imports WalletService, import and use MockWalletService — do NOT create an inline mock. If the source calls a method not present on the class, add it to the class via REPLACE (see MOCK EDITING RULES below).`)
       }
       const inventory = parseMockInventory(mocksCode)
       if (inventory.length > 0) {
@@ -474,17 +491,22 @@ export function buildGeneratePrompt(args: {
           const exp = entry.exports.length > 0 ? entry.exports.join(', ') : '(no simple key exports)'
           parts.push(`  ${path} → ${exp}`)
         }
-        parts.push('MOCK EDITING RULES — follow exactly when returning a ---MOCKS_FILE--- block:')
-        parts.push(`• A module in the inventory is ALREADY mocked. To add a new export: write ONE updated ${mockApi}.mock() block with ALL existing exports PLUS the new one. NEVER write a second ${mockApi}.mock() for the same path — the second block silently wipes every export from the first.`)
-        parts.push(`• New export const mockFoo = ${mockApi}.fn(): declare it near other exports of the same domain. Add its .mockReset() or .mockClear() to the EXISTING beforeEach — do NOT create an extra beforeEach for one variable.`)
-        parts.push(`• New module (not in inventory): append a new ${mockApi}.mock() at the END of the file, before the final beforeEach.`)
       }
+      parts.push(`MOCK EDITING RULES — use // ---MOCKS_PATCH--- to make surgical changes (preferred over full rewrite):`)
+      parts.push(`• To add a new export (function/const) or a new ${mockApi}.mock() block: use APPEND_EXPORT + ADD_TO_BEFOREEACH for the reset.`)
+      parts.push(`• To add a method to an existing class mock (e.g. MockWalletService): use REPLACE — copy the entire class definition verbatim from the file below as the anchor, then emit the same class with the new method(s) added.`)
+      parts.push(`• To update an existing ${mockApi}.mock() block or any other section: use REPLACE with the old block as anchor, WITH the updated version.`)
+      parts.push(`• Never write a second ${mockApi}.mock() for the same path — the second block silently wipes every export from the first.`)
+      parts.push(`• If the source imports a service/hook that has NO mock here yet: add it via APPEND_EXPORT. Never leave it as an inline ${mockApi}.fn() object in the test — put it in this shared file so all tests use the same mock.`)
+      // Show the full mock file — the model needs to read exact text to write accurate
+      // REPLACE anchors in ---MOCKS_PATCH--- blocks. Truncating would make anchors impossible
+      // for anything past the cut-off. filterMockFileForSource already reduces size by keeping
+      // only vi.mock() blocks relevant to the source's imports; if nothing matched it returns
+      // the full file. Either way, show it all.
       const relevantMocks = filterMockFileForSource(mocksCode, sourceCode)
-      if (relevantMocks !== mocksCode || relevantMocks.split('\n').length < 80) {
-        parts.push('```')
-        parts.push(relevantMocks)
-        parts.push('```')
-      }
+      parts.push('```')
+      parts.push(relevantMocks)
+      parts.push('```')
     } else {
       parts.push(`\nSHARED MOCK FILE (does not exist yet) — create it if you need mocks, return it via the // ---MOCKS_FILE--- separator. Path: '${mocksImportPath}'\n⚠ Mocks file must contain ONLY ${mockApi}.fn()/${mockApi}.mock() definitions and beforeEach resets — NEVER describe/it/test/expect blocks.`)
     }
@@ -499,9 +521,23 @@ export function buildGeneratePrompt(args: {
   if (detectReactNative(packageDeps ?? null)) parts.push(`\n${buildReactNativeGuidance()}`)
   else if (detectVue(packageDeps ?? null)) parts.push(`\n${buildVueGuidance()}`)
 
-  const displaySource = buildSourceSkeleton(sourceCode, uncoveredFunctions)
-  const skeletonized = shouldUseSkeleton(sourceCode)
-  parts.push(`\nSOURCE FILE: ${sourceFile}${skeletonized ? ' (large file — bodies of already-covered functions collapsed; uncovered functions shown in full)' : ''}`)
+  // Skeleton strategy:
+  //   coverage-driven (uncoveredFunctions non-empty): collapse covered bodies, expand uncovered ones.
+  //   single-file / all-uncovered (uncoveredFunctions empty):
+  //     ≤ 600 lines → full source (model needs implementations to write good tests)
+  //     > 600 lines → skeleton with signatures only + note to rely on USED SYMBOL DEFINITIONS
+  const FULL_SOURCE_LINE_LIMIT = 600
+  const sourceLineCount = sourceCode.split('\n').length
+  const skeletonized = uncoveredFunctions.length > 0
+    ? shouldUseSkeleton(sourceCode)
+    : sourceLineCount > FULL_SOURCE_LINE_LIMIT
+  const displaySource = skeletonized ? buildSourceSkeleton(sourceCode, uncoveredFunctions) : sourceCode
+  const largeFileNote = skeletonized && uncoveredFunctions.length === 0
+    ? ` (${sourceLineCount}-line file — function bodies collapsed to signatures. Use the USED SYMBOL DEFINITIONS section and existing tests to infer which functions are already covered and what the implementations do.)`
+    : skeletonized
+      ? ' (large file — bodies of already-covered functions collapsed; uncovered functions shown in full)'
+      : ''
+  parts.push(`\nSOURCE FILE: ${sourceFile}${largeFileNote}`)
   if (sourceImportPath) {
     parts.push(`SOURCE FILE IMPORT PATH: when importing the source in your test file, use exactly: '${sourceImportPath}'`)
   }
@@ -525,7 +561,39 @@ export function buildGeneratePrompt(args: {
     parts.push(`\nUNCOVERED LINES: ${uncoveredLines.slice(0, 30).join(', ')}${uncoveredLines.length > 30 ? '…' : ''}`)
   }
 
-  parts.push('\nWrite the complete test file now.')
+  const patchMode = existingTestLineCount !== undefined && existingTestLineCount > 300
+  if (patchMode) {
+    parts.push(`\n⚠ PATCH MODE — this test file already has ${existingTestLineCount} lines. DO NOT rewrite the whole file. Use <code_patch> tags (NOT <code_output>) with these operations:
+
+// @@@ ADD_AFTER_DESCRIBE: "exact describe block name"
+it('new test name', async () => {
+  // body
+})
+// @@@ END
+
+// @@@ ADD_IMPORT:
+import { NewThing } from './path'
+// @@@ END
+
+// @@@ ADD_AFTER_IMPORTS:
+vi.mock('./some/module', () => ({ default: vi.fn() }))
+// @@@ END
+
+// @@@ REPLACE:
+import { render, screen } from '@testing-library/react-native'
+// @@@ WITH:
+import { render, screen, waitFor } from '@testing-library/react-native'
+// @@@ END
+
+Rules:
+- ADD_IMPORT: appends a new import line. Use REPLACE instead when you need to add to an EXISTING import from the same module — never write a second import from the same module.
+- ADD_AFTER_IMPORTS: for vi.mock() / module-level setup that must go AFTER all imports.
+- REPLACE: exact old_string → new_string for any section (imports, beforeEach, helpers). Copy old text verbatim from the CURRENT TEST FILE above — character-for-character including quotes and whitespace. First occurrence only.
+- ADD_AFTER_DESCRIBE anchor must exactly match the describe() name in the file.
+- Do NOT output <code_output> tags in patch mode.`)
+  } else {
+    parts.push('\nWrite the complete test file now.')
+  }
   return parts.join('\n')
 }
 
@@ -548,8 +616,9 @@ export function buildFixPrompt(args: {
   localImportPaths?: string[] | null
   reactMajorVersion?: number | null
   projectMemory?: string | null
+  existingTestLineCount?: number
 }): string {
-  const { testFile, testCode, sourceFile, sourceImportPath, errorOutput, env, mocksCode, mocksImportPath, setupFileCode, packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, reactMajorVersion, projectMemory } = args
+  const { testFile, testCode, sourceFile, sourceImportPath, errorOutput, env, mocksCode, mocksImportPath, setupFileCode, packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, reactMajorVersion, projectMemory, existingTestLineCount } = args
   const sourceCode = args.sourceCode ? compressSource(args.sourceCode) : null
   const mockApi = env.testRunner === 'vitest' ? 'vi' : 'jest'
   const parts: string[] = []
@@ -598,7 +667,7 @@ export function buildFixPrompt(args: {
       parts.push(`\nSHARED MOCK FILE (import from: '${mocksImportPath}')`)
       if (exports.length > 0) {
         parts.push(`Available exports: ${exports.join(', ')}`)
-        parts.push(`↑ Every name above ALREADY EXISTS in the mock file — do NOT re-declare any of them in a ---MOCKS_FILE--- block. Only declare names that do NOT appear in this list.\n↑ Import every mock that matches the source file's domain. Do NOT create inline mocks for anything already in this list.`)
+        parts.push(`↑ Every name above ALREADY EXISTS in the mock file — do NOT re-declare any of them. Only declare names that do NOT appear in this list.\n↑ Import every mock that matches the source file's domain. Do NOT create inline mocks for anything already in this list.\n↑ CLASS MOCKS (Mock-prefixed exports, e.g. MockWalletService) are the canonical mock for their named service. If the source imports WalletService, import and use MockWalletService — do NOT create an inline mock. If the source calls a method not present on the class, add it to the class via REPLACE (see MOCK EDITING RULES below).`)
       }
       const inventory = parseMockInventory(compressed)
       if (inventory.length > 0) {
@@ -609,11 +678,13 @@ export function buildFixPrompt(args: {
           const exp = entry.exports.length > 0 ? entry.exports.join(', ') : '(no simple key exports)'
           parts.push(`  Line ${String(entry.lineNumber).padStart(4)}: ${path} → ${exp}`)
         }
-        parts.push('MOCK EDITING RULES — follow exactly when returning a ---MOCKS_FILE--- block:')
-        parts.push(`• A module in the inventory is ALREADY mocked. To add a new export: write ONE updated ${mockApi}.mock() block with ALL existing exports PLUS the new one. NEVER write a second ${mockApi}.mock() for the same path — the second block silently wipes every export from the first.`)
-        parts.push(`• New export const mockFoo = ${mockApi}.fn(): declare it near other exports of the same domain. Add its .mockReset() or .mockClear() to the EXISTING beforeEach — do NOT create an extra beforeEach for one variable.`)
-        parts.push(`• New module (not in inventory): append a new ${mockApi}.mock() at the END of the file, before the final beforeEach.`)
       }
+      parts.push(`MOCK EDITING RULES — use // ---MOCKS_PATCH--- to make surgical changes (preferred over full rewrite):`)
+      parts.push(`• To add a new export (function/const) or a new ${mockApi}.mock() block: use APPEND_EXPORT + ADD_TO_BEFOREEACH for the reset.`)
+      parts.push(`• To add a method to an existing class mock (e.g. MockWalletService): use REPLACE — copy the entire class definition verbatim from the file below as the anchor, then emit the same class with the new method(s) added.`)
+      parts.push(`• To update an existing ${mockApi}.mock() block or any other section: use REPLACE with the old block as anchor, WITH the updated version.`)
+      parts.push(`• Never write a second ${mockApi}.mock() for the same path — the second block silently wipes every export from the first.`)
+      parts.push(`• If the source imports a service/hook that has NO mock here yet: add it via APPEND_EXPORT. Never leave it as an inline ${mockApi}.fn() object in the test — put it in this shared file so all tests use the same mock.`)
       parts.push('```')
       parts.push(compressed)
       parts.push('```')
@@ -692,7 +763,51 @@ export function buildFixPrompt(args: {
   parts.push('- Component/function API changed — check the source file')
   parts.push('- Unhandled rejection: if the error output says "Unhandled Rejection" or "Vitest caught 1 unhandled error", a mockRejectedValueOnce promise is escaping the test scope. Fix by adding await waitFor(() => expect(errorElement).toBeInTheDocument()) after the triggering action, so the rejection is fully resolved inside the test.')
 
-  parts.push('\nReturn your response in the required <thinking> + <code_output> format.')
+  const patchMode = existingTestLineCount !== undefined && existingTestLineCount > 300
+  if (patchMode) {
+    parts.push(`\n⚠ PATCH MODE — this test file has ${existingTestLineCount} lines. DO NOT rewrite the whole file — the output token limit will cut it off. Instead:
+1. Identify ONLY the failing/broken tests from the error output above.
+2. Output a patch inside <code_patch> tags (NOT <code_output>) using this exact format:
+
+// @@@ REPLACE_TEST: "exact it/test description string"
+it('exact it/test description string', async () => {
+  // fixed body
+})
+// @@@ END
+
+// @@@ DELETE_TEST: "exact test name to remove"
+// @@@ END
+
+// @@@ ADD_AFTER_DESCRIBE: "exact describe block name"
+it('new test', async () => {
+  // body
+})
+// @@@ END
+
+// @@@ ADD_IMPORT:
+import { NewThing } from './path'
+// @@@ END
+
+// @@@ ADD_AFTER_IMPORTS:
+vi.mock('./some/module', () => ({ default: vi.fn() }))
+// @@@ END
+
+// @@@ REPLACE:
+import { render, screen } from '@testing-library/react-native'
+// @@@ WITH:
+import { render, screen, waitFor } from '@testing-library/react-native'
+// @@@ END
+
+Rules:
+- REPLACE_TEST / DELETE_TEST / ADD_AFTER_DESCRIBE anchors must exactly match what appears in the test file — copy verbatim, same quotes.
+- REPLACE: use for any section that isn't an entire it/test block — imports, beforeEach, helpers. Copy old text verbatim from the CURRENT TEST FILE. Use instead of ADD_IMPORT when adding to an existing import from the same module.
+- Only include operations for what actually needs to change. Do not restate passing tests.
+- ADD_IMPORT: appends a new import line — only for modules not yet imported at all.
+- ADD_AFTER_IMPORTS: for vi.mock() / module-level setup that must go AFTER all imports.
+- Do NOT output <code_output> tags in patch mode. Use <code_patch> only.`)
+  } else {
+    parts.push('\nReturn your response in the required <thinking> + <code_output> format.')
+  }
   return parts.join('\n')
 }
 

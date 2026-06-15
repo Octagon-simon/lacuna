@@ -72,7 +72,7 @@ Lacuna's AI prompts are tuned for frameworks that have been field-tested. Runner
 |---|---|---|
 | **TypeScript / JavaScript** (utilities, services, hooks) | Vitest, Jest | Hook return shape extraction, service method verification, TypeScript type-safety rules (`T[]` not `Array<T>`, no `as any` on mock shapes), mock structure (object vs factory), `jest.mocked()` / `vi.mocked()` pattern, factory hoisting rules |
 | **React** | Vitest, Jest | RTL query hierarchy, `act()` async rules, loading state (unmounted vs disabled button), unhandled rejection handling, mock lifecycle (`mockResolvedValueOnce`), `findBy` over `waitFor` preference |
-| **React Native** / Expo | Jest (`jest-expo`) | RNTL v14 async contract (`render()` + `fireEvent` must be awaited), infra mocks (Reanimated, AsyncStorage, safe area, vector icons), compound component factories, mock shape accuracy (hook destructure matching, service method names), dynamic text template resolution, toast vs screen text, icon-only button handling, `useFocusEffect` mocking, test cascade detection |
+| **React Native** / Expo | Jest (`jest-expo`) | RNTL v14 async contract (`render()` + `fireEvent` must be awaited), infra mocks (Reanimated, AsyncStorage, safe area, vector icons), compound component factories, mock shape accuracy (hook destructure matching, service method names verbatim from source), factory functions for mock contexts (prevents `clearAllMocks()` wipes), Fragment-wrapped button `testID` pattern, Modal `visible={false}` query isolation, icon library completeness (grep every import — one missing icon crashes render), unique mock list data, dynamic text template resolution, toast vs screen text, icon-only button handling, `useFocusEffect` mocking, test cascade detection |
 | **Next.js** | Vitest | Server/client boundary mocks, `next/navigation`, `next/headers`, `next/cache`, server actions, `'use client'`/`'use server'` directive detection |
 
 ### Supported — not yet field-tested
@@ -307,14 +307,39 @@ Lacuna parses your mock file before every prompt and builds a **mock inventory**
 'axios'             → get, post, put, delete
 ```
 
-This inventory is injected into every prompt so the AI knows exactly which modules are already mocked and what they export. When the AI needs to add a new export (e.g. a new API client method), it updates the **existing** `vi.mock()` block with the full list of old + new exports — never appending a second block for the same module.
+The inventory is injected into every prompt so the AI knows which modules are already mocked. The **full file** is also included for generate prompts — the AI needs to read exact text to write accurate patch anchors.
 
-**Structure rules the AI follows:**
-- Module already in inventory → update the existing block (never a duplicate)
-- New mock variable → declare near same-domain exports, reset in existing `beforeEach`
-- New module → append at end before the final `beforeEach`
+When the AI needs to change the mock file, it uses **surgical patch operations** rather than rewriting the whole file:
 
-For fix prompts, the mock file is **compressed** before sending (multi-line React component stub bodies are collapsed to `vi.fn()`) to reduce token cost while preserving all `vi.mock()` blocks and factory functions. For generate prompts, only the inventory and exports list are sent — the raw file is skipped entirely since the AI only needs to know what to import, not re-read every implementation.
+```
+// ---MOCKS_PATCH---
+// @@@ REPLACE:
+export class MockWalletService {
+  getBalance = jest.fn()
+}
+// @@@ WITH:
+export class MockWalletService {
+  getBalance = jest.fn()
+  transfer = jest.fn()        ← method added
+}
+// @@@ END
+
+// @@@ APPEND_EXPORT:
+export const mockNewHelper = jest.fn()
+// @@@ END
+
+// @@@ ADD_TO_BEFOREEACH:
+mockNewHelper.mockReset()
+// @@@ END
+```
+
+**Rules the AI follows:**
+- Module already in inventory → patch existing block, never write a second `vi.mock()` for the same path
+- Method missing from a class mock (e.g. `MockWalletService`) → add it via `REPLACE`, never create a separate inline mock
+- Service/hook with no mock yet → add it to the shared file via `APPEND_EXPORT`, never keep it inline in the test file
+- New mock → reset it in `beforeEach` via `ADD_TO_BEFOREEACH`
+
+For **fix prompts**, the mock file is filtered to only the exports the broken test actually imports (reducing a 700-line file to ~40 lines for a targeted fix), then compressed (multi-line stub bodies collapsed to `vi.fn()`). For **generate prompts**, the full file is sent so the AI can write exact REPLACE anchors.
 
 ---
 
@@ -507,7 +532,11 @@ lacuna/
 │   │       ├── react-native.ts    # RNTL v14 rules, infra mock guidance, error detectors
 │   │       ├── nextjs.ts          # Next.js boundary analysis, server action mocks
 │   │       ├── react.ts           # React web testing rules (act, RTL, timers)
-│   │       └── vue.ts             # Vue testing guidance
+│   │       ├── vue.ts             # Vue testing guidance
+│   │       └── runners/           # runner-specific prompt rules
+│   │           ├── js-common.ts   # rules shared across Jest + Vitest + Mocha
+│   │           ├── vitest.ts      # Vitest-specific: vi.mock hoisting, vi.hoisted(), resetAllMocks
+│   │           └── typescript.ts  # TypeScript type-safety rules (no as any, T[] not Array<T>)
 │   ├── lib/
 │   │   ├── config.ts      # cosmiconfig loader + zod schema
 │   │   ├── detector.ts    # auto-detects test runner and language
