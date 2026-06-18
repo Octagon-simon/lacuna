@@ -3,6 +3,7 @@ import chalk from 'chalk'
 import { loadConfig, applyModelOverride } from '../lib/config.js'
 import { detectEnvironment } from '../lib/detector.js'
 import { runFixLoop } from '../agent/fix-loop.js'
+import { debugLogPattern } from '../agent/generator.js'
 import { showStarNudge, showIssueNudge } from '../lib/feedback.js'
 
 export default class Fix extends Command {
@@ -53,6 +54,10 @@ export default class Fix extends Command {
       description: 'After fixing, bisect the test suite to identify files that corrupt shared state, then use AI to add cleanup',
       default: false,
     }),
+    types: Flags.boolean({
+      description: 'Select files by TypeScript type errors instead of test failures — repairs test files that pass but fail type-checking (one project-wide tsc, honors --workers)',
+      default: false,
+    }),
   }
 
   async run(): Promise<void> {
@@ -68,7 +73,11 @@ export default class Fix extends Command {
     this.log(chalk.bold('\nlacuna fix\n'))
     this.log(`${chalk.dim('Model:')}   ${chalk.cyan(config.model)}`)
     this.log(`${chalk.dim('Runner:')}  ${chalk.cyan(env.testRunner)}`)
+    if (flags.types) this.log(`${chalk.dim('Mode:')}    ${chalk.cyan('type errors')} ${chalk.dim('(selecting files by TypeScript errors, not test failures)')}`)
     if (flags.workers > 1) this.log(`${chalk.dim('Workers:')} ${flags.workers}`)
+    if (config.mocksFile) this.log(`${chalk.dim('Mocks:')}   ${chalk.cyan(config.mocksFile)}`)
+    const debugPattern = debugLogPattern(config.debug)
+    if (debugPattern) this.log(`${chalk.dim('Debug:')}   ${chalk.green('on')} ${chalk.dim(`→ ${debugPattern}`)}`)
     if (flags['dry-run']) this.log(chalk.yellow('  [dry-run — no files will be written]'))
     if (flags.file) this.log(`${chalk.dim('Target:')}  ${flags.file}`)
 
@@ -90,6 +99,7 @@ export default class Fix extends Command {
         fresh: flags.fresh,
         regenerateOnFailure: flags['regenerate-on-failure'],
         fixPolluters: flags['fix-polluters'],
+        types: flags.types,
         log: (msg) => this.log(msg),
       })
     } catch (err) {
@@ -113,10 +123,12 @@ export default class Fix extends Command {
 
     const stillFailing = result.filesProcessed - result.filesFixed - result.filesAlreadyPassing
     if (stillFailing > 0) {
-      this.log(`  ${chalk.dim('Still failing:')}  ${chalk.red(String(stillFailing))}`)
+      this.log(`  ${chalk.dim(flags.types ? 'Still erroring:' : 'Still failing:')}  ${chalk.red(String(stillFailing))}`)
     }
 
-    if (result.filesAlreadyPassing > 0 && !flags['fix-polluters']) {
+    // The pollution hint only makes sense for suite-failure selection — in --types mode a
+    // "skipped" file is a type-clean false match, not a pollution victim.
+    if (result.filesAlreadyPassing > 0 && !flags['fix-polluters'] && !flags.types) {
       this.log(chalk.dim(`\n  ${result.filesAlreadyPassing} file(s) passed in isolation but fail in the suite. Use --fix-polluters to bisect + regenerate them.`))
     }
 
@@ -136,14 +148,14 @@ export default class Fix extends Command {
     if (result.filesProcessed === 0) {
       this.exit(0)
     } else if (stillFailing === 0) {
-      if (result.filesAlreadyPassing > 0 && result.filesFixed === 0) {
+      if (result.filesAlreadyPassing > 0 && result.filesFixed === 0 && !flags.types) {
         this.log(chalk.yellow(`\n  No tests were repaired — all skipped as already passing. Run lacuna fix --fresh to re-scan.`))
         this.exit(1)
       }
-      this.log(chalk.green('\n  All failing tests fixed.'))
+      this.log(chalk.green(flags.types ? '\n  All type errors fixed.' : '\n  All failing tests fixed.'))
       this.exit(0)
     } else {
-      this.log(chalk.yellow(`\n  ${stillFailing} file(s) still failing. Re-run lacuna fix or check errors above.`))
+      this.log(chalk.yellow(`\n  ${stillFailing} file(s) ${flags.types ? 'still have type errors' : 'still failing'}. Re-run lacuna fix or check errors above.`))
       this.exit(1)
     }
   }

@@ -22,6 +22,7 @@ npm version "$BUMP" --no-git-tag-version
 VERSION=$(node -p "require('./package.json').version")
 
 npm run build
+npx oclif manifest
 
 git add .
 git commit -m "chore: release v${VERSION}"

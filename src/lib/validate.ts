@@ -23,10 +23,33 @@ export function hasPlaceholderBodies(code: string): boolean {
   return /\{\s*\/\/\s*(body|todo|implement(?:ation)?|placeholder|stub|fill\s*in|your\s*code)\s*\}/i.test(code)
 }
 
-// If the runner output indicates "no tests found", replace it with a
-// clear instruction so the AI knows exactly what went wrong.
-export function enrichNoTestsError(output: string): string {
-  if (!/no tests|0 tests?\b/i.test(output)) return output
+// Returns true when the runner output shows that zero tests were collected.
+// Distinct from hasTestFunctions (static check) — this checks actual runtime collection.
+// Handles:
+//   - Vitest summary "Tests  0 total" or "Tests  no tests"
+//   - Jest summary "Tests: 0 total"
+//   - Common "no tests found" / "found 0 tests" messages
+// NOTE: Vitest per-file listing lines like "foo.test.ts (0 test)" are NOT zero-test
+// signals — that interim count updates as tests resolve; the summary line is authoritative.
+// We do NOT match bare "0 test" (with word boundary) because of that false-positive.
+//
+// AUTHORITATIVE COUNT GUARD: if the summary reports ANY passed or failed test, tests WERE
+// collected — even if a failing test's name or assertion message happens to contain the
+// phrase "no tests found" / "found 0 tests". Those substrings are unanchored and would
+// otherwise false-positive on a run like "11 failed | 17 passed (28)". The pass/fail counts
+// come from the authoritative Tests summary line, so they override the substring match.
+export function isZeroTestsOutput(raw: string): boolean {
+  if (parsePassCount(raw) > 0 || parseFailCount(raw) > 0) return false
+  return /Tests:?\s+(?:0\s+total|no tests)\b|no tests? found|found 0 tests/i.test(raw)
+}
+
+// If the runner output indicates "no tests found", replace it with a clear instruction
+// so the AI knows exactly what went wrong. The zero-tests decision is made on `rawOutput`
+// (the full runner output, which still carries the authoritative Tests summary line);
+// `extracted` is the already-trimmed failure text that gets returned/appended. Callers that
+// only have one string can omit `rawOutput` — it defaults to `extracted`.
+export function enrichNoTestsError(extracted: string, rawOutput: string = extracted): string {
+  if (!isZeroTestsOutput(rawOutput)) return extracted
   return (
     'ERROR: Vitest found 0 tests in this file. The file ran but had nothing to execute.\n\n' +
     'This means one of:\n' +
@@ -39,14 +62,8 @@ export function enrichNoTestsError(output: string): string {
     '  })\n\n' +
     'DO NOT wrap tests inside a function. Put them directly inside describe() or at the top level.\n\n' +
     'Original runner output:\n' +
-    output
+    extracted
   )
-}
-
-// Returns true when the runner output shows that zero tests were collected.
-// Distinct from hasTestFunctions (static check) — this checks actual runtime collection.
-export function isZeroTestsOutput(raw: string): boolean {
-  return /Tests:\s+0\s+total|no tests found|found 0 tests/i.test(raw)
 }
 
 // Extracts the number of passing tests from the runner summary footer.
@@ -59,6 +76,15 @@ export function parsePassCount(output: string): number {
   // Fallback: any "N passed" in the output
   const m = output.match(/(\d+)\s+passed/)
   return m ? parseInt(m[1], 10) : 0
+}
+
+// Extracts the number of failing tests from the runner summary footer.
+// Anchored to the "Tests  N failed | M passed" line specifically — the word "failed"
+// appears in too many noise lines (per-test FAIL markers, stack frames) to match loosely.
+// Used alongside parsePassCount to prove tests were actually collected.
+export function parseFailCount(output: string): number {
+  const summaryLine = output.match(/^\s*Tests\b[^\n]*?(\d+)\s+failed/m)
+  return summaryLine ? parseInt(summaryLine[1], 10) : 0
 }
 
 // Strips leading prose/thinking lines from generated code output.
@@ -426,7 +452,10 @@ export interface PatchOperation {
 export function parsePatch(patchOutput: string): PatchOperation[] {
   const ops: PatchOperation[] = []
   const lines = patchOutput.split('\n')
-  const headerRe = /^\/\/ @@@ (REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):\s*(?:"(.*)")?/
+  // Capture the anchor either quoted ("name") or unquoted (name).
+  // Group 2 = quoted text, group 3 = unquoted text. DeepSeek and other models
+  // often drop the double-quotes, so we accept both forms.
+  const headerRe = /^\/\/ @@@ (REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):\s*(?:"([^"]*)"|(.*\S))?/
   const withRe = /^\/\/ @@@ WITH:\s*$/
   const endRe = /^\/\/ @@@ END\s*$/
 
@@ -461,7 +490,7 @@ export function parsePatch(patchOutput: string): PatchOperation[] {
       if (content.endsWith('\n')) content = content.slice(0, -1)
       ops.push({ type, anchor, content })
     } else {
-      const anchor = m[2] ?? ''  // ADD_IMPORT / ADD_AFTER_IMPORTS have no anchor
+      const anchor = (m[2] ?? m[3] ?? '').trim()  // quoted OR unquoted; ADD_IMPORT/ADD_AFTER_IMPORTS have no anchor
       const contentLines: string[] = []
       while (i < lines.length && !endRe.test(lines[i])) {
         contentLines.push(lines[i])
@@ -475,6 +504,44 @@ export function parsePatch(patchOutput: string): PatchOperation[] {
     }
   }
   return ops
+}
+
+// Finds the start and end character positions of `anchor` within `code`.
+// First tries exact match; if that fails, tries a line-by-line match that
+// trims trailing whitespace from each line (handles trailing spaces and CRLF files).
+// Returns the range in the ORIGINAL (un-normalized) code so the replacement is clean.
+function findAnchorRange(code: string, anchor: string): { start: number; end: number } | null {
+  // Fast path: exact match
+  const exactIdx = code.indexOf(anchor)
+  if (exactIdx !== -1) return { start: exactIdx, end: exactIdx + anchor.length }
+
+  // Fallback: trim trailing whitespace (including \r) on every line and re-compare.
+  // Handles trailing spaces left by editors and CRLF files (\r stripped by trimEnd).
+  const anchorLines = anchor.split('\n').map(l => l.trimEnd())
+  const codeLines = code.split('\n')
+  const n = anchorLines.length
+  if (n === 0) return null
+
+  // Precompute byte offset of each line start — O(N) once, avoids O(N²) inner accumulation.
+  const lineStart: number[] = new Array(codeLines.length + 1)
+  lineStart[0] = 0
+  for (let k = 0; k < codeLines.length; k++) {
+    lineStart[k + 1] = lineStart[k] + codeLines[k].length + 1  // +1 for the \n separator
+  }
+
+  for (let i = 0; i <= codeLines.length - n; i++) {
+    if (codeLines[i].trimEnd() !== anchorLines[0]) continue
+    let match = true
+    for (let j = 1; j < n; j++) {
+      if (codeLines[i + j].trimEnd() !== anchorLines[j]) { match = false; break }
+    }
+    if (!match) continue
+    const start = lineStart[i]
+    // end = start of line after the match minus the \n, i.e. the span of the matched lines joined
+    const end = start + codeLines.slice(i, i + n).join('\n').length
+    return { start, end }
+  }
+  return null
 }
 
 // Finds the end of an it()/test()/describe() call starting at `startIdx` in `code`.
@@ -575,9 +642,11 @@ export function applyPatch(existingCode: string, ops: PatchOperation[]): string 
     if (op.type === 'REPLACE') {
       // General text replacement — same mechanism as the Edit tool.
       // anchor = exact old text, content = replacement. First occurrence only.
-      if (!code.includes(op.anchor)) return null
-      const idx = code.indexOf(op.anchor)
-      code = code.slice(0, idx) + op.content + code.slice(idx + op.anchor.length)
+      // Falls back to trailing-whitespace-normalized line matching so that minor
+      // formatting differences (trailing spaces, CRLF files) don't cause failures.
+      const range = findAnchorRange(code, op.anchor)
+      if (!range) return null
+      code = code.slice(0, range.start) + op.content + code.slice(range.end)
 
     } else if (op.type === 'REPLACE_TEST' || op.type === 'DELETE_TEST') {
       const anchor = op.anchor
@@ -802,6 +871,23 @@ export function tryApplyPatch(existingCode: string, patchOutput: string): string
   return applyPatch(existingCode, ops)
 }
 
+export interface PatchApplyOk { ok: true; result: string }
+export interface PatchApplyFail { ok: false; failedOp: PatchOperation | null; opsCount: number }
+
+// Like tryApplyPatch but surfaces which operation failed, so callers can build
+// a useful error message pointing the model at the exact anchor that didn't match.
+export function tryApplyPatchWithDiag(existingCode: string, patchOutput: string): PatchApplyOk | PatchApplyFail {
+  const ops = parsePatch(patchOutput)
+  if (ops.length === 0) return { ok: false, failedOp: null, opsCount: 0 }
+  let code = existingCode
+  for (const op of ops) {
+    const result = applyPatch(code, [op])
+    if (result === null) return { ok: false, failedOp: op, opsCount: ops.length }
+    code = result
+  }
+  return { ok: true, result: code }
+}
+
 // ---------------------------------------------------------------------------
 // Mock file patch — surgical edits without rewriting the whole file.
 //
@@ -892,12 +978,12 @@ export function applyMocksPatch(existing: string, ops: MockPatchOperation[]): { 
 
   for (const op of ops) {
     if (op.type === 'REPLACE') {
-      if (!code.includes(op.oldText)) {
+      const range = findAnchorRange(code, op.oldText)
+      if (!range) {
         failedOps.push(op)
         continue
       }
-      // Replace only the first occurrence — same as Edit tool
-      code = code.slice(0, code.indexOf(op.oldText)) + op.newText + code.slice(code.indexOf(op.oldText) + op.oldText.length)
+      code = code.slice(0, range.start) + op.newText + code.slice(range.end)
 
     } else if (op.type === 'APPEND_EXPORT') {
       // Insert before the last beforeEach block, or at end of file if none

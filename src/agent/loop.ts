@@ -15,7 +15,7 @@ import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError,
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile } from '../lib/typecheck.js'
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -109,6 +109,19 @@ export async function processGap(
   let firstPassCount = 0                    // passing tests on attempt 1
   let stallRetries = 0
   const MAX_STALL_RETRIES = 2
+  let consecutivePatchFailures = 0
+
+  // Best collecting attempt seen so far — used on failure to keep a net-improving partial
+  // result (which `lacuna fix` can finish) instead of discarding work. Only attempts that
+  // actually collected tests qualify, so a fence-broken / 0-test file is never kept.
+  let bestCode: string | null = null
+  let bestPassCount = -1
+
+  // Running base for patch-mode application. Starts as the original test file and is updated
+  // to the written content after each attempt, so a retry that patches a test ADDED by an
+  // earlier attempt anchors against the current file — not the frozen original (which would
+  // fail with "anchor not found").
+  let patchBase = context.existingTestCode
 
   for (let attempt = 1; attempt <= config.maxIterations; attempt++) {
     if (!onStatus) {
@@ -194,24 +207,45 @@ export async function processGap(
     }
 
     // Patch mode: model returned surgical edits — apply them to get the complete file
-    if (generator.isPatch && context.existingTestCode) {
-      const patched = tryApplyPatch(context.existingTestCode, generatedCode)
-      if (patched !== null) {
-        generatedCode = patched
+    if (generator.isPatch && patchBase) {
+      const patchResult = tryApplyPatchWithDiag(patchBase, generatedCode)
+      if (patchResult.ok) {
+        generatedCode = patchResult.result
+        consecutivePatchFailures = 0
       } else {
-        // Anchor(s) not found — do NOT write raw patch markers to disk
-        lastError =
-          'PATCH APPLICATION FAILED: one or more anchor strings in your patch were not found in the test file.\n' +
-          'Anchors must be copied character-for-character (including quote style) from the CURRENT TEST FILE shown above.\n' +
-          'Checklist:\n' +
-          '  • REPLACE_TEST / DELETE_TEST anchor = exact it/test name already in the file\n' +
-          '  • ADD_AFTER_DESCRIBE anchor = exact describe() name already in the file\n' +
-          '  • For a brand-new test, use ADD_AFTER_DESCRIBE with the enclosing describe name\n' +
-          'Re-read the test file, find the exact anchor names, and rewrite your patch.'
+        consecutivePatchFailures++
+
+        if (consecutivePatchFailures >= 2) {
+          // Escape hatch: after 2 failed patches the model can't anchor correctly.
+          // Force a full-file rewrite on the next attempt so it bypasses patch matching entirely.
+          lastError =
+            `PATCH ANCHORS FAILED ${consecutivePatchFailures} TIMES — SWITCH TO FULL REWRITE MODE.\n` +
+            `Your patch is not matching the file. On this attempt you MUST use <code_output> (NOT <code_patch>) and output the COMPLETE test file.\n` +
+            `Include every existing test verbatim and add the new ones you need.\n` +
+            `Do NOT use <code_patch> this time.`
+        } else {
+          // Give the model the exact anchor text that failed so it can correct it
+          const failedOp = patchResult.failedOp
+          const anchorBlock = failedOp
+            ? `\nFailed operation: ${failedOp.type}\nAnchor that was NOT found in the file:\n"""\n${failedOp.anchor.slice(0, 600)}\n"""`
+            : ''
+          lastError =
+            `PATCH APPLICATION FAILED: an anchor string in your patch was not found in the test file.${anchorBlock}\n\n` +
+            `The anchor must be character-for-character identical to the text in the EXISTING TEST FILE shown in the original prompt.\n` +
+            `Checklist:\n` +
+            `  • REPLACE_TEST / DELETE_TEST anchor = exact it/test name string (without quotes)\n` +
+            `  • ADD_AFTER_DESCRIBE anchor = exact describe() name string\n` +
+            `  • REPLACE anchor = entire text block copied verbatim from the test file\n` +
+            `Re-read the test file in the original prompt, locate the exact text, and rewrite your patch.`
+        }
+
         if (!onStatus) log(chalk.yellow(`  Patch anchors not found — retrying...`))
         onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations } as WorkerState)
         continue
       }
+    } else if (!generator.isPatch) {
+      // Model switched to (or stayed in) full-file mode — reset patch failure counter
+      consecutivePatchFailures = 0
     }
 
     // Strip thinking/prose that leaked before the first real code line.
@@ -285,6 +319,9 @@ export async function processGap(
     onStatus?.({ phase: 'writing', file: shortPath })
     await mkdir(dirname(context.suggestedTestFile), { recursive: true })
     await writeFile(context.suggestedTestFile, testCode, 'utf-8')
+    // Next patch-mode retry anchors against what's actually on disk now (including tests this
+    // attempt added/changed), not the frozen original.
+    patchBase = testCode
 
     if (!onStatus) log(chalk.dim(`  Written. Running tests...`))
     onStatus?.({ phase: 'running', file: shortPath })
@@ -317,7 +354,8 @@ export async function processGap(
         }
         // Last attempt — tests pass even though type errors remain.
         // Report as passed rather than discarding a working test file.
-        if (!onStatus) log(chalk.yellow(`  ⚠ Type errors remain — tests pass. Run lacuna fix to clean up types.`))
+        const relTest = context.suggestedTestFile.replace(cwd + '/', '')
+        if (!onStatus) log(chalk.yellow(`  ⚠ Type errors remain — tests pass. Run \`lacuna fix --file ${relTest}\` to clean up types.`))
       } else {
         if (!onStatus) log(chalk.green(`  Tests passed.`))
       }
@@ -327,8 +365,13 @@ export async function processGap(
 
     const rawRunOutput = runResult.stdout + '\n' + runResult.stderr
     const rawExtracted = extractTestFailure(rawRunOutput)
-    const extracted = enrichNoTestsError(rawExtracted)
+    const extracted = enrichNoTestsError(rawExtracted, rawRunOutput)
     const passCount = parsePassCount(rawRunOutput)
+
+    if (!isZeroTestsOutput(rawRunOutput) && passCount > bestPassCount) {
+      bestPassCount = passCount
+      bestCode = testCode
+    }
 
     if (attempt === 1) {
       firstError = extracted
@@ -349,13 +392,35 @@ export async function processGap(
   }
 
   onStatus?.({ phase: 'failed', file: shortPath })
-  if (originalTestContent !== null) {
-    // Pre-existing file — restore it so the workspace stays coherent
-    await restoreTestFile(context.suggestedTestFile, originalTestContent)
-  } else {
-    // New file — keep the last attempt on disk so `lacuna fix` can repair it
-    if (!onStatus) log(chalk.yellow(`\n  Last attempt kept at ${context.suggestedTestFile.replace(cwd + '/', '')} — run ${chalk.cyan('lacuna fix')} to repair it`))
+  const rel = context.suggestedTestFile.replace(cwd + '/', '')
+  const keepHint = () => {
+    if (!onStatus) log(chalk.yellow(`\n  Kept ${bestPassCount} passing test(s) at ${rel} — run ${chalk.cyan(`lacuna fix --file ${rel}`)} to repair the remaining failures`))
   }
+
+  if (originalTestContent === null) {
+    // New file — keep the best collecting attempt so `lacuna fix` can repair it.
+    if (bestCode !== null) { await writeFile(context.suggestedTestFile, bestCode, 'utf-8'); keepHint() }
+    else if (!onStatus) log(chalk.yellow(`\n  Last attempt kept at ${rel} — run ${chalk.cyan(`lacuna fix --file ${rel}`)} to repair it`))
+  } else if (parallel && bestCode !== null) {
+    // Existing file with a clean, collecting attempt. Keep it ONLY if it adds net-new passing
+    // tests vs the original — otherwise the generated tests broke the suite or added no value,
+    // so restore the original. parallel ⇒ testCmd is file-scoped, so parsePassCount reflects
+    // this file and the comparison is sound. Measure the baseline lazily (only here on failure).
+    await writeFile(context.suggestedTestFile, originalTestContent, 'utf-8')
+    const baseRun = await runCommand(testCmd, cwd)
+    const baselinePassCount = parsePassCount(baseRun.stdout + '\n' + baseRun.stderr)
+    if (bestPassCount > baselinePassCount) {
+      await writeFile(context.suggestedTestFile, bestCode, 'utf-8')
+      keepHint()
+    } else if (!onStatus) {
+      log(chalk.dim(`\n  Generated tests didn't improve on the existing file (${baselinePassCount} passing) — restored the original.`))
+    }
+  } else {
+    // Existing file under a full-suite run (per-file pass count not measurable) or no clean
+    // attempt — restore the original so the workspace stays coherent.
+    await restoreTestFile(context.suggestedTestFile, originalTestContent)
+  }
+
   return {
     success: false,
     error: `Tests still failing after ${config.maxIterations} attempts. Last error:\n${lastError?.slice(0, 1500)}`,

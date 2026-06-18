@@ -15,7 +15,7 @@ import { processGap } from './loop.js'
 import type { CoverageGap } from '../lib/coverage/types.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
-import { typeCheckFile } from '../lib/typecheck.js'
+import { typeCheckFile, findTestFilesWithTypeErrors } from '../lib/typecheck.js'
 import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
@@ -31,12 +31,19 @@ export interface FixOptions {
   fresh?: boolean
   regenerateOnFailure?: boolean
   fixPolluters?: boolean
+  types?: boolean   // select files by type errors (not test failures); repair type-only issues
   log: (msg: string) => void
 }
 
 // ─── Failing-files cache ──────────────────────────────────────────────────────
 
 const FIX_CACHE_TTL_S = 1800 // 30 minutes
+
+// Regenerate-on-failure only attempts a from-scratch rewrite when the file has FEWER than
+// this many passing tests. A file with a substantial passing suite is repaired, never nuked
+// and rebuilt — regenerating it from scratch is slow and almost never reproduces the suite.
+// (regenerateFile additionally never keeps a regen that reduces the passing count.)
+const REGEN_MAX_BASELINE_PASS = 10
 
 function fixCachePath(cwd: string): string {
   return join(cwd, '.lacuna-fix-cache.json')
@@ -229,7 +236,7 @@ async function fixFile(
   generator: TestGenerator,
   onStatus?: (state: WorkerState) => void,
   projectMemory?: string | null,
-): Promise<{ success: boolean; skipped?: boolean; error?: string }> {
+): Promise<{ success: boolean; skipped?: boolean; error?: string; typeOnly?: boolean; baselinePassCount?: number }> {
   const { config, env, cwd, dryRun, verbose, log } = options
   const shortPath = testFilePath.replace(cwd + '/', '')
   const absTestPath = testFilePath.startsWith('/') ? testFilePath : join(cwd, testFilePath)
@@ -239,13 +246,25 @@ async function fixFile(
 
   // Run just this test file to get focused error output
   const firstRun = await runCommand(fileTestCommand(env, absTestPath), cwd, 60_000)
+  let typeErrorsAtStart: string | null = null
   if (firstRun.success) {
-    if (!onStatus) log(chalk.dim('  Already passing — skipping.'))
-    onStatus?.({ phase: 'passed', file: shortPath })
-    return { success: true, skipped: true }
+    // Tests pass. In targeted (--file) or --types mode, a green file may still have
+    // TypeScript errors the runner ignores (it transpiles, doesn't type-check) — repair
+    // those rather than skip, otherwise generate's "run lacuna fix --file …" hand-off and
+    // `lacuna fix --types` are dead ends. Default full-suite mode keeps skipping so
+    // pollution-victim accounting is untouched.
+    typeErrorsAtStart = (options.targetFile || options.types) ? await typeCheckFile(absTestPath, cwd, env) : null
+    if (!typeErrorsAtStart) {
+      if (!onStatus) log(chalk.dim('  Already passing — skipping.'))
+      onStatus?.({ phase: 'passed', file: shortPath })
+      return { success: true, skipped: true }
+    }
+    if (!onStatus) log(chalk.yellow('  Tests pass but type errors found — repairing types.'))
   }
 
-  let errorOutput = extractTestFailure(firstRun.stdout + '\n' + firstRun.stderr)
+  let errorOutput = typeErrorsAtStart
+    ? `Tests pass but the test file has TypeScript type errors:\n${typeErrorsAtStart}\n\nFix ALL type errors without changing test behavior. Do not use 'as any' or '@ts-ignore'.`
+    : extractTestFailure(firstRun.stdout + '\n' + firstRun.stderr)
   const initialErrorOutput = errorOutput
   const baselinePassCount = parsePassCount(firstRun.stdout + '\n' + firstRun.stderr)
 
@@ -498,11 +517,21 @@ async function fixFile(
         continue
       }
       const typeErrors = await typeCheckFile(absTestPath, cwd, env)
-      if (typeErrors) {
+      if (typeErrors && typeErrorsAtStart !== null) {
+        // Type-cleanup mode: the file's tests already passed at start (generate→fix handoff or
+        // --types), so type errors ARE the goal — keep retrying to clear them.
         errorOutput = `Tests passed but TypeScript type errors were found:\n${typeErrors}\n\nFix ALL type errors. Do not use 'as any' or '@ts-ignore'.`
-        if (!onStatus) log(chalk.yellow('  Type errors found — retrying...'))
+        if (!onStatus) log(chalk.yellow('  Tests pass but type errors found — retrying...'))
         onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations })
         continue
+      }
+      if (typeErrors) {
+        // Test-repair mode: the failing test(s) now PASS — that IS the fix. Residual type
+        // errors (often just implicit-any in mocks) must not make us burn retries or revert to
+        // the broken original. Keep the passing fix; surface the types as a follow-up.
+        if (!onStatus) log(chalk.yellow('  ⚠ Tests now pass — keeping the fix. Type errors remain; run `lacuna fix --types` to clean them up.'))
+        onStatus?.({ phase: 'passed', file: shortPath })
+        return { success: true }
       }
       if (!onStatus) log(chalk.green('  Fixed.'))
       onStatus?.({ phase: 'passed', file: shortPath })
@@ -516,7 +545,7 @@ async function fixFile(
     // enrichNoTestsError adds guidance for genuinely missing test functions;
     // in the structure-broken path the issue is always a broken import, so use
     // rawExtracted there so the actual module error isn't buried in boilerplate.
-    const extracted = enrichNoTestsError(rawExtracted)
+    const extracted = enrichNoTestsError(rawExtracted, rawRunOutput)
 
     if (structureBroken) {
       errorOutput = buildStructureBrokenMessage(initialErrorOutput, rawExtracted)
@@ -531,12 +560,17 @@ async function fixFile(
     if (!onStatus && verbose) log(chalk.dim(errorOutput.split('\n').slice(0, 20).join('\n')))
   }
 
-  // Restore original test file — don't leave broken AI code on disk
+  // Restore original test file — don't leave broken AI code on disk.
+  // For a type-only repair this puts back the passing (but type-erroring) file, which is
+  // strictly better than a regenerated guess — so the caller must NOT regenerate it.
   await writeFile(absTestPath, testCode, 'utf-8').catch(() => {})
   onStatus?.({ phase: 'failed', file: shortPath })
+  const typeOnly = firstRun.success
   return {
     success: false,
-    error: `Still failing after ${config.maxIterations} attempts. Last error:\n${errorOutput.slice(0, 1500)}`,
+    typeOnly,
+    baselinePassCount,
+    error: `${typeOnly ? 'Type errors remain' : 'Still failing'} after ${config.maxIterations} attempts. Last error:\n${errorOutput.slice(0, 1500)}`,
   }
 }
 
@@ -741,6 +775,7 @@ async function regenerateFile(
   options: FixOptions,
   onStatus?: (state: WorkerState) => void,
   projectMemory?: string | null,
+  baselinePassCount = 0,
 ): Promise<{ success: boolean; error?: string }> {
   const absTestFile = testFilePath.startsWith('/') ? testFilePath : join(options.cwd, testFilePath)
 
@@ -750,6 +785,11 @@ async function regenerateFile(
   if (!sourceFile) {
     return { success: false, error: `Could not find source file for ${absTestFile}` }
   }
+
+  // Back up the current content so a failed regeneration never leaves the file deleted or
+  // filled with a broken last attempt — on failure we restore exactly what was here.
+  let originalContent: string | null = null
+  try { originalContent = await readFile(absTestFile, 'utf-8') } catch { /* already gone */ }
 
   // Delete the broken test file before regenerating. If it stays on disk,
   // buildFileContext reads it as existingTestCode and the generate prompt says
@@ -775,6 +815,23 @@ async function regenerateFile(
     : undefined
 
   const result = await processGap(gap, options, generator, true, regenOnStatus, projectMemory, absTestFile)
+
+  if (result.success) {
+    // Never-regress: a "green" regen with fewer tests than the original is still a net loss
+    // (e.g. 50 passing replacing 477). Re-run the regenerated file and keep it only if it has
+    // at least as many passing tests as the original — otherwise restore the original.
+    const regenRun = await runCommand(fileTestCommand(options.env, absTestFile), options.cwd, 60_000)
+    const regenPass = parsePassCount(regenRun.stdout + '\n' + regenRun.stderr)
+    if (regenPass < baselinePassCount && originalContent !== null) {
+      await writeFile(absTestFile, originalContent, 'utf-8').catch(() => {})
+      return { success: false, error: `Regeneration produced fewer passing tests (${regenPass}) than the original (${baselinePassCount}) — restored the original.` }
+    }
+    return { success: true }
+  }
+
+  // Regeneration failed — restore the original so we never leave the workspace worse than we
+  // found it (deleted, or holding a truncated/garbage attempt).
+  if (originalContent !== null) await writeFile(absTestFile, originalContent, 'utf-8').catch(() => {})
   return { success: result.success, error: result.error }
 }
 
@@ -822,11 +879,16 @@ async function runFixWorkers(
         if (result.success) {
           if (result.skipped) { filesAlreadyPassing++; victimFiles.push(absFile) }
           else filesFixed++
-        } else if (options.regenerateOnFailure) {
+        } else if (options.regenerateOnFailure && !options.types && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
+          // Regenerate from scratch only for mostly-broken files (few passing tests) — that's
+          // where a fresh take rescues stuck tests. A file with a substantial passing suite is
+          // left restored by fixFile, never nuked. Skip too for type-only/--types repairs, and
+          // when the baseline is unknown (?? Infinity ⇒ don't risk it). regenerateFile itself
+          // also discards any regen that lowers the passing count.
           // Signal 'regenerating' first — this undoes the 'failed' done-count from fixFile
           // so the regen's final phase is the single counted outcome for this file.
           onStatus?.({ phase: 'regenerating', file: absFile.replace(options.cwd + '/', '') })
-          const regenResult = await regenerateFile(absFile, workerOptions, onStatus, projectMemory)
+          const regenResult = await regenerateFile(absFile, workerOptions, onStatus, projectMemory, result.baselinePassCount ?? 0)
           if (regenResult.success) {
             filesFixed++
           } else {
@@ -854,7 +916,24 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
 
   let failingFiles: string[]
 
-  if (options.targetFile) {
+  if (options.types && !options.targetFile) {
+    // Types mode: select by type errors rather than test failures. One project-wide tsc
+    // finds every test file that fails type-checking — including files whose tests pass,
+    // which the normal failure-driven selection never sees.
+    if (env.language !== 'typescript') {
+      log(chalk.yellow('\n  --types only applies to TypeScript projects — nothing to do.'))
+      return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
+    }
+    const spinner = startCoverageSpinner(chalk.dim('  Type-checking project to find test files with type errors...'), env.testRunner)
+    const allTestFiles = await discoverTestFiles(cwd, env)
+    failingFiles = await findTestFilesWithTypeErrors(allTestFiles, cwd, env)
+    spinner.stop()
+
+    if (failingFiles.length === 0) {
+      log(chalk.green('\n  All test files are type-clean — nothing to fix.'))
+      return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
+    }
+  } else if (options.targetFile) {
     // Single-file mode: skip the full suite run, go straight to the target file
     const absTarget = options.targetFile.startsWith('/')
       ? options.targetFile
@@ -864,8 +943,15 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
     spinner.stop()
 
     if (fileResult.success) {
-      log(chalk.green('\n  All tests are passing — nothing to fix.'))
-      return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
+      // Tests pass — but the runner only transpiles, it doesn't type-check. A green file
+      // can still have TypeScript errors (the exact case `generate` hands off here). Only
+      // declare victory if the file is also type-clean; otherwise fall through and repair.
+      const typeErrors = await typeCheckFile(absTarget, cwd, env)
+      if (!typeErrors) {
+        log(chalk.green('\n  All tests are passing — nothing to fix.'))
+        return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
+      }
+      log(chalk.yellow('\n  Tests pass but TypeScript type errors remain — repairing types.'))
     }
 
     failingFiles = [absTarget]
@@ -916,7 +1002,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
     }
   }
 
-  log(chalk.bold(`\n  Found ${failingFiles.length} failing test file(s).`))
+  log(chalk.bold(`\n  Found ${failingFiles.length} ${options.types ? 'test file(s) with type errors' : 'failing test file(s)'}.`))
   if (parallel) {
     if (options.verbose) log(chalk.dim(`  (--verbose is not shown in parallel mode — use --workers 1 to see the live code panel)`))
     log(chalk.dim(`\n  Workers: ${workerCount}\n`))
@@ -964,9 +1050,11 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       if (result.success) {
         if (result.skipped) { filesAlreadyPassing++; victimFiles.push(absFile) }
         else filesFixed++
-      } else if (options.regenerateOnFailure) {
+      } else if (options.regenerateOnFailure && !options.types && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
+        // Regenerate only for mostly-broken files (few passing tests) — see runFixWorkers.
+        // A substantial passing suite is left restored by fixFile, never nuked + rebuilt.
         log(chalk.yellow(`  Fix exhausted — falling back to full regeneration...`))
-        const regenResult = await regenerateFile(absFile, options, undefined, memory.toPromptSection())
+        const regenResult = await regenerateFile(absFile, options, undefined, memory.toPromptSection(), result.baselinePassCount ?? 0)
         if (regenResult.success) {
           filesFixed++
         } else {
@@ -984,7 +1072,9 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
   // This means the next `lacuna fix` run skips the full suite and picks up exactly
   // where we left off. If everything was fixed, delete the cache so the next run
   // does a clean suite scan to confirm.
-  if (!options.targetFile) {
+  // Skip in --types mode: it selects by type errors, not the suite-failure axis the
+  // cache represents, so it must not overwrite the failing-files cache.
+  if (!options.targetFile && !options.types) {
     if (stillFailingFiles.length > 0) await saveFixCache(cwd, stillFailingFiles)
     else await clearFixCache(cwd)
   }

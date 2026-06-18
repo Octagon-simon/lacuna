@@ -8,6 +8,10 @@ import { detectEnvironment } from '../lib/detector.js'
 import { PRESETS } from '../lib/providers/index.js'
 import type { LacunaConfig } from '../lib/config.js'
 
+// Hosted JSON Schema for .lacuna.json — gives editor key completion + hover docs.
+// Hosted (not a node_modules path) because lacuna installs globally, so there's no local copy.
+const LACUNA_SCHEMA_URL = 'https://raw.githubusercontent.com/Octagon-simon/lacuna/main/lacuna.schema.json'
+
 interface ProjectMeta {
   isReact: boolean
   isReactNative: boolean
@@ -776,7 +780,9 @@ export default class Init extends Command {
     if (setupFile)   config.setupFile = setupFile
 
     const clean = Object.fromEntries(Object.entries(config).filter(([, v]) => v !== undefined))
-    await writeFile(configPath, JSON.stringify(clean, null, 2) + '\n')
+    // $schema first so editors (VS Code, etc.) offer key completion + hover docs in .lacuna.json.
+    const withSchema = { $schema: LACUNA_SCHEMA_URL, ...clean }
+    await writeFile(configPath, JSON.stringify(withSchema, null, 2) + '\n')
 
     // ── Summary ───────────────────────────────────────────────────────────────
 
