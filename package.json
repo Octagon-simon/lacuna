@@ -19,10 +19,11 @@
   "files": [
     "/bin",
     "/dist",
-    "/oclif.manifest.json"
+    "/oclif.manifest.json",
+    "/lacuna.schema.json"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && node scripts/generate-schema.mjs",
     "watch": "tsc -p tsconfig.json --watch",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write 'src/**/*.ts'",
@@ -48,7 +49,8 @@
     "eslint": "^9",
     "prettier": "^3",
     "ts-node": "^10",
-    "typescript": "^5"
+    "typescript": "^5",
+    "zod-to-json-schema": "^3.25.2"
   },
   "engines": {
     "node": ">=20.0.0"

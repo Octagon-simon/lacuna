@@ -2,38 +2,49 @@ import { cosmiconfig } from 'cosmiconfig'
 import { z } from 'zod'
 import { PRESETS } from './providers/types.js'
 
-const ConfigSchema = z.object({
-  testRunner: z.enum(['jest', 'vitest', 'pytest', 'mocha', 'go-test', 'phpunit', 'pest', 'rspec', 'cargo-test', 'dotnet-test', 'gradle-test', 'maven-test', 'swift-test']).optional(),
-  coverageFormat: z.enum(['lcov', 'json-summary', 'cobertura']).default('lcov'),
-  coverageDir: z.string().default('coverage'),
-  // sourceDir accepts a string OR an array — both are normalised to string[] internally.
-  // Use an array when source files live in multiple top-level dirs (e.g. ["src", "lib", "utils"]).
-  sourceDir: z.union([z.string(), z.array(z.string())]).default('src').transform(
-    (v): string[] => (Array.isArray(v) ? v : [v]),
-  ),
-  threshold: z.number().min(0).max(100).default(80),
-  maxIterations: z.number().min(1).max(10).default(3),
-  coverageTimeout: z.number().min(30).default(300),   // seconds; kills hung test suite
-  testDir: z.string().optional(),
-  ignore: z.array(z.string()).default([]),
-  // mock configuration
-  mocksFile: z.string().optional(),     // path to shared mock file (e.g. src/test/mocks.ts)
-  setupFile: z.string().optional(),     // path to test setup file (e.g. src/test/setup.ts)
-  // provider config
-  provider: z.enum(['anthropic', 'openai-compatible']).default('openai-compatible'),
-  model: z.string().default('deepseek-chat'),
-  baseURL: z.string().default('https://api.deepseek.com/v1'),
-  apiKeyEnv: z.string().default('DEEPSEEK_API_KEY'),
-  maxTokens: z.number().min(1024).max(128000).default(16000),
-  // Override the test command lacuna uses to scan for failures / run coverage.
-  // By default lacuna auto-detects (e.g. "npx jest", "npx vitest run --coverage").
-  // Use this when you want to add flags: { "testCommand": "npx jest --no-coverage" }
-  testCommand: z.string().optional(),
-  // Environment variables injected into every test-runner invocation.
-  // Useful for monorepos where the test suite needs NODE_CONFIG_DIR, APP_ENV, etc.
-  // set to values that differ from the lacuna process environment.
-  // Example: { "NODE_CONFIG_DIR": "packages/server/config" }
-  testEnv: z.record(z.string()).default({}),
+// NOTE: the .describe() text on each field is the single source of truth for both code
+// readers AND the generated JSON Schema (lacuna.schema.json) that powers editor completion
+// and hover docs in .lacuna.json. Keep descriptions concise and user-facing.
+export const ConfigSchema = z.object({
+  testRunner: z.enum(['jest', 'vitest', 'pytest', 'mocha', 'go-test', 'phpunit', 'pest', 'rspec', 'cargo-test', 'dotnet-test', 'gradle-test', 'maven-test', 'swift-test']).optional()
+    .describe('Test runner. Auto-detected from your project dependencies if omitted.'),
+  coverageFormat: z.enum(['lcov', 'json-summary', 'cobertura']).default('lcov')
+    .describe('Coverage report format your test runner produces.'),
+  coverageDir: z.string().default('coverage')
+    .describe('Directory where your test runner writes its coverage report.'),
+  sourceDir: z.union([z.string(), z.array(z.string())]).default('src')
+    .describe('Source directory (or directories) to scan for coverage gaps. A string, or an array like ["src","lib"] when source lives in multiple top-level dirs.')
+    .transform((v): string[] => (Array.isArray(v) ? v : [v])),
+  threshold: z.number().min(0).max(100).default(80)
+    .describe('Minimum line-coverage % a file must reach to be considered covered.'),
+  maxIterations: z.number().min(1).max(10).default(3)
+    .describe('How many times to retry a failing generated/fixed test before giving up.'),
+  coverageTimeout: z.number().min(30).default(300)
+    .describe('Seconds before the test suite is killed — guards against hung open handles (unclosed servers, timers).'),
+  testDir: z.string().optional()
+    .describe('Optional explicit test directory. Rarely needed — test locations are auto-detected.'),
+  ignore: z.array(z.string()).default([])
+    .describe('Path substrings to exclude from gap detection, e.g. ["src/graphql/", "src/theme/"].'),
+  mocksFile: z.string().optional()
+    .describe('Path to a shared mock file every generated test imports from, e.g. "src/test/mocks.ts".'),
+  setupFile: z.string().optional()
+    .describe('Path to your test setup file. Its contents are shown to the AI so it knows which globals/matchers exist.'),
+  provider: z.enum(['anthropic', 'openai-compatible']).default('openai-compatible')
+    .describe('AI provider. "anthropic" uses the Anthropic SDK; "openai-compatible" covers DeepSeek, OpenAI, Groq, OpenRouter, Ollama, etc.'),
+  model: z.string().default('deepseek-chat')
+    .describe('Model name, e.g. "deepseek-chat", "claude-sonnet-4-6", "gpt-4o".'),
+  baseURL: z.string().default('https://api.deepseek.com/v1')
+    .describe('API base URL. Required for the "openai-compatible" provider.'),
+  apiKeyEnv: z.string().default('DEEPSEEK_API_KEY')
+    .describe('Name of the environment variable that holds your API key.'),
+  maxTokens: z.number().min(1024).max(128000).default(16000)
+    .describe('Maximum output tokens per model call. Lower for strict providers (Groq free tier ~8000); raise if large test files are cut off.'),
+  testCommand: z.string().optional()
+    .describe('Override the auto-detected test command, e.g. "npx jest --no-coverage". Use to add flags.'),
+  testEnv: z.record(z.string()).default({})
+    .describe('Environment variables injected into every test-runner invocation, e.g. { "NODE_CONFIG_DIR": "packages/server/config" }.'),
+  debug: z.boolean().optional()
+    .describe('Set true to log every raw model prompt + response. Each target file gets its own log (lacuna-debug.<file>.txt). Equivalent to LACUNA_DEBUG=1.'),
 })
 
 export type LacunaConfig = z.infer<typeof ConfigSchema>

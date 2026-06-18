@@ -4,6 +4,7 @@ import chalk from 'chalk'
 import { loadConfig, applyModelOverride } from '../lib/config.js'
 import { detectEnvironment } from '../lib/detector.js'
 import { runAgentLoop } from '../agent/loop.js'
+import { debugLogPattern } from '../agent/generator.js'
 import { reportTerminal, buildJsonReport, buildMarkdownReport, getExitCode } from '../lib/reporter.js'
 import type { ReportInput } from '../lib/reporter.js'
 import { showStarNudge, showIssueNudge } from '../lib/feedback.js'
@@ -77,6 +78,9 @@ export default class Generate extends Command {
     this.log(`${chalk.dim('Runner:')}     ${chalk.cyan(env.testRunner)}`)
     this.log(`${chalk.dim('Threshold:')}  ${config.threshold}%`)
     if (flags.workers > 1) this.log(`${chalk.dim('Workers:')}    ${flags.workers}`)
+    if (config.mocksFile) this.log(`${chalk.dim('Mocks:')}      ${chalk.cyan(config.mocksFile)}`)
+    const debugPattern = debugLogPattern(config.debug)
+    if (debugPattern) this.log(`${chalk.dim('Debug:')}      ${chalk.green('on')} ${chalk.dim(`→ ${debugPattern}`)}`)
     if (flags['dry-run']) this.log(chalk.yellow('  [dry-run — no files will be written]'))
     if (flags.file) this.log(`${chalk.dim('Target:')}     ${flags.file}`)
 

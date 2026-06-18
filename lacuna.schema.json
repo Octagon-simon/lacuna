@@ -1,0 +1,150 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/Octagon-simon/lacuna/main/lacuna.schema.json",
+  "title": "Lacuna config (.lacuna.json)",
+  "description": "Configuration for the lacuna CLI. See https://github.com/Octagon-simon/lacuna",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "JSON Schema reference for editor completion."
+    },
+    "testRunner": {
+      "type": "string",
+      "enum": [
+        "jest",
+        "vitest",
+        "pytest",
+        "mocha",
+        "go-test",
+        "phpunit",
+        "pest",
+        "rspec",
+        "cargo-test",
+        "dotnet-test",
+        "gradle-test",
+        "maven-test",
+        "swift-test"
+      ],
+      "description": "Test runner. Auto-detected from your project dependencies if omitted."
+    },
+    "coverageFormat": {
+      "type": "string",
+      "enum": [
+        "lcov",
+        "json-summary",
+        "cobertura"
+      ],
+      "default": "lcov",
+      "description": "Coverage report format your test runner produces."
+    },
+    "coverageDir": {
+      "type": "string",
+      "default": "coverage",
+      "description": "Directory where your test runner writes its coverage report."
+    },
+    "sourceDir": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ],
+      "default": "src",
+      "description": "Source directory (or directories) to scan for coverage gaps. A string, or an array like [\"src\",\"lib\"] when source lives in multiple top-level dirs."
+    },
+    "threshold": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 100,
+      "default": 80,
+      "description": "Minimum line-coverage % a file must reach to be considered covered."
+    },
+    "maxIterations": {
+      "type": "number",
+      "minimum": 1,
+      "maximum": 10,
+      "default": 3,
+      "description": "How many times to retry a failing generated/fixed test before giving up."
+    },
+    "coverageTimeout": {
+      "type": "number",
+      "minimum": 30,
+      "default": 300,
+      "description": "Seconds before the test suite is killed — guards against hung open handles (unclosed servers, timers)."
+    },
+    "testDir": {
+      "type": "string",
+      "description": "Optional explicit test directory. Rarely needed — test locations are auto-detected."
+    },
+    "ignore": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "default": [],
+      "description": "Path substrings to exclude from gap detection, e.g. [\"src/graphql/\", \"src/theme/\"]."
+    },
+    "mocksFile": {
+      "type": "string",
+      "description": "Path to a shared mock file every generated test imports from, e.g. \"src/test/mocks.ts\"."
+    },
+    "setupFile": {
+      "type": "string",
+      "description": "Path to your test setup file. Its contents are shown to the AI so it knows which globals/matchers exist."
+    },
+    "provider": {
+      "type": "string",
+      "enum": [
+        "anthropic",
+        "openai-compatible"
+      ],
+      "default": "openai-compatible",
+      "description": "AI provider. \"anthropic\" uses the Anthropic SDK; \"openai-compatible\" covers DeepSeek, OpenAI, Groq, OpenRouter, Ollama, etc."
+    },
+    "model": {
+      "type": "string",
+      "default": "deepseek-chat",
+      "description": "Model name, e.g. \"deepseek-chat\", \"claude-sonnet-4-6\", \"gpt-4o\"."
+    },
+    "baseURL": {
+      "type": "string",
+      "default": "https://api.deepseek.com/v1",
+      "description": "API base URL. Required for the \"openai-compatible\" provider."
+    },
+    "apiKeyEnv": {
+      "type": "string",
+      "default": "DEEPSEEK_API_KEY",
+      "description": "Name of the environment variable that holds your API key."
+    },
+    "maxTokens": {
+      "type": "number",
+      "minimum": 1024,
+      "maximum": 128000,
+      "default": 16000,
+      "description": "Maximum output tokens per model call. Lower for strict providers (Groq free tier ~8000); raise if large test files are cut off."
+    },
+    "testCommand": {
+      "type": "string",
+      "description": "Override the auto-detected test command, e.g. \"npx jest --no-coverage\". Use to add flags."
+    },
+    "testEnv": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "default": {},
+      "description": "Environment variables injected into every test-runner invocation, e.g. { \"NODE_CONFIG_DIR\": \"packages/server/config\" }."
+    },
+    "debug": {
+      "type": "boolean",
+      "description": "Set true to log every raw model prompt + response. Each target file gets its own log (lacuna-debug.<file>.txt). Equivalent to LACUNA_DEBUG=1."
+    }
+  },
+  "additionalProperties": false
+}

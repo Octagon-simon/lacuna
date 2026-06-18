@@ -128,7 +128,7 @@ When `--file` is given, lacuna skips the coverage suite entirely and goes straig
 
 If you ran `lacuna analyze` recently (within 10 minutes), `generate` will reuse the existing coverage report instead of running the suite again. Use `--fresh` to force a new run.
 
-If all retries fail, the original test file is restored — your workspace is never left with a half-written file. If the model oscillates (produces the same code twice), the retry loop stops early rather than burning remaining iterations.
+If all retries fail, lacuna keeps the best attempt **when it adds passing tests over what was there before** — and tells you to run `lacuna fix --file …` to finish the remaining failures — otherwise it restores the original. Either way your workspace is never left worse than it started or with a half-written file. If the model oscillates (produces the same code twice), the retry loop stops early rather than burning remaining iterations.
 
 If a fix attempt breaks an import and causes the test runner to collect 0 tests, lacuna detects this and sends the model the original error alongside an explicit warning — so it knows it over-reached and what it was actually supposed to fix. The same applies if a fix reduces the number of passing tests: the model is told it caused a regression and shown what the baseline was.
 
@@ -143,12 +143,13 @@ lacuna generate --format json --output report.json
 ```
 
 ### `lacuna fix`
-Finds all failing tests and repairs them using AI. Sends each failing file along with its error output and source code to the model, which surgically fixes what's broken and retries until it passes. If all fix retries fail, lacuna automatically deletes the broken test and regenerates it from the source file — a clean slate rather than another round of patchwork.
+Finds all failing tests and repairs them using AI. Sends each failing file along with its error output and source code to the model, which surgically fixes what's broken and retries until it passes. A fix that makes the failing tests pass is **kept even if minor type warnings remain** — fix never reverts a behavioral improvement. If repair is exhausted on a *genuinely broken* file (no passing tests to lose), lacuna falls back to regenerating it from source; a file that already has passing tests is never deleted or regenerated.
 
 ```bash
 lacuna fix
 lacuna fix --workers 4                     # fix 4 files in parallel
 lacuna fix --file src/utils/math.test.ts   # fix a single test file (skips full suite run)
+lacuna fix --types                         # repair files that pass but fail type-checking (project-wide)
 lacuna fix --dry-run                       # preview fixes without writing
 lacuna fix --verbose                       # live code panel as model writes each fix
 lacuna fix --fresh                         # re-run the suite even if cache is recent
@@ -158,7 +159,9 @@ lacuna fix --fix-polluters                 # also handle tests that pass alone b
 
 Unlike `lacuna generate`, which creates new tests, `lacuna fix` operates on existing failing tests and preserves all test logic where possible.
 
-**Regeneration fallback (default on):** When fix retries are exhausted, lacuna deletes the test file and regenerates it from scratch using the generate path. This works better than continued repair for structurally broken tests — the AI starts with a clean conversation and full source context instead of carrying forward a chain of failed hypotheses. Use `--no-regenerate-on-failure` to disable this and get fix-only behaviour.
+**Regeneration fallback (default on):** When fix retries are exhausted on a *genuinely broken* file (zero passing tests to lose), lacuna deletes it and regenerates from scratch using the generate path — a clean conversation and full source context beat another round of patchwork. Two guardrails keep this safe: a file that already has passing tests is **never** regenerated (it's left repaired-or-restored, never nuked to chase a few failures), and a regeneration that would *reduce* the passing-test count is discarded and the original restored. Use `--no-regenerate-on-failure` to disable the fallback entirely.
+
+**Type errors (`--types`):** `lacuna fix --types` selects files by TypeScript type errors instead of test failures — one project-wide `tsc` pass finds every test file that fails type-checking (even if its tests pass), then repairs them (honors `--workers`). Type-checking respects each file's **governing tsconfig**: if the nearest `tsconfig.json` disables `noImplicitAny` (common in monorepo packages that loosen a strict root), implicit-any is not treated as an error to chase. A plain `lacuna fix --file …` also repairs a file that passes but has type errors — this is what `lacuna generate` points you to when it leaves a green-but-type-dirty file.
 
 **Passing in isolation, failing in suite (`--fix-polluters`):** Some tests pass when run alone but fail in the full suite. `--fix-polluters` handles these in two phases: (1) bisect the test suite to find if another file is leaking state (e.g. an uncleaned mock or global), and fix the polluter; (2) if no polluter can be isolated (the test has an internal spy lifecycle bug), delete and regenerate the victim file directly.
 
@@ -179,8 +182,17 @@ lacuna run
 
 Created by `lacuna init`. All fields are optional with sensible defaults.
 
+`lacuna init` adds a `"$schema"` line so editors (VS Code, etc.) give you **key completion and hover docs** while editing `.lacuna.json` — start typing a key and you'll see what each one means. To enable it on an existing config, add this as the first line:
+
 ```json
 {
+  "$schema": "https://raw.githubusercontent.com/Octagon-simon/lacuna/main/lacuna.schema.json"
+}
+```
+
+```json
+{
+  "$schema": "https://raw.githubusercontent.com/Octagon-simon/lacuna/main/lacuna.schema.json",
   "provider": "openai-compatible",
   "model": "deepseek-chat",
   "baseURL": "https://api.deepseek.com/v1",
@@ -214,6 +226,48 @@ Created by `lacuna init`. All fields are optional with sensible defaults.
 | `setupFile` | — | Path to your test setup file — lacuna passes its contents to the AI so it knows which globals and matchers are already available |
 | `ignore` | `[]` | Extra path substrings to exclude from gap detection (e.g. `"src/graphql/"`) |
 | `maxTokens` | `16000` | Maximum output tokens per model call. Lower this for providers with strict limits (Groq free tier: ~8000, Ollama: depends on model). Raise it if large test files are being cut off mid-generation. |
+| `debug` | `false` | Set `true` to log every raw model prompt and response. Each target file gets its own log (`lacuna-debug.<file>.txt`), so parallel/multi-file runs never share one stream. Equivalent to the `LACUNA_DEBUG` env var (env var takes precedence). Use this to diagnose unexpected model output without guessing. |
+
+---
+
+## Debugging
+
+When a test generation loop behaves unexpectedly — wrong patch anchors, bad mock shapes, repeated failures you can't reproduce locally — you need to see exactly what the model received and returned.
+
+Set `LACUNA_DEBUG=1` before running any lacuna command:
+
+```bash
+LACUNA_DEBUG=1 lacuna generate --file src/payments/processor.ts
+```
+
+Or add it to `.lacuna.json` so it persists across runs:
+
+```json
+{
+  "debug": true
+}
+```
+
+(You don't pick a filename — lacuna names each log after the target file automatically.)
+
+lacuna writes a **separate log per target file** — e.g. `lacuna-debug.MessagingService.txt` (a file's `generate` and `fix` logs share the same name). Each per-file log is **cleared when that file's `generate`/`fix` begins** and appended through its retries, so it's a self-contained record. Per-file logs mean `--workers` runs and multi-file suites never share or clobber one stream — a single shared file would be truncated and interleaved by concurrent workers.
+
+Each section is separated by a header like:
+
+```
+════════════════════════════════════════════════════════════════════════
+PROMPT (generate) — 2026-06-17T10:32:01.234Z
+════════════════════════════════════════════════════════════════════════
+```
+
+This is the most effective way to diagnose issues like:
+- A model omitting required quotes from patch anchor headers
+- A model producing correct test logic but hitting a format the parser doesn't expect
+- Unexpected truncation mid-file
+
+The env var takes precedence over the config value, so you can temporarily override it per-run without editing `.lacuna.json`.
+
+**Reporting a bug?** If a file keeps failing, run with `LACUNA_DEBUG` and attach the debug file to your GitHub issue — it gives us the exact prompt and raw model response and cuts diagnosis time dramatically.
 
 ---
 

@@ -8,6 +8,11 @@ import { buildJsCauses } from './runners/js-common.js'
 import { buildVitestCauses } from './runners/vitest.js'
 import { buildTsRule } from './runners/typescript.js'
 
+// Existing test files longer than this switch to surgical patch mode (<code_patch>) instead
+// of full-file rewrites — rewriting a large file risks hitting the output token limit mid-file.
+// Shared by the generate, fix, and retry prompts so they never disagree about the mode.
+export const PATCH_MODE_LINE_THRESHOLD = 300
+
 // ─── Setup file mock extractor ────────────────────────────────────────────────
 
 function extractGlobalNextMocks(setupCode: string): string[] {
@@ -183,6 +188,21 @@ function detectTypeScriptErrors(errorOutput: string): string | null {
       if (seen.has(key)) continue
       seen.add(key)
       parts.push(`  '${wrongProp}' → not valid. Use one of: ${available.slice(0, 12).join(', ')}${available.length > 12 ? ' …' : ''}`)
+    }
+  }
+
+  // Property errors on a NAMED type (e.g. "... does not exist on type 'BusinessSwap'") — the
+  // members can't be enumerated from the message like the inline-object case above, but the
+  // error must still be surfaced. Without this it was excluded from "Additional errors" by the
+  // TS2339/2551/2561 lookahead below and silently dropped from the targeted guidance.
+  const namedPropErrors = [...errorOutput.matchAll(/'(\w+)' does not exist (?:on|in) type '([^'{][^']*)'/g)]
+  if (namedPropErrors.length > 0) {
+    const seen = new Set<string>()
+    for (const m of namedPropErrors) {
+      const key = `${m[1]}::${m[2]}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      parts.push(`• '${m[1]}' is not a member of type '${m[2].slice(0, 80)}' — check the source file / TYPE DEFINITIONS for the correct name; do not invent one.`)
     }
   }
 
@@ -376,6 +396,7 @@ ${ruleCount + 1}. Structure ALL output using exactly these two XML blocks — no
     // complete test file here
     </code_output>
     CRITICAL: Once you open <code_output>, ALL remaining output must be code. Finish ALL reasoning inside <thinking> first.
+    THINKING BUDGET: keep <thinking> brief — roughly 30 lines or fewer. Record only the key facts you need (exact names, mock shapes, the plan), then open <code_output> and write the test immediately. Do NOT re-paste or quote large excerpts of the source or existing test file inside <thinking> — they are already provided above. A <thinking> block that runs to hundreds of lines will exhaust the token limit before any code is written and waste the entire attempt.
 ${ruleCount + 2 <= ruleCount + 1 ? '' : `${ruleCount + 2}. Inside <code_output>: do NOT wrap in markdown code fences.`}${jsOutputRules}
 
 A good test suite you write will have:
@@ -561,7 +582,7 @@ export function buildGeneratePrompt(args: {
     parts.push(`\nUNCOVERED LINES: ${uncoveredLines.slice(0, 30).join(', ')}${uncoveredLines.length > 30 ? '…' : ''}`)
   }
 
-  const patchMode = existingTestLineCount !== undefined && existingTestLineCount > 300
+  const patchMode = existingTestLineCount !== undefined && existingTestLineCount > PATCH_MODE_LINE_THRESHOLD
   if (patchMode) {
     parts.push(`\n⚠ PATCH MODE — this test file already has ${existingTestLineCount} lines. DO NOT rewrite the whole file. Use <code_patch> tags (NOT <code_output>) with these operations:
 
@@ -763,7 +784,7 @@ export function buildFixPrompt(args: {
   parts.push('- Component/function API changed — check the source file')
   parts.push('- Unhandled rejection: if the error output says "Unhandled Rejection" or "Vitest caught 1 unhandled error", a mockRejectedValueOnce promise is escaping the test scope. Fix by adding await waitFor(() => expect(errorElement).toBeInTheDocument()) after the triggering action, so the rejection is fully resolved inside the test.')
 
-  const patchMode = existingTestLineCount !== undefined && existingTestLineCount > 300
+  const patchMode = existingTestLineCount !== undefined && existingTestLineCount > PATCH_MODE_LINE_THRESHOLD
   if (patchMode) {
     parts.push(`\n⚠ PATCH MODE — this test file has ${existingTestLineCount} lines. DO NOT rewrite the whole file — the output token limit will cut it off. Instead:
 1. Identify ONLY the failing/broken tests from the error output above.
@@ -876,7 +897,7 @@ export interface FailedAttempt {
   failureReason: string
 }
 
-export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAttempt[] = []): string {
+export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAttempt[] = [], patchMode = false, reactish = true): string {
   const parts: string[] = []
 
   if (failedAttempts.length > 0) {
@@ -897,7 +918,10 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
     parts.push('')
   }
 
-  parts.push(`The tests failed. Error output:`)
+  // Neutral header: this prompt is reused for assertion failures, type-only repairs (where
+  // the tests actually PASS), patch-anchor failures, and "no tests" cases. Hardcoding "the
+  // tests failed" contradicts the error text in several of those. Let the output speak.
+  parts.push(`The previous attempt did not pass. Output from the last run:`)
   parts.push('```')
   parts.push(failureOutput.slice(0, 3000))
   parts.push('```')
@@ -928,11 +952,21 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
   parts.push('- Barrel file mock miss: if a module is re-exported from a barrel/index file, mocking the barrel will NOT intercept imports of the direct file. Mock the specific file the source actually imports. If unsure, mock both.')
   parts.push('- Wrong API — use only methods that exist in the installed version of the library')
   parts.push('- Type error — make sure the types match what the source file exports')
-  parts.push('- React 18 act() async: every act(async () => ...) MUST be awaited. Unawaited act() calls cause state to leak across tests, producing "Cannot read properties of null" or timeout failures in unrelated tests. Fix: add await before every act() call that wraps async code.')
-  parts.push('- Loading state — if the error is "Unable to find element" on a Submit/Save button, the component likely unmounts the button during loading rather than disabling it. Assert on the spinner or loading indicator instead.')
-  parts.push('- Unhandled rejection ("Vitest caught 1 unhandled error" / "Unhandled Rejection"): a mockRejectedValueOnce promise is escaping the test scope. After the action that triggers the rejection, add: await waitFor(() => expect(screen.getByText(/error/i)).toBeInTheDocument()) — this keeps the rejection chained inside the test so Vitest doesn\'t treat it as unhandled. The component may already catch the error internally, but the test still needs to await the resulting state change.')
+  // React/RTL-specific causes — only relevant to component tests. Omitted for backend/library
+  // projects (e.g. a service interactor) where they are pure noise on every retry.
+  if (reactish) {
+    parts.push('- React 18 act() async: every act(async () => ...) MUST be awaited. Unawaited act() calls cause state to leak across tests, producing "Cannot read properties of null" or timeout failures in unrelated tests. Fix: add await before every act() call that wraps async code.')
+    parts.push('- Loading state — if the error is "Unable to find element" on a Submit/Save button, the component likely unmounts the button during loading rather than disabling it. Assert on the spinner or loading indicator instead.')
+    parts.push('- Unhandled rejection ("Vitest caught 1 unhandled error" / "Unhandled Rejection"): a mockRejectedValueOnce promise is escaping the test scope. After the action that triggers the rejection, add: await waitFor(() => expect(screen.getByText(/error/i)).toBeInTheDocument()) — this keeps the rejection chained inside the test so Vitest doesn\'t treat it as unhandled. The component may already catch the error internally, but the test still needs to await the resulting state change.')
+  }
   parts.push('')
-  parts.push('Fix the issue and return your response in the required <thinking> + <code_output> format.')
+  // Preserve the response mode the file is in. For a large (patch-mode) file, forcing a full
+  // <code_output> rewrite risks truncation mid-file — keep it on <code_patch>.
+  parts.push(
+    patchMode
+      ? 'Fix the issue using <code_patch> tags with the patch operations from the original prompt — do NOT rewrite the whole file, and do NOT use <code_output>.'
+      : 'Fix the issue and return your response in the required <thinking> + <code_output> format.',
+  )
 
   return parts.join('\n')
 }
