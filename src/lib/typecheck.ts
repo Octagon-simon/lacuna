@@ -1,5 +1,5 @@
 import { access, readFile } from 'fs/promises'
-import { join, dirname, basename, resolve } from 'path'
+import { join, dirname, resolve, relative } from 'path'
 import type { DetectedEnvironment } from './detector.js'
 import { runCommand } from './runner.js'
 
@@ -80,10 +80,14 @@ export async function typeCheckFile(
   const result = await runCommand('npx tsc --noEmit --skipLibCheck', cwd, 60_000)
   if (result.success) return null
 
-  const fileName = basename(absTestPath)
+  // Match by path relative to cwd (how tsc prints diagnostics), NOT basename — many
+  // projects have dozens of identically-named files (route.test.ts, index.test.ts, page.test.tsx)
+  // and a basename filter would pull in unrelated files' errors, making the AI try to "fix"
+  // type errors that don't belong to the file it's repairing.
+  const relPath = relative(cwd, absTestPath).replace(/\\/g, '/')
   let errors = (result.stdout + '\n' + result.stderr)
     .split('\n')
-    .filter((l) => l.includes(fileName) && /error TS\d+/.test(l))
+    .filter((l) => (l.includes(relPath) || l.includes(absTestPath)) && /error TS\d+/.test(l))
 
   // Respect the file's governing tsconfig: if it disables noImplicitAny (e.g. a monorepo
   // package that loosens the strict root), implicit-any is not an error for this file — drop
@@ -119,15 +123,15 @@ export async function findTestFilesWithTypeErrors(
     .split('\n')
     .filter((l) => /error TS\d+/.test(l))
 
-  // Match by basename — mirrors typeCheckFile's own filter so selection and per-file
-  // verification agree. (Same-basename files in different dirs may both be selected; the
-  // per-file fix loop simply finds nothing to change in a false match and moves on.)
+  // Match by path relative to cwd — mirrors typeCheckFile's own filter so selection and
+  // per-file verification agree. Basename matching would conflate identically-named files
+  // (route.test.ts, index.test.ts) across the project and select the wrong ones.
   // Honor each file's governing noImplicitAny just like typeCheckFile, so a file whose only
   // diagnostics are implicit-any in a package that allows it is not selected.
   const withErrors: string[] = []
   for (const abs of testFiles) {
-    const fileName = basename(abs)
-    let lines = errorLines.filter((l) => l.includes(fileName))
+    const relPath = relative(cwd, abs).replace(/\\/g, '/')
+    let lines = errorLines.filter((l) => l.includes(relPath) || l.includes(abs))
     if (lines.length === 0) continue
     if (!(await noImplicitAnyEnabled(abs, cwd))) lines = lines.filter((l) => !IMPLICIT_ANY_RE.test(l))
     if (lines.length > 0) withErrors.push(abs)

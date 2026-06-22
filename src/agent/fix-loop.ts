@@ -406,10 +406,18 @@ async function fixFile(
       return { success: true }
     }
 
-    // Patch mode: apply surgical edits against the current file on disk
+    // Patch mode: apply surgical edits against the ORIGINAL file the model was shown
+    // (history[0] in the generator), NOT whatever a prior failed/regressing attempt left on
+    // disk. A regression isn't reverted until the loop ends, so the on-disk file drifts away
+    // from what the model anchors to — making every retry's anchors "not found". Anchor to
+    // testCode first; fall back to disk only when the model genuinely built on its own prior
+    // (still-applied) edit.
     if (generator.isPatch) {
-      const currentContent = await readFile(absTestPath, 'utf-8').catch(() => null) ?? testCode
-      const patched = tryApplyPatch(currentContent, fixed)
+      let patched = tryApplyPatch(testCode, fixed)
+      if (patched === null) {
+        const onDisk = await readFile(absTestPath, 'utf-8').catch(() => null)
+        if (onDisk && onDisk !== testCode) patched = tryApplyPatch(onDisk, fixed)
+      }
       if (patched !== null) {
         fixed = patched
       } else {
