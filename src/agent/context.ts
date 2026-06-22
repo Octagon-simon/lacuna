@@ -42,6 +42,26 @@ async function dirExists(path: string): Promise<boolean> {
 // Candidate test-directory roots for mirrored project layouts (test/unit/…, etc.)
 const MIRROR_TEST_ROOTS = ['test/unit', 'test/integration', 'test', 'tests/unit', 'tests', 'spec']
 
+const TEST_FILE_RE = /\.(test|spec)\.[cm]?[jt]sx?$/
+
+// True if dir contains at least one test file (recursively, shallow). Guards against
+// treating a helpers-only directory — e.g. a `test/` holding only mock.ts/setup.ts —
+// as a mirror test root, which would scatter new tests far from the source.
+async function dirContainsTestFile(dir: string, depth = 0, maxDepth = 6): Promise<boolean> {
+  if (depth > maxDepth) return false
+  let entries: import('fs').Dirent<string>[]
+  try { entries = await readdir(dir, { withFileTypes: true, encoding: 'utf-8' }) } catch { return false }
+  for (const entry of entries) {
+    if (entry.isFile() && TEST_FILE_RE.test(entry.name)) return true
+  }
+  for (const entry of entries) {
+    if (entry.isDirectory() && !entry.name.startsWith('.') && entry.name !== 'node_modules') {
+      if (await dirContainsTestFile(join(dir, entry.name), depth + 1, maxDepth)) return true
+    }
+  }
+  return false
+}
+
 // Recursively search dir for a file matching filename, up to maxDepth levels deep.
 // Returns the first absolute path found, or null.
 export async function findFileByName(dir: string, filename: string, depth = 0, maxDepth = 6): Promise<string | null> {
@@ -144,7 +164,9 @@ async function inferTestFilePath(
     const { srcDirParent, relPath } = parts
     for (const testRoot of MIRROR_TEST_ROOTS) {
       const testRootAbs = join(cwd, srcDirParent, testRoot)
-      if (await dirExists(testRootAbs)) {
+      // Require the root to actually contain tests — a bare `test/` that only holds
+      // mock/setup helpers must not hijack placement away from the real convention.
+      if ((await dirExists(testRootAbs)) && (await dirContainsTestFile(testRootAbs))) {
         const targetDir = join(testRootAbs, dirname(relPath))
         await mkdir(targetDir, { recursive: true })
         return join(srcDirParent, testRoot, dirname(relPath), `${base}.test${ext}`)
