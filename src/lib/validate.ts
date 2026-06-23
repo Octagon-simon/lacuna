@@ -427,6 +427,94 @@ export function buildRegressionMessage(
 // Patch-mode support
 // ---------------------------------------------------------------------------
 
+// Index of the line that ENDS the last import statement (or -1 if there are none).
+// Unlike a naive "last line starting with `import`", this spans multi-line imports so
+// callers insert AFTER the whole statement, never inside an `import { ... } from '...'` block.
+function lastImportStatementEndIdx(lines: string[]): number {
+  let end = -1
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*import\b/.test(lines[i])) continue
+    // Walk to the line that completes this statement: one ending in `from '...'`/`from "..."`,
+    // a bare side-effect import (`import '...'`), or any line ending with a semicolon.
+    let j = i
+    while (
+      j < lines.length &&
+      !/from\s+['"][^'"]+['"]\s*;?\s*$/.test(lines[j]) &&
+      !/^\s*import\s+['"][^'"]+['"]\s*;?\s*$/.test(lines[j]) &&
+      !/;\s*$/.test(lines[j])
+    ) {
+      j++
+    }
+    end = Math.min(j, lines.length - 1)
+    i = end   // resume scanning after this statement
+  }
+  return end
+}
+
+// Walk the file's import statements, yielding each one's line range + joined text
+// (spans multi-line imports).
+function* iterImportStatements(lines: string[]): Generator<{ start: number; end: number; text: string }> {
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*import\b/.test(lines[i])) continue
+    let j = i
+    while (
+      j < lines.length &&
+      !/from\s+['"][^'"]+['"]\s*;?\s*$/.test(lines[j]) &&
+      !/^\s*import\s+['"][^'"]+['"]\s*;?\s*$/.test(lines[j]) &&
+      !/;\s*$/.test(lines[j])
+    ) {
+      j++
+    }
+    const end = Math.min(j, lines.length - 1)
+    yield { start: i, end, text: lines.slice(i, end + 1).join('\n') }
+    i = end
+  }
+}
+
+const moduleKey = (m: string): string => m.replace(/\.(js|ts|jsx|tsx|mjs|cjs)$/, '')
+
+// Parse a single import statement into its parts. Returns null if it has no module specifier.
+function parseImportStatement(text: string): { module: string; quote: string; typeOnly: boolean; def: string | null; names: string[]; semicolon: boolean } | null {
+  const modM = text.match(/from\s+(['"])([^'"]+)\1/)
+  if (!modM) return null
+  const typeOnly = /^\s*import\s+type\b/.test(text)
+  const braceM = text.match(/\{([\s\S]*?)\}/)
+  const names = braceM ? braceM[1].split(',').map((s) => s.trim()).filter(Boolean) : []
+  const defM = text.match(/import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s*(?:,|from)/)
+  return { module: modM[2], quote: modM[1], typeOnly, def: defM ? defM[1] : null, names, semicolon: /;\s*$/.test(text.trim()) }
+}
+
+// ADD_IMPORT helper: if the new import names come from a module already imported in the file,
+// merge them into that existing statement (deduped) instead of appending a duplicate import —
+// a second `import … from 'X'` triggers bundler "imported multiple times" errors. Mutates
+// `lines` and returns true when a merge happened; false means "no existing import to merge into".
+function mergeNamedImportIntoExisting(lines: string[], content: string): boolean {
+  // Only handle a single named-import statement; anything more exotic falls back to append.
+  if ((content.match(/\bimport\b/g) ?? []).length !== 1) return false
+  const incoming = parseImportStatement(content)
+  if (!incoming || incoming.names.length === 0) return false
+
+  for (const stmt of iterImportStatements(lines)) {
+    const existing = parseImportStatement(stmt.text)
+    if (!existing) continue
+    if (moduleKey(existing.module) !== moduleKey(incoming.module)) continue
+    if (existing.typeOnly !== incoming.typeOnly) continue   // don't mix `import type` with value imports
+
+    const mergedNames = [...existing.names]
+    for (const n of incoming.names) if (!mergedNames.includes(n)) mergedNames.push(n)
+    const def = existing.def ?? incoming.def
+    const q = existing.quote
+    const rebuilt =
+      `import ${existing.typeOnly ? 'type ' : ''}` +
+      `${def ? def + (mergedNames.length ? ', ' : ' ') : ''}` +
+      `${mergedNames.length ? `{ ${mergedNames.join(', ')} }` : ''}` +
+      ` from ${q}${existing.module}${q}${existing.semicolon ? ';' : ''}`
+    lines.splice(stmt.start, stmt.end - stmt.start + 1, rebuilt)
+    return true
+  }
+  return false
+}
+
 export type PatchOpType = 'REPLACE_TEST' | 'DELETE_TEST' | 'ADD_AFTER_DESCRIBE' | 'ADD_IMPORT' | 'ADD_AFTER_IMPORTS' | 'REPLACE'
 
 export interface PatchOperation {
@@ -775,28 +863,26 @@ export function applyPatch(existingCode: string, ops: PatchOperation[]): string 
       code = code.slice(0, lastClosePos) + insertion + code.slice(lastClosePos)
 
     } else if (op.type === 'ADD_IMPORT') {
-      // Find the last `import ` line in the file
       const lines = code.split('\n')
-      let lastImportLineIdx = -1
-      for (let idx = 0; idx < lines.length; idx++) {
-        if (/^\s*import\s/.test(lines[idx])) lastImportLineIdx = idx
-      }
-
-      const importLines = op.content.split('\n')
-      if (lastImportLineIdx === -1) {
-        lines.unshift(...importLines)
-      } else {
-        lines.splice(lastImportLineIdx + 1, 0, ...importLines)
+      // Prefer merging into an existing import from the same module (avoids a duplicate
+      // `import … from 'X'` that bundlers reject). Otherwise insert after the END of the last
+      // import statement (handles multi-line imports — inserting after the opening `import {`
+      // line would split the block).
+      if (!mergeNamedImportIntoExisting(lines, op.content)) {
+        const lastImportLineIdx = lastImportStatementEndIdx(lines)
+        const importLines = op.content.split('\n')
+        if (lastImportLineIdx === -1) {
+          lines.unshift(...importLines)
+        } else {
+          lines.splice(lastImportLineIdx + 1, 0, ...importLines)
+        }
       }
       code = lines.join('\n')
     } else if (op.type === 'ADD_AFTER_IMPORTS') {
       // Like ADD_IMPORT but inserts a blank line before the block — for vi.mock() calls
       // and other module-level statements that follow imports
       const lines = code.split('\n')
-      let lastImportLineIdx = -1
-      for (let idx = 0; idx < lines.length; idx++) {
-        if (/^\s*import\s/.test(lines[idx])) lastImportLineIdx = idx
-      }
+      const lastImportLineIdx = lastImportStatementEndIdx(lines)
 
       const contentLines = ['', ...op.content.split('\n')]
       if (lastImportLineIdx === -1) {
