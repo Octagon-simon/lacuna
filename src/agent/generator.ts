@@ -1,5 +1,5 @@
 import { writeFile, appendFile, mkdir } from 'fs/promises'
-import { basename, extname, dirname } from 'path'
+import { extname, dirname } from 'path'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import type { ModelProvider, ChatMessage } from '../lib/providers/index.js'
@@ -12,9 +12,10 @@ import type { CoverageGap } from '../lib/coverage/types.js'
 
 // When debug is enabled (config `debug: true` or the LACUNA_DEBUG env var), every raw model
 // exchange is written to a per-file log. Each target file gets its own log (e.g.
-// lacuna-debug.MessagingService.txt), cleared at the start of that file's generate()/fix() and
-// appended through its retries — so parallel workers and multi-file runs never share/clobber
-// one stream. The base is fixed; perFileDebugPath appends the target file name.
+// lacuna-debug.src_services_MessagingService.txt), cleared at the start of that file's
+// generate()/fix() and appended through its retries — so parallel workers and multi-file runs
+// never share/clobber one stream. The base is fixed; perFileDebugPath derives the suffix from
+// the target file's full relative path so identically-named files stay distinct.
 // Usage: LACUNA_DEBUG=1 lacuna generate   |   { "debug": true } in .lacuna.json
 const DEFAULT_DEBUG_BASE = 'lacuna-debug.txt'
 
@@ -38,15 +39,22 @@ export function debugLogPattern(configDebug: boolean | undefined): string | null
 
 const SEP = '═'.repeat(72)
 
-// Derives a per-file debug path from the configured base by inserting the target file's
-// name before the extension: "lacuna-debug.txt" + "MessagingService.test.ts" →
-// "lacuna-debug.MessagingService.txt". Returns null when debug is disabled.
+// Derives a per-file debug path from the configured base by inserting a slug built from the
+// target file's *full relative path* before the extension: "lacuna-debug.txt" +
+// "src/app/api/send-email/route.ts" → "lacuna-debug.src_app_api_send-email_route.txt".
+// Using the whole path (not just the basename) keeps every log in one flat dir, the base's,
+// while staying unique: projects with many identically-named files (route.ts, index.ts,
+// page.tsx) would otherwise all slug to the same basename and clobber each other's logs, since
+// each run clears its own file. Returns null when debug is disabled.
 function perFileDebugPath(base: string | null, filePath: string): string | null {
   if (!base) return null
-  const slug = basename(filePath)
+  const slug = filePath
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
     .replace(/\.(test|spec)\.[jt]sx?$/, '')
     .replace(/\.[jt]sx?$/, '')
-    .replace(/[^a-zA-Z0-9._-]/g, '_') || 'file'
+    .replace(/[^a-zA-Z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'file'
   const ext = extname(base)
   const baseNoExt = ext ? base.slice(0, -ext.length) : base
   return `${baseNoExt}.${slug}${ext}`
