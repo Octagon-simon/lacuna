@@ -1,7 +1,8 @@
 import { readFile } from 'fs/promises'
 import { join } from 'path'
+import { PLAYWRIGHT_DEFAULTS, playwrightRunCommand } from './playwright.js'
 
-export type TestRunner = 'jest' | 'vitest' | 'pytest' | 'mocha' | 'go-test' | 'phpunit' | 'pest' | 'rspec' | 'cargo-test' | 'dotnet-test' | 'gradle-test' | 'maven-test' | 'swift-test' | 'unknown'
+export type TestRunner = 'jest' | 'vitest' | 'pytest' | 'mocha' | 'go-test' | 'phpunit' | 'pest' | 'rspec' | 'cargo-test' | 'dotnet-test' | 'gradle-test' | 'maven-test' | 'swift-test' | 'playwright' | 'unknown'
 export type Language = 'typescript' | 'javascript' | 'python' | 'go' | 'php' | 'ruby' | 'rust' | 'csharp' | 'java' | 'swift' | 'unknown'
 
 export interface DetectedEnvironment {
@@ -104,6 +105,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     coverageCommand: 'swift test --enable-code-coverage',
     testCommand: 'swift test',
   },
+  playwright: PLAYWRIGHT_DEFAULTS,
 }
 
 export function envForRunner(runner: string): DetectedEnvironment {
@@ -159,6 +161,7 @@ export function fileTestCommand(env: DetectedEnvironment, testFilePath: string):
     case 'vitest': return `npx vitest run ${q}`
     case 'jest':   return `npx jest --testPathPattern=${jestPath(testFilePath)}`
     case 'mocha':  return `npx mocha ${q}`
+    case 'playwright': return playwrightRunCommand(testFilePath)
     case 'pytest': return `python -m pytest ${q} -v`
     case 'go-test': {
       const dir = testFilePath.includes('/') ? testFilePath.replace(/\/[^/]+$/, '') : '.'
@@ -176,6 +179,17 @@ export function fileTestCommand(env: DetectedEnvironment, testFilePath: string):
   }
 }
 
+// Overloads: with no configRunner, detection is purely auto and never yields
+// 'playwright' (it is opt-in via --e2e), so the result narrows accordingly.
+// With a configRunner the user may explicitly select playwright, so the wide
+// DetectedEnvironment type applies.
+export async function detectEnvironment(
+  cwd?: string,
+): Promise<DetectedEnvironment & { testRunner: Exclude<TestRunner, 'playwright'> }>
+export async function detectEnvironment(
+  cwd: string | undefined,
+  configRunner: string | undefined,
+): Promise<DetectedEnvironment>
 export async function detectEnvironment(
   cwd: string = process.cwd(),
   configRunner?: string,
@@ -196,6 +210,9 @@ export async function detectEnvironment(
     ...((pkg.devDependencies as Record<string, string>) ?? {}),
   }
 
+  // Playwright is intentionally opt-in (selected via the --e2e flag, handled
+  // elsewhere) and is NOT auto-detected here: repos using Playwright for e2e
+  // usually also use Vitest/Jest for unit tests, which must keep winning here.
   if ('vitest' in deps) return RUNNER_DEFAULTS.vitest
   if ('jest' in deps || '@jest/core' in deps) return RUNNER_DEFAULTS.jest
   if ('mocha' in deps) return RUNNER_DEFAULTS.mocha
