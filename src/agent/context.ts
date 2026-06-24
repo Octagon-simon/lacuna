@@ -231,7 +231,7 @@ function relativeMockPath(testFile: string, mockFile: string): string {
 
 // ─── Type definition collector ────────────────────────────────────────────────
 
-async function readTsconfigAliases(cwd: string): Promise<Record<string, string[]>> {
+export async function readTsconfigAliases(cwd: string): Promise<Record<string, string[]>> {
   const candidates = ['tsconfig.json', 'tsconfig.app.json', 'tsconfig.base.json']
   for (const name of candidates) {
     try {
@@ -246,7 +246,7 @@ async function readTsconfigAliases(cwd: string): Promise<Record<string, string[]
 
 // Resolve an import path to an absolute filesystem base path (no extension).
 // Returns null for node_modules and unresolvable paths.
-function resolveLocalImport(
+export function resolveLocalImport(
   importPath: string,
   absoluteSourcePath: string,
   cwd: string,

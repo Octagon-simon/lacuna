@@ -16,6 +16,7 @@ export default class Fix extends Command {
     '$ lacuna fix --dry-run',
     '$ lacuna fix --regenerate-on-failure',
     '$ lacuna fix --fix-polluters',
+    '$ lacuna fix --e2e',
   ]
 
   static flags = {
@@ -58,6 +59,10 @@ export default class Fix extends Command {
       description: 'Select files by TypeScript type errors instead of test failures — repairs test files that pass but fail type-checking (one project-wide tsc, honors --workers)',
       default: false,
     }),
+    e2e: Flags.boolean({
+      description: 'Repair failing Playwright end-to-end specs instead of unit tests (selects specs by running Playwright, requires @playwright/test)',
+      default: false,
+    }),
   }
 
   async run(): Promise<void> {
@@ -72,8 +77,11 @@ export default class Fix extends Command {
 
     this.log(chalk.bold('\nlacuna fix\n'))
     this.log(`${chalk.dim('Model:')}   ${chalk.cyan(config.model)}`)
-    this.log(`${chalk.dim('Runner:')}  ${chalk.cyan(env.testRunner)}`)
+    // In e2e mode the unit runner is irrelevant — runFixLoop swaps in the Playwright env — so
+    // show that rather than a misleading "unknown".
+    this.log(`${chalk.dim('Runner:')}  ${chalk.cyan(flags.e2e ? 'playwright' : env.testRunner)}`)
     if (flags.types) this.log(`${chalk.dim('Mode:')}    ${chalk.cyan('type errors')} ${chalk.dim('(selecting files by TypeScript errors, not test failures)')}`)
+    if (flags.e2e) this.log(`${chalk.dim('Mode:')}    ${chalk.cyan('end-to-end')} ${chalk.dim('(repairing Playwright specs, not unit tests)')}`)
     if (flags.workers > 1) this.log(`${chalk.dim('Workers:')} ${flags.workers}`)
     if (config.mocksFile) this.log(`${chalk.dim('Mocks:')}   ${chalk.cyan(config.mocksFile)}`)
     const debugPattern = debugLogPattern(config.debug)
@@ -81,7 +89,9 @@ export default class Fix extends Command {
     if (flags['dry-run']) this.log(chalk.yellow('  [dry-run — no files will be written]'))
     if (flags.file) this.log(`${chalk.dim('Target:')}  ${flags.file}`)
 
-    if (env.testRunner === 'unknown') {
+    // E2E mode selects specs by running Playwright (runFixLoop checks for @playwright/test), so
+    // it does NOT need a unit test runner — skip the guard that would otherwise bail here.
+    if (env.testRunner === 'unknown' && !flags.e2e) {
       this.warn('Could not detect test runner. Run `lacuna init` to configure.')
       this.exit(2)
     }
@@ -100,6 +110,7 @@ export default class Fix extends Command {
         regenerateOnFailure: flags['regenerate-on-failure'],
         fixPolluters: flags['fix-polluters'],
         types: flags.types,
+        e2e: flags.e2e,
         log: (msg) => this.log(msg),
       })
     } catch (err) {

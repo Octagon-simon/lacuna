@@ -4,7 +4,10 @@ import { access, stat } from 'fs/promises'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
-import { fileTestCommand, multiFileTestCommand } from '../lib/detector.js'
+import { fileTestCommand, multiFileTestCommand, envForRunner } from '../lib/detector.js'
+import { detectPlaywright, loadPlaywrightConfig, playwrightTestCommand, parsePlaywrightResults } from '../lib/playwright.js'
+import { snapshotRoutes, type RouteSnapshot } from '../lib/flows/snapshot.js'
+import { buildE2ESystemPrompt, buildE2EFixPrompt } from './prompts/e2e.js'
 import { runCommand } from '../lib/runner.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
@@ -32,6 +35,7 @@ export interface FixOptions {
   regenerateOnFailure?: boolean
   fixPolluters?: boolean
   types?: boolean   // select files by type errors (not test failures); repair type-only issues
+  e2e?: boolean     // repair failing Playwright end-to-end specs instead of unit tests
   log: (msg: string) => void
 }
 
@@ -230,6 +234,30 @@ async function findSourceFile(testFilePath: string, cwd: string, configSourceDir
 
 // ─── Fix a single test file ───────────────────────────────────────────────────
 
+// Build the failure summary the model sees from a Playwright run, parsing the JSON reporter
+// into "title (file)\nmessage" blocks. Falls back to the generic extractor when the output
+// isn't parseable JSON (e.g. the run crashed before the reporter emitted anything), mirroring
+// how the unit path degrades on an unrecognised runner.
+function extractE2EFailure(output: string): string {
+  const parsed = parsePlaywrightResults(output)
+  if (!parsed || parsed.failures.length === 0) return extractTestFailure(output)
+  return parsed.failures
+    .map((f) => `${f.title} (${f.file})\n${f.message}`)
+    .join('\n\n')
+    .slice(0, 4000)
+}
+
+// Best-effort: the route a spec exercises, from its first page.goto(...). Used to capture a fresh
+// snapshot for E2E repair. Returns the pathname (origin stripped) or null when no goto is found.
+function extractRouteFromSpec(specCode: string): string | null {
+  const m = specCode.match(/\.goto\(\s*[`'"]([^`'"]+)[`'"]/)
+  if (!m) return null
+  let route = m[1]
+  try { route = new URL(route).pathname } catch { /* relative path — keep as written */ }
+  if (!route.startsWith('/')) route = '/' + route
+  return route
+}
+
 async function fixFile(
   testFilePath: string,
   options: FixOptions,
@@ -253,7 +281,9 @@ async function fixFile(
     // those rather than skip, otherwise generate's "run lacuna fix --file …" hand-off and
     // `lacuna fix --types` are dead ends. Default full-suite mode keeps skipping so
     // pollution-victim accounting is untouched.
-    typeErrorsAtStart = (options.targetFile || options.types) ? await typeCheckFile(absTestPath, cwd, env) : null
+    // E2E specs are never type-gated: a green Playwright run IS the pass, so there is nothing
+    // to repair. Type-cleanup (generate→fix handoff / --types) is a unit-test-only concern.
+    typeErrorsAtStart = (!options.e2e && (options.targetFile || options.types)) ? await typeCheckFile(absTestPath, cwd, env) : null
     if (!typeErrorsAtStart) {
       if (!onStatus) log(chalk.dim('  Already passing — skipping.'))
       onStatus?.({ phase: 'passed', file: shortPath })
@@ -264,7 +294,9 @@ async function fixFile(
 
   let errorOutput = typeErrorsAtStart
     ? `Tests pass but the test file has TypeScript type errors:\n${typeErrorsAtStart}\n\nFix ALL type errors without changing test behavior. Do not use 'as any' or '@ts-ignore'.`
-    : extractTestFailure(firstRun.stdout + '\n' + firstRun.stderr)
+    : options.e2e
+      ? extractE2EFailure(firstRun.stdout + '\n' + firstRun.stderr)
+      : extractTestFailure(firstRun.stdout + '\n' + firstRun.stderr)
   const initialErrorOutput = errorOutput
   const baselinePassCount = parsePassCount(firstRun.stdout + '\n' + firstRun.stderr)
 
@@ -279,8 +311,10 @@ async function fixFile(
     return { success: false, error: msg }
   }
 
-  // Find and read the source file being tested
-  const sourceFilePath = await findSourceFile(testFilePath, cwd, config.sourceDir)
+  // Find and read the source file being tested. Skipped for E2E: a Playwright spec drives the
+  // running app through the browser and imports no single source module, so there is nothing to
+  // resolve — passing a misleading "source under test" would only pollute the prompt.
+  const sourceFilePath = options.e2e ? null : await findSourceFile(testFilePath, cwd, config.sourceDir)
   let sourceCode: string | null = null
   if (sourceFilePath) {
     sourceCode = await readFile(sourceFilePath, 'utf-8').catch(() => null)
@@ -301,6 +335,23 @@ async function fixFile(
 
   // Build mocks/setup context relative to the actual test file path
   const ctx = await buildFixFileContext(absTestPath, cwd, config).catch(() => null)
+
+  // E2E repair context: capture a FRESH snapshot of the spec's route once (best-effort) so the
+  // repair prompt can fix selector drift against the page's current state — the dominant cause
+  // of E2E breakage. Skipped silently if the route can't be parsed or the snapshot fails.
+  let e2eRoute: string | null = null
+  let e2eBaseURL: string | null = null
+  let e2eSnapshot: RouteSnapshot | null = null
+  if (options.e2e) {
+    e2eRoute = extractRouteFromSpec(testCode)
+    const pw = await loadPlaywrightConfig(cwd).catch(() => null)
+    e2eBaseURL = pw?.baseURL ?? null
+    if (e2eRoute && pw) {
+      if (!onStatus) log(chalk.dim('  Capturing the current page state...'))
+      const snap = await snapshotRoutes([e2eRoute], cwd, pw, 90_000).catch(() => null)
+      e2eSnapshot = snap?.snapshots?.[0] ?? null
+    }
+  }
 
   let stallRetries = 0
   const MAX_STALL_RETRIES = 2
@@ -332,25 +383,38 @@ async function fixFile(
     let fixed: string
     try {
       fixed = attempt === 1
-        ? await generator.fix({
-            testFile: shortPath,
-            testCode,
-            sourceFile: sourceFilePath?.replace(cwd + '/', '') ?? null,
-            sourceCode,
-            sourceImportPath,
-            errorOutput,
-            env,
-            mocksCode: ctx?.mocksCode ?? null,
-            mocksImportPath: ctx?.mocksImportPath ?? null,
-            setupFileCode: ctx?.setupFileCode ?? null,
-            packageDeps: ctx?.packageDeps ?? null,
-            tsconfigPaths: ctx?.tsconfigPaths ?? null,
-            typeDefinitions,
-            localImportPaths,
-            reactMajorVersion,
-            projectMemory,
-            existingTestLineCount: testCode.split('\n').length,
-          })
+        ? options.e2e
+          ? await generator.fixE2E(
+              buildE2ESystemPrompt(),
+              buildE2EFixPrompt({
+                specFilePath: shortPath,
+                specCode: testCode,
+                failureOutput: errorOutput,
+                route: e2eRoute,
+                baseURL: e2eBaseURL,
+                snapshot: e2eSnapshot,
+              }),
+              shortPath.split('/').pop() ?? shortPath,
+            )
+          : await generator.fix({
+              testFile: shortPath,
+              testCode,
+              sourceFile: sourceFilePath?.replace(cwd + '/', '') ?? null,
+              sourceCode,
+              sourceImportPath,
+              errorOutput,
+              env,
+              mocksCode: ctx?.mocksCode ?? null,
+              mocksImportPath: ctx?.mocksImportPath ?? null,
+              setupFileCode: ctx?.setupFileCode ?? null,
+              packageDeps: ctx?.packageDeps ?? null,
+              tsconfigPaths: ctx?.tsconfigPaths ?? null,
+              typeDefinitions,
+              localImportPaths,
+              reactMajorVersion,
+              projectMemory,
+              existingTestLineCount: testCode.split('\n').length,
+            })
         : await generator.retry(errorOutput)
     } catch (err) {
       viewer?.stop()
@@ -524,6 +588,12 @@ async function fixFile(
         onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations })
         continue
       }
+      if (options.e2e) {
+        // E2E success is a green, complete Playwright run — there is no type-gate to apply.
+        if (!onStatus) log(chalk.green('  Fixed.'))
+        onStatus?.({ phase: 'passed', file: shortPath })
+        return { success: true }
+      }
       const typeErrors = await typeCheckFile(absTestPath, cwd, env)
       if (typeErrors && typeErrorsAtStart !== null) {
         // Type-cleanup mode: the file's tests already passed at start (generate→fix handoff or
@@ -547,6 +617,15 @@ async function fixFile(
     }
 
     const rawRunOutput = result.stdout + '\n' + result.stderr
+    // E2E: the pass-count / zero-tests heuristics below key off unit-runner output ("Tests: N
+    // passed"), which Playwright doesn't print, so just feed back the parsed Playwright failure
+    // and skip the regression/structure-broken accounting (none of it is meaningful for specs).
+    if (options.e2e) {
+      errorOutput = extractE2EFailure(rawRunOutput)
+      if (!onStatus) log(chalk.red(`  Still failing (attempt ${attempt}/${config.maxIterations})`))
+      if (!onStatus && verbose) log(chalk.dim(errorOutput.split('\n').slice(0, 20).join('\n')))
+      continue
+    }
     const rawExtracted = extractTestFailure(rawRunOutput)
     const structureBroken = isZeroTestsOutput(rawRunOutput)
     const currentPassCount = structureBroken ? 0 : parsePassCount(rawRunOutput)
@@ -887,7 +966,7 @@ async function runFixWorkers(
         if (result.success) {
           if (result.skipped) { filesAlreadyPassing++; victimFiles.push(absFile) }
           else filesFixed++
-        } else if (options.regenerateOnFailure && !options.types && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
+        } else if (options.regenerateOnFailure && !options.types && !options.e2e && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
           // Regenerate from scratch only for mostly-broken files (few passing tests) — that's
           // where a fresh take rescues stuck tests. A file with a substantial passing suite is
           // left restored by fixFile, never nuked. Skip too for type-only/--types repairs, and
@@ -918,13 +997,56 @@ async function runFixWorkers(
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 export async function runFixLoop(options: FixOptions): Promise<FixResult> {
+  // E2E mode swaps in the Playwright environment for the whole run (selection, per-file runs,
+  // and the commands fixFile issues) by normalising options up front, so everything downstream
+  // — including fixFile, which reads options.env — sees the Playwright runner.
+  if (options.e2e) {
+    if (!(await detectPlaywright(options.cwd))) {
+      options.log(chalk.yellow('\n  --e2e needs @playwright/test in the project, but none was found.'))
+      return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
+    }
+    options = { ...options, env: envForRunner('playwright') }
+  }
+
   const { config, env, cwd, log } = options
   const workerCount = Math.max(1, Math.min(options.workers ?? 1, 10))
   const parallel = workerCount > 1
 
   let failingFiles: string[]
 
-  if (options.types && !options.targetFile) {
+  if (options.e2e && !options.targetFile) {
+    // E2E selection: run the whole Playwright suite once and take the spec files that failed,
+    // parsed from the JSON reporter. We delegate app start/stop to Playwright's own webServer
+    // config rather than orchestrating it here.
+    const spinner = startCoverageSpinner(chalk.dim('  Running Playwright suite to find failing specs...'), env.testRunner)
+    const suiteResult = await runCommand(playwrightTestCommand(), cwd, config.coverageTimeout * 1000, spinner.onLine)
+    spinner.stop()
+
+    if (suiteResult.timedOut) {
+      throw new Error(
+        `Playwright suite timed out after ${config.coverageTimeout}s.\n` +
+        `Increase it in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`,
+      )
+    }
+
+    if (suiteResult.success) {
+      log(chalk.green('\n  All Playwright specs are passing — nothing to fix.'))
+      return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
+    }
+
+    const parsed = parsePlaywrightResults(suiteResult.stdout + '\n' + suiteResult.stderr)
+    const failed = parsed ? [...new Set(parsed.failures.map((f) => f.file))] : []
+    failingFiles = failed.filter((f) => {
+      const abs = f.startsWith('/') ? f : join(cwd, f)
+      return abs.startsWith(cwd) && !abs.includes('node_modules')
+    })
+
+    if (failingFiles.length === 0) {
+      log(chalk.yellow('\n  Could not identify any failing spec files from the Playwright output.'))
+      log(chalk.dim(`  Try running ${playwrightTestCommand()} directly to inspect the output.`))
+      return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
+    }
+  } else if (options.types && !options.targetFile) {
     // Types mode: select by type errors rather than test failures. One project-wide tsc
     // finds every test file that fails type-checking — including files whose tests pass,
     // which the normal failure-driven selection never sees.
@@ -949,6 +1071,12 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
     const spinner = startCoverageSpinner(chalk.dim(`  Checking ${options.targetFile}...`), env.testRunner)
     const fileResult = await runCommand(fileTestCommand(env, absTarget), cwd, 60_000, spinner.onLine)
     spinner.stop()
+
+    if (fileResult.success && options.e2e) {
+      // E2E: a green Playwright run is the whole pass — no type-gate.
+      log(chalk.green('\n  Spec is passing — nothing to fix.'))
+      return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
+    }
 
     if (fileResult.success) {
       // Tests pass — but the runner only transpiles, it doesn't type-check. A green file
@@ -1058,7 +1186,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       if (result.success) {
         if (result.skipped) { filesAlreadyPassing++; victimFiles.push(absFile) }
         else filesFixed++
-      } else if (options.regenerateOnFailure && !options.types && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
+      } else if (options.regenerateOnFailure && !options.types && !options.e2e && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
         // Regenerate only for mostly-broken files (few passing tests) — see runFixWorkers.
         // A substantial passing suite is left restored by fixFile, never nuked + rebuilt.
         log(chalk.yellow(`  Fix exhausted — falling back to full regeneration...`))
