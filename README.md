@@ -98,6 +98,8 @@ lacuna generate                              lacuna fix
 
 Two rules hold throughout: lacuna never leaves a half-written file behind, and it never removes passing tests. If it can't improve a file, it puts the original back.
 
+This is the unit/integration layer. For browser-level tests, [`--e2e`](#end-to-end-testing-playwright) follows the same loop but targets routes instead of source files and verifies with a real browser run.
+
 ---
 
 ## Commands
@@ -133,6 +135,7 @@ lacuna generate --verbose                   # live panel as the model writes
 lacuna generate --workers 4                  # process 4 files in parallel
 lacuna generate --fresh                      # ignore the cached coverage report
 lacuna generate --format json --output report.json
+lacuna generate --e2e                        # generate Playwright end-to-end specs (see below)
 ```
 
 If you ran `analyze` in the last 10 minutes, `generate` reuses that report instead of running the suite again (`--fresh` forces a new run). When retries are exhausted, lacuna keeps the best attempt **only if it adds passing tests** and points you to `lacuna fix` for the rest; otherwise it restores the original. If the model produces the same output twice, the loop stops early instead of wasting iterations.
@@ -151,6 +154,7 @@ lacuna fix --verbose
 lacuna fix --fresh
 lacuna fix --no-regenerate-on-failure        # don't fall back to regenerating
 lacuna fix --fix-polluters                   # handle tests that pass alone but fail in the suite
+lacuna fix --e2e                             # repair failing Playwright specs (see below)
 ```
 
 A few behaviors worth knowing:
@@ -168,6 +172,35 @@ Runs your suite and reports coverage. No model involved.
 ```bash
 lacuna run
 ```
+
+---
+
+## End-to-end testing (Playwright)
+
+Everything above writes unit and integration tests. With `--e2e`, lacuna instead works at the **browser** layer: it discovers your app's routes, drives a real browser to see what's actually on each page, and writes [Playwright](https://playwright.dev) specs that click and assert like a user.
+
+Requirements: `@playwright/test` installed and a `playwright.config.ts` with a `webServer` block (so lacuna can start your app) and a `baseURL`. Route discovery currently supports **Next.js** (app and pages router) and **React Router**.
+
+```bash
+lacuna generate --e2e                  # discover routes, generate a spec for each
+lacuna generate --e2e --route /login   # just one route
+lacuna generate --e2e --workers 4      # generate in parallel
+lacuna generate --e2e --dry-run        # list which routes would get specs (no app, no API call)
+lacuna fix --e2e                       # repair failing Playwright specs
+```
+
+How generation works:
+
+1. **Discover** the routes from your router (e.g. `app/login/page.tsx` → `/login`, or a `<Route path="/login">`).
+2. **Snapshot** each page: lacuna starts your app once via the `webServer` config and captures the accessibility tree plus any `data-testid`s, so the model writes specs against the elements that are *really there*.
+3. **Generate** one spec per route. Selectors follow a strict order: `getByRole`, `getByLabel`, `getByPlaceholder`, then `getByTestId` (only for testids actually present on the page, never invented), with `getByText` as a last resort. Brittle CSS, XPath, and arbitrary sleeps are forbidden; assertions are auto-waiting and validate the outcome of each action. Login redirects are detected and asserted rather than fabricated.
+4. **Verify**: lacuna runs each spec, confirms it isn't flaky, and retries on failure. A spec that never goes green is removed rather than left broken.
+
+If your project already uses `data-testid`s, lacuna picks them up from the snapshot and prefers them where a semantic locator isn't enough. It reads testids from your components but does not add them, it only touches test files.
+
+Specs are written to your Playwright `testDir`. Routes that already have a spec are skipped, so re-running only fills the gaps. `--dry-run` is a free preview: it lists what would be generated without starting your app or calling the model.
+
+**Repairing specs (`lacuna fix --e2e`).** When a spec breaks, lacuna captures a fresh snapshot of the page, then asks the model to diagnose the root cause (selector drift, a timing gap, an auth redirect, a removed feature) and apply the smallest fix that preserves what the test checks. It fixes selectors and synchronization rather than weakening or deleting assertions to force a pass.
 
 ---
 
@@ -259,6 +292,8 @@ Lacuna can run the suite and collect coverage for a wide range of languages. The
 **Runner support, lighter tuning:** Vue (Vitest), Python (pytest), PHP (PHPUnit, Pest). These run and collect coverage, but framework-specific prompt tuning is still in progress.
 
 **Runner only:** Go, Ruby (RSpec), Rust (cargo), C# (dotnet), Java (Gradle/Maven), Swift. Suites run and coverage is collected, but test generation isn't tuned for them yet.
+
+**End-to-end (`--e2e`):** Playwright, with route discovery for Next.js (app and pages router) and React Router. See [End-to-end testing](#end-to-end-testing-playwright).
 
 ---
 
@@ -426,10 +461,11 @@ lacuna/
 │   ├── commands/          # CLI commands: analyze, generate, fix, run, init
 │   ├── agent/
 │   │   ├── loop.ts        # generate → run → retry loop
-│   │   ├── fix-loop.ts    # fix → run → retry loop
+│   │   ├── fix-loop.ts    # fix → run → retry loop (+ --e2e repair)
+│   │   ├── e2e-loop.ts    # E2E generate: discover → snapshot → generate → verify
 │   │   ├── context.ts     # builds model context (source, tests, mocks, types)
 │   │   ├── generator.ts   # calls the model, manages conversation history
-│   │   └── prompts/       # prompt builders, split by framework and runner
+│   │   └── prompts/       # prompt builders, split by framework and runner (incl. e2e.ts)
 │   ├── lib/
 │   │   ├── config.ts      # config loader + zod schema
 │   │   ├── detector.ts    # detects test runner and language
@@ -437,6 +473,8 @@ lacuna/
 │   │   ├── reporter.ts    # terminal / JSON / markdown output
 │   │   ├── validate.ts    # patch application, regression + broken-import detection
 │   │   ├── typecheck.ts   # tsc pass and type-error scoping
+│   │   ├── playwright.ts  # Playwright detection, config parse, result parsing
+│   │   ├── flows/         # E2E route discovery, DOM snapshot, app-server lifecycle
 │   │   ├── providers/     # model provider abstraction (anthropic, openai-compatible)
 │   │   └── coverage/      # lcov / json parsers, gap extraction
 │   └── ci/                # PR comment + GitHub Actions outputs
