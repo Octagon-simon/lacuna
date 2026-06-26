@@ -19,8 +19,8 @@
 // green, non-flaky browser run rather than executed source lines. Everything below is shaped
 // around that reality.
 
-import { readFile } from 'fs/promises'
-import { join, isAbsolute } from 'path'
+import { readFile, readdir } from 'fs/promises'
+import { join, isAbsolute, basename } from 'path'
 import type { DetectedEnvironment, TestRunner } from './detector.js'
 
 // ---------------------------------------------------------------------------------------------
@@ -233,6 +233,56 @@ export function parsePlaywrightResults(stdout: string): PlaywrightRunResult | nu
   for (const suite of report.suites ?? []) walkSuite(suite, [])
 
   return { passed, failed, flaky, failures }
+}
+
+export interface FailureContext {
+  specPath: string | null     // the spec the failure is in (from the "Location:" line) — may differ
+                              //   from the spec being fixed (a failed setup/dependency project)
+  test: string | null         // the failing test's name/location, from the "# Test info" section
+  errorDetails: string        // the real error (e.g. "page.waitForURL: Timeout … navigation to **/otp**")
+  pageSnapshot: string | null // the page's aria snapshot at failure, when Playwright captured one
+}
+
+// Read ALL of a run's per-failure `error-context.md` files. Playwright writes these the instant a
+// test fails — BEFORE the run finishes — so they survive even when the run is killed by a timeout
+// (the case where the JSON reporter produces nothing). Reading ALL of them (not just the target
+// spec's) is deliberate: with project dependencies, the failure that blocks a spec is often in a
+// SETUP/dependency spec, and Playwright then skips the dependent — so the target's own failure is
+// absent and the real cause lives in another file. Each context is tagged with its source spec.
+export async function readPlaywrightErrorContext(cwd: string, outputDir = 'test-results'): Promise<FailureContext[]> {
+  const resultsDir = isAbsolute(outputDir) ? outputDir : join(cwd, outputDir)
+  let entries: string[]
+  try { entries = await readdir(resultsDir) } catch { return [] }
+
+  const out: FailureContext[] = []
+  for (const dir of entries.slice(0, 30)) {
+    const md = await readFile(join(resultsDir, dir, 'error-context.md'), 'utf-8').catch(() => null)
+    if (!md) continue
+    const info = section(md, 'Test info')
+    const locLine = info?.split('\n').find((l) => l.includes('Location:'))
+    const specPath = locLine?.match(/Location:\s*([^\s:]+)/)?.[1] ?? null
+    out.push({
+      specPath,
+      test: info?.replace(/^- /gm, '').trim().slice(0, 300) ?? null,
+      errorDetails: (codeBlock(section(md, 'Error details')) ?? '').slice(0, 2000),
+      pageSnapshot: codeBlock(section(md, 'Page snapshot')),
+    })
+  }
+  return out.filter((c) => c.errorDetails || c.pageSnapshot)
+}
+
+// Extract the body of a `# <heading>` section from error-context.md (up to the next `# `).
+function section(md: string, heading: string): string | null {
+  const re = new RegExp(`(?:^|\\n)#\\s+${heading}\\s*\\n([\\s\\S]*?)(?=\\n#\\s|$)`)
+  const m = md.match(re)
+  return m ? m[1].trim() : null
+}
+
+// Pull the first fenced code block out of a section body (the snapshot/error is fenced).
+function codeBlock(body: string | null): string | null {
+  if (!body) return null
+  const m = body.match(/```[a-z]*\n([\s\S]*?)```/)
+  return m ? m[1].trim() : null
 }
 
 // Playwright prints non-JSON lines (webServer logs, the dot reporter) around the JSON blob when

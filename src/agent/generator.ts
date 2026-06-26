@@ -334,6 +334,7 @@ export class TestGenerator {
   private lastIsPatch = false
   private patchMode = false   // file is large enough to require <code_patch> mode — retries must stay in it
   private reactish = false     // React/RN project — gates React-specific retry guidance
+  private e2eMode = false       // E2E (Playwright) repair — gates E2E retry guidance over unit causes
   private readonly debugFile: string | null   // configured base path (or null)
   private activeDebugFile: string | null = null   // per-file path for the file currently being processed
   private systemPromptOverride?: string   // set by generateE2E so generate AND retries use the E2E system prompt
@@ -398,6 +399,7 @@ export class TestGenerator {
     this.failedAttempts = []
     this.previousCodes = []
     this.systemPromptOverride = undefined   // unit path uses the env-derived system prompt
+    this.e2eMode = false
     // Mirrors buildGeneratePrompt's patch-mode decision so retries stay in the same mode.
     this.patchMode = (context.existingTestCode?.split('\n').length ?? 0) > PATCH_MODE_LINE_THRESHOLD
     this.reactish = context.reactMajorVersion != null
@@ -455,6 +457,7 @@ export class TestGenerator {
     this.failedAttempts = []
     this.previousCodes = []
     this.systemPromptOverride = undefined   // unit path uses the env-derived system prompt
+    this.e2eMode = false
     // Mirrors buildFixPrompt's patch-mode decision so retries stay in the same mode.
     this.patchMode = (args.existingTestLineCount ?? 0) > PATCH_MODE_LINE_THRESHOLD
     this.reactish = args.reactMajorVersion != null
@@ -509,6 +512,7 @@ export class TestGenerator {
     this.previousCodes = []
     this.patchMode = false   // specs are written whole; no patch mode
     this.reactish = false    // no React-specific retry guidance for browser specs
+    this.e2eMode = true      // retries get E2E guidance (selector/sync/redirect), not unit mock causes
     this.systemPromptOverride = systemPrompt
 
     this.history = [{ role: 'user', content: userPrompt }]
@@ -576,7 +580,7 @@ export class TestGenerator {
 
     this.history.push({
       role: 'user',
-      content: buildRetryPrompt(failureOutput, this.failedAttempts, this.patchMode, this.reactish),
+      content: buildRetryPrompt(failureOutput, this.failedAttempts, this.patchMode, this.reactish, this.e2eMode),
     })
     await debugWrite(this.activeDebugFile, `PROMPT (retry ${this.failedAttempts.length})`, this.history[this.history.length - 1].content)
 

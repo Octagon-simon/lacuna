@@ -5,8 +5,9 @@ import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import { fileTestCommand, multiFileTestCommand, envForRunner } from '../lib/detector.js'
-import { detectPlaywright, loadPlaywrightConfig, playwrightTestCommand, parsePlaywrightResults } from '../lib/playwright.js'
+import { detectPlaywright, loadPlaywrightConfig, playwrightTestCommand, parsePlaywrightResults, readPlaywrightErrorContext } from '../lib/playwright.js'
 import { snapshotRoutes, type RouteSnapshot } from '../lib/flows/snapshot.js'
+import { collectSpecHelpers, splitSpecAndHelpers, type SpecHelperFile } from '../lib/flows/spec-helpers.js'
 import { buildE2ESystemPrompt, buildE2EFixPrompt } from './prompts/e2e.js'
 import { runCommand } from '../lib/runner.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
@@ -238,13 +239,23 @@ async function findSourceFile(testFilePath: string, cwd: string, configSourceDir
 // into "title (file)\nmessage" blocks. Falls back to the generic extractor when the output
 // isn't parseable JSON (e.g. the run crashed before the reporter emitted anything), mirroring
 // how the unit path degrades on an unrecognised runner.
-function extractE2EFailure(output: string): string {
+function extractE2EFailure(output: string, timedOut = false): string {
   const parsed = parsePlaywrightResults(output)
-  if (!parsed || parsed.failures.length === 0) return extractTestFailure(output)
-  return parsed.failures
-    .map((f) => `${f.title} (${f.file})\n${f.message}`)
-    .join('\n\n')
-    .slice(0, 4000)
+  if (parsed && parsed.failures.length > 0) {
+    return parsed.failures
+      .map((f) => `${f.title} (${f.file})\n${f.message}`)
+      .join('\n\n')
+      .slice(0, 4000)
+  }
+  // No parseable Playwright failure. Do NOT run it through extractTestFailure — that's the unit
+  // extractor and it strips Playwright/timeout output down to nothing, leaving the model to
+  // repair blind. Surface the raw tail (and call out a timeout) so there's always real signal.
+  const raw = output.replace(/\x1B\[[0-9;]*m/g, '').trim()
+  const tail = raw.slice(-3000)
+  if (timedOut) {
+    return `The spec run TIMED OUT before finishing — the flow likely exceeds the run timeout or is hanging on a step (a missing/changed selector that never resolves, a stuck navigation, or slow setup). Make the failing step resolve quickly or fix the selector it's waiting on.${tail ? `\n\nLast output before the timeout:\n${tail}` : ''}`
+  }
+  return tail || 'The spec failed but produced no readable Playwright output. It most likely errored in setup (beforeAll/beforeEach) or a helper — check the imported helpers and any external setup (login, seeded data) the spec depends on.'
 }
 
 // Best-effort: the route a spec exercises, from its first page.goto(...). Used to capture a fresh
@@ -272,8 +283,11 @@ async function fixFile(
   if (!onStatus) log(chalk.bold(`\n  Fixing: ${chalk.cyan(shortPath)}`))
   onStatus?.({ phase: 'running', file: shortPath })
 
-  // Run just this test file to get focused error output
-  const firstRun = await runCommand(fileTestCommand(env, absTestPath), cwd, 60_000)
+  // Run just this test file to get focused error output. E2E flows (login + setup + multi-step)
+  // routinely exceed the unit-test 60s cap; use the configured coverage timeout (default 300s) so
+  // the run actually finishes and produces a real failure instead of being killed mid-run.
+  const fileRunTimeoutMs = options.e2e ? config.coverageTimeout * 1000 : 60_000
+  const firstRun = await runCommand(fileTestCommand(env, absTestPath), cwd, fileRunTimeoutMs)
   let typeErrorsAtStart: string | null = null
   if (firstRun.success) {
     // Tests pass. In targeted (--file) or --types mode, a green file may still have
@@ -295,8 +309,50 @@ async function fixFile(
   let errorOutput = typeErrorsAtStart
     ? `Tests pass but the test file has TypeScript type errors:\n${typeErrorsAtStart}\n\nFix ALL type errors without changing test behavior. Do not use 'as any' or '@ts-ignore'.`
     : options.e2e
-      ? extractE2EFailure(firstRun.stdout + '\n' + firstRun.stderr)
+      ? extractE2EFailure(firstRun.stdout + '\n' + firstRun.stderr, firstRun.timedOut)
       : extractTestFailure(firstRun.stdout + '\n' + firstRun.stderr)
+
+  // E2E: enrich the failure with Playwright's per-failure error-context.md — it carries the REAL
+  // error and the exact failing line, and is written the instant the test fails (so it survives a
+  // killed/timed-out run where the JSON reporter produced nothing). It also pinpoints the failing
+  // STEP/page in a multi-step flow, not just the first route. This is the precise signal that lets
+  // the model fix on the first attempt instead of burning iterations guessing.
+  let e2eFailurePageState: string | null = null
+  if (options.e2e) {
+    const allContexts = await readPlaywrightErrorContext(cwd).catch(() => [])
+    const targetBase = basename(absTestPath)
+    const target = allContexts.filter((c) => c.specPath && basename(c.specPath) === targetBase)
+    const upstream = allContexts.filter((c) => c.specPath && basename(c.specPath) !== targetBase)
+
+    // The target produced no failure of its own but another spec did — with Playwright project
+    // dependencies, the target was almost certainly SKIPPED because a setup/dependency spec failed.
+    // Repairing the target can't help; point at the real one instead of burning every attempt.
+    if (target.length === 0 && upstream.length > 0) {
+      const u = upstream[0]
+      const upSpec = u.specPath ?? 'a setup/dependency spec'
+      const msg =
+        `"${shortPath}" did not fail on its own — Playwright skipped it because a dependency/setup spec failed first:\n\n` +
+        `  ${upSpec}\n  ${u.errorDetails.split('\n').slice(0, 4).join('\n  ')}\n\n` +
+        `Fix that spec first (e.g. lacuna fix --e2e --file ${upSpec}). Repairing ${shortPath} cannot help until its setup passes.`
+      if (!onStatus) log(chalk.yellow(`\n  ⚠ ${shortPath} is blocked by a failing dependency — ${upSpec}`))
+      onStatus?.({ phase: 'failed', file: shortPath })
+      return { success: false, error: msg }
+    }
+
+    const contexts = target.length > 0 ? target : allContexts   // target's own failures, else whatever we found
+    if (contexts.length > 0) {
+      const ctxText = contexts
+        .map((c) => [c.test?.split('\n').find((l) => l.includes('Location:'))?.trim() ?? c.test?.split('\n')[0], c.errorDetails].filter(Boolean).join('\n'))
+        .join('\n\n')
+        .trim()
+      if (ctxText) {
+        const wasPlaceholder = /TIMED OUT before finishing|no readable Playwright output/.test(errorOutput)
+        errorOutput = wasPlaceholder ? ctxText : `${ctxText}\n\n--- additional run output ---\n${errorOutput}`
+      }
+      e2eFailurePageState = contexts.find((c) => c.pageSnapshot)?.pageSnapshot ?? null
+    }
+  }
+
   const initialErrorOutput = errorOutput
   const baselinePassCount = parsePassCount(firstRun.stdout + '\n' + firstRun.stderr)
 
@@ -342,8 +398,11 @@ async function fixFile(
   let e2eRoute: string | null = null
   let e2eBaseURL: string | null = null
   let e2eSnapshot: RouteSnapshot | null = null
+  let e2eHelpers: SpecHelperFile[] = []   // the spec's imported selectors/helpers/config (read for context)
+  const helperBackups = new Map<string, string>()   // original content of any helper file we overwrite (multi-file fix)
   if (options.e2e) {
     e2eRoute = extractRouteFromSpec(testCode)
+    e2eHelpers = await collectSpecHelpers(testCode, absTestPath, cwd).catch(() => [])
     const pw = await loadPlaywrightConfig(cwd).catch(() => null)
     e2eBaseURL = pw?.baseURL ?? null
     if (e2eRoute && pw) {
@@ -393,6 +452,8 @@ async function fixFile(
                 route: e2eRoute,
                 baseURL: e2eBaseURL,
                 snapshot: e2eSnapshot,
+                helpers: e2eHelpers,
+                failurePageState: e2eFailurePageState,
               }),
               shortPath.split('/').pop() ?? shortPath,
             )
@@ -449,6 +510,7 @@ async function fixFile(
         if (!onStatus) log(chalk.red(`\n  ⚠ Agent loop detected — output identical to a previous attempt. Stopping early.`))
         onStatus?.({ phase: 'failed', file: shortPath })
         await writeFile(absTestPath, testCode, 'utf-8').catch(() => {})
+        for (const [abs, orig] of helperBackups) await writeFile(abs, orig, 'utf-8').catch(() => {})
         return { success: false, error: err.message }
       }
       const msg = err instanceof Error ? err.message : String(err)
@@ -512,7 +574,22 @@ async function fixFile(
     const MOCKS_PATCH_SEPARATOR = '// ---MOCKS_PATCH---'
     let testFileContent = fixed
 
-    if (fixed.includes(MOCKS_PATCH_SEPARATOR) && config.mocksFile) {
+    if (options.e2e) {
+      // E2E multi-file fix: the model may fix a stale selector at its source by appending
+      // // ---HELPER_FILE: <path>--- sections. Only the spec's own resolved imports are writable;
+      // back up each before overwriting so a failed run can be fully reverted.
+      const { spec, helpers: emitted } = splitSpecAndHelpers(fixed, e2eHelpers.map((h) => h.path))
+      testFileContent = spec
+      for (const h of emitted) {
+        const abs = h.path.startsWith('/') ? h.path : join(cwd, h.path)
+        if (!helperBackups.has(abs)) {
+          const orig = await readFile(abs, 'utf-8').catch(() => null)
+          if (orig !== null) helperBackups.set(abs, orig)
+        }
+        await writeFile(abs, h.content, 'utf-8').catch(() => {})
+        if (!onStatus) log(chalk.dim(`  Updated helper: ${h.path}`))
+      }
+    } else if (fixed.includes(MOCKS_PATCH_SEPARATOR) && config.mocksFile) {
       // Surgical patch mode: model only emits the changed sections
       const [newTestCode, patchContent] = fixed.split(MOCKS_PATCH_SEPARATOR)
       testFileContent = newTestCode.trim()
@@ -572,7 +649,7 @@ async function fixFile(
     if (!onStatus) log(chalk.dim('  Written. Running tests...'))
     onStatus?.({ phase: 'running', file: shortPath })
 
-    const result = await runCommand(fileTestCommand(env, absTestPath), cwd, 60_000)
+    const result = await runCommand(fileTestCommand(env, absTestPath), cwd, fileRunTimeoutMs)
 
     if (result.success) {
       if (hasPlaceholderBodies(testFileContent)) {
@@ -621,7 +698,7 @@ async function fixFile(
     // passed"), which Playwright doesn't print, so just feed back the parsed Playwright failure
     // and skip the regression/structure-broken accounting (none of it is meaningful for specs).
     if (options.e2e) {
-      errorOutput = extractE2EFailure(rawRunOutput)
+      errorOutput = extractE2EFailure(rawRunOutput, result.timedOut)
       if (!onStatus) log(chalk.red(`  Still failing (attempt ${attempt}/${config.maxIterations})`))
       if (!onStatus && verbose) log(chalk.dim(errorOutput.split('\n').slice(0, 20).join('\n')))
       continue
@@ -651,6 +728,9 @@ async function fixFile(
   // For a type-only repair this puts back the passing (but type-erroring) file, which is
   // strictly better than a regenerated guess — so the caller must NOT regenerate it.
   await writeFile(absTestPath, testCode, 'utf-8').catch(() => {})
+  // Also restore any helper/config files the E2E multi-file fix overwrote — never leave a
+  // half-applied selector change behind when the repair ultimately failed.
+  for (const [abs, orig] of helperBackups) await writeFile(abs, orig, 'utf-8').catch(() => {})
   onStatus?.({ phase: 'failed', file: shortPath })
   const typeOnly = firstRun.success
   return {

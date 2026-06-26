@@ -12,6 +12,7 @@
 // <code_output>…</code_output>, so the existing parseStructuredResponse handles it unchanged.
 
 import type { RouteSnapshot } from '../../lib/flows/snapshot.js'
+import type { SpecHelperFile } from '../../lib/flows/spec-helpers.js'
 
 const SELECTOR_RULES = `SELECTORS — choose the first that uniquely identifies the element:
    1. getByRole(role, { name }) — strongly preferred. For icon-only controls, use the EXACT accessible
@@ -83,7 +84,7 @@ Assumptions: redirects, substituted ids, anything inferred (omit if none)
 </code_output>
 
 RULES:
-1. Import from Playwright only: import { test, expect } from '@playwright/test'. The spec imports NO application source and uses NO mocks — it exercises the running app.
+1. Import from @playwright/test, and you MAY import the project's existing TEST helpers/config (shared selectors, fixtures, setup) shown below — but NO application source and NO mocks; the spec exercises the running app.
 2. Target ONLY elements present in the PAGE SNAPSHOT. If the page has nothing meaningful to interact with, write a minimal navigation + visibility smoke test rather than fabricating elements. If an element the page clearly needs is absent (the snapshot may be truncated on a busy page), fall back to a visibility check on a container/heading that IS present and note the omission in <thinking> — never invent the missing selector.
 3. ${SELECTOR_RULES}
 4. ${ASSERTION_RULES}
@@ -104,8 +105,9 @@ export function buildE2EGeneratePrompt(args: {
   pageSource?: string | null     // the page/component source, trimmed — intent, not selectors
   dynamic?: boolean
   existingSpecExample?: string | null // an existing project spec, as a style reference
+  helpers?: SpecHelperFile[]          // shared selectors/helpers the project's specs import
 }): string {
-  const { route, specFilePath, baseURL, snapshot, pageSource, dynamic, existingSpecExample } = args
+  const { route, specFilePath, baseURL, snapshot, pageSource, dynamic, existingSpecExample, helpers } = args
   const parts: string[] = []
 
   parts.push(`Write a complete Playwright end-to-end spec for this route.`)
@@ -160,7 +162,17 @@ export function buildE2EGeneratePrompt(args: {
     parts.push('```')
   }
 
-  parts.push(`\nWrite the complete spec now. Role/label/testid locators only (testids must be from the list above), unique locators, web-first assertions, no arbitrary waits, and assert the outcome of every action.`)
+  if (helpers && helpers.length > 0) {
+    parts.push(`\nSHARED TEST HELPERS / CONFIG used by this project's specs — import and reuse these (their selectors, fixtures, and setup) instead of inlining selector strings or duplicating setup:`)
+    for (const h of helpers) {
+      parts.push(`\n--- ${h.path} ---`)
+      parts.push('```typescript')
+      parts.push(h.content)
+      parts.push('```')
+    }
+  }
+
+  parts.push(`\nWrite the complete spec now. Reuse the shared helpers/selectors where they fit; for any NEW locators prefer role/label/testid (testids must be from the list above), unique locators, web-first assertions, no arbitrary waits, and assert the outcome of every action.`)
   return parts.join('\n')
 }
 
@@ -176,8 +188,10 @@ export function buildE2EFixPrompt(args: {
   baseURL?: string | null
   snapshot?: RouteSnapshot | null
   existingSpecExample?: string | null
+  helpers?: SpecHelperFile[]    // local files the spec imports (selectors/helpers/config)
+  failurePageState?: string | null   // aria snapshot of the page AT failure, from Playwright's error-context
 }): string {
-  const { specFilePath, specCode, failureOutput, route, baseURL, snapshot, existingSpecExample } = args
+  const { specFilePath, specCode, failureOutput, route, baseURL, snapshot, existingSpecExample, helpers, failurePageState } = args
   const parts: string[] = []
 
   parts.push(`A Playwright spec is failing. Diagnose the root cause and apply the SMALLEST fix that makes it pass without changing what it tests.`)
@@ -190,10 +204,27 @@ export function buildE2EFixPrompt(args: {
   parts.push(specCode)
   parts.push('```')
 
+  if (helpers && helpers.length > 0) {
+    parts.push(`\nSHARED TEST HELPERS / CONFIG (imported by this spec — these define its selectors, fixtures, and setup; REUSE them, do not inline or duplicate them):`)
+    for (const h of helpers) {
+      parts.push(`\n--- ${h.path} ---`)
+      parts.push('```typescript')
+      parts.push(h.content)
+      parts.push('```')
+    }
+  }
+
   parts.push(`\nFAILURE OUTPUT:`)
   parts.push('```')
   parts.push(failureOutput.length > 3000 ? failureOutput.slice(0, 3000) + '\n…truncated' : failureOutput)
   parts.push('```')
+
+  if (failurePageState) {
+    parts.push(`\nPAGE STATE AT FAILURE (captured by Playwright at the exact moment the spec broke — this is the page the failing step was on, which in a multi-step flow is NOT the first route; AUTHORITATIVE for the failing step's selectors):`)
+    parts.push('```')
+    parts.push(failurePageState.length > 2500 ? failurePageState.slice(0, 2500) + '\n…truncated' : failurePageState)
+    parts.push('```')
+  }
 
   if (snapshot && snapshot.ok) {
     parts.push(`\nFRESH PAGE SNAPSHOT (current state of the page — AUTHORITATIVE for selectors; the page may have changed since the spec was written):`)
@@ -240,11 +271,23 @@ locator matched more than one element. Make it UNIQUE (role + accessible name, o
 the snapshot). Do NOT silence it with .first()/.last()/.nth() unless the snapshot shows the matches
 are genuinely equivalent with no semantic distinction.
 
-PRESERVE INTENT: keep what each test verifies, its name, the describe structure, and any helpers.
+PRESERVE INTENT and CONVENTIONS: keep what each test verifies, its name, the describe structure, and
+the project's helpers. When the spec uses SHARED TEST HELPERS / CONFIG (e.g. a central \`selectors\`
+object or helper functions), KEEP USING them — reference selectors.x and the helpers exactly as the
+spec does. Do NOT inline a selector string, duplicate a helper, or convert the project's selectors to
+getByRole. If the project centralises selectors as CSS strings, that is its deliberate convention;
+the role/label/testid preference is for NEW selectors you author, and does NOT override it.
 
-Output the COMPLETE repaired spec in <code_output>. Same rules as generation: role/label/testid
-locators only (testids must exist in the snapshot), unique locators, web-first assertions, no
-arbitrary waits, no forced interactions, assert the outcome of every action.`)
+FIX AT THE SOURCE (multi-file) — if the real cause is a stale selector or value DEFINED IN a helper
+file shown above (e.g. selectors.loginButton points at a data-testid that changed), fix it THERE, not
+by inlining a workaround in the spec. After the spec, append the corrected file like this:
+// ---HELPER_FILE: <exact path shown above>---
+<the COMPLETE updated contents of that file>
+Only emit a HELPER_FILE you were shown above; change only what is necessary in it.
+
+Output the repaired spec in <code_output> (followed by any // ---HELPER_FILE--- sections). Same rules
+as generation: prefer role/label/testid for any NEW locators, unique locators, web-first assertions,
+no arbitrary waits, no forced interactions, assert the outcome of every action.`)
 
   return parts.join('\n')
 }

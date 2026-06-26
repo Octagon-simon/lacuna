@@ -21,6 +21,7 @@ import { envForRunner } from '../lib/detector.js'
 import { buildE2ESystemPrompt, buildE2EGeneratePrompt, buildTestIdInjectionSystemPrompt, buildTestIdInjectionPrompt } from './prompts/e2e.js'
 import { buildLibraryTestIdGuidance } from '../lib/flows/ui-libraries.js'
 import { resolveComponentLibraries } from '../lib/flows/resolve-libraries.js'
+import { collectSpecHelpers } from '../lib/flows/spec-helpers.js'
 import type { PlaywrightConfig } from '../lib/playwright.js'
 import { TestGenerator, TruncatedOutputError, OscillationError } from './generator.js'
 import { runCommand } from '../lib/runner.js'
@@ -169,6 +170,9 @@ export async function runE2ELoop(options: E2ELoopOptions): Promise<E2ELoopResult
     }
 
     const exampleSpec = await findExampleSpec(testDirAbs)
+    // Shared selectors/helpers the project's specs import — so generated specs reuse the project's
+    // convention (central selectors object, fixtures, setup) instead of inlining their own.
+    const e2eHelpers = exampleSpec ? await collectSpecHelpers(exampleSpec.content, exampleSpec.path, cwd).catch(() => []) : []
     const systemPrompt = buildE2ESystemPrompt()
 
     // In parallel mode, drive the same live worker panel the unit commands use (per-worker rows
@@ -204,7 +208,8 @@ export async function runE2ELoop(options: E2ELoopOptions): Promise<E2ELoopResult
           snapshot: snapshotByRoute.get(flow.route) ?? null,
           pageSource,
           dynamic: flow.dynamic,
-          existingSpecExample: exampleSpec,
+          existingSpecExample: exampleSpec?.content ?? null,
+          helpers: e2eHelpers,
         })
 
         const outcome = await generateAndVerifySpec(flow, specPath, specName, userPrompt, systemPrompt, generator, options, onStatus)
@@ -438,11 +443,13 @@ async function specExists(testDirAbs: string, flow: Flow): Promise<boolean> {
 
 // Find an existing spec to show the model as a style reference. Best-effort: the first *.spec.ts
 // under the test dir that isn't one of ours.
-async function findExampleSpec(testDirAbs: string): Promise<string | null> {
+async function findExampleSpec(testDirAbs: string): Promise<{ path: string; content: string } | null> {
   const { readdir } = await import('fs/promises')
   let entries: string[]
   try { entries = await readdir(testDirAbs) } catch { return null }
   const spec = entries.find((e) => /\.(spec|e2e)\.[jt]sx?$/.test(e) && !e.startsWith('__lacuna'))
   if (!spec) return null
-  return readFile(join(testDirAbs, spec), 'utf-8').catch(() => null)
+  const abs = join(testDirAbs, spec)
+  const content = await readFile(abs, 'utf-8').catch(() => null)
+  return content === null ? null : { path: abs, content }
 }

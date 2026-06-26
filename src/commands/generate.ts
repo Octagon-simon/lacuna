@@ -91,6 +91,9 @@ export default class Generate extends Command {
     // before the unit-path setup (and its "unknown runner" guard) since a Playwright-only repo
     // legitimately has no unit runner.
     if (flags.e2e) {
+      // --file targets a source file in the unit path; E2E is route-driven, so it has no effect
+      // here. Warn rather than silently ignore it, and point at the right flag.
+      if (flags.file) this.warn(`--file is ignored with --e2e (E2E generation is route-driven). Use --route ${flags.file.startsWith('/') ? flags.file : '<path>'} to target a single route.`)
       await this.runE2E(config, flags)
       return
     }
