@@ -181,6 +181,8 @@ Everything above writes unit and integration tests. With `--e2e`, lacuna instead
 
 Requirements: `@playwright/test` installed and a `playwright.config.ts` with a `webServer` block (so lacuna can start your app) and a `baseURL`. Route discovery currently supports **Next.js** (app and pages router) and **React Router**.
 
+You don't have to install Playwright by hand. `lacuna init` offers to set it up (installs `@playwright/test` plus the browser binaries) for React and Next.js projects, and if you run `--e2e` without it, lacuna prints the install command and — in an interactive terminal — offers to install it on the spot. In CI or a non-interactive shell it just prints `npm install -D @playwright/test && npx playwright install` and exits, so nothing hangs.
+
 ```bash
 lacuna generate --e2e                  # discover routes, generate a spec for each
 lacuna generate --e2e --route /login   # just one route

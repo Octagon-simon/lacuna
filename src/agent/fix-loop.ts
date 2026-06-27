@@ -5,7 +5,7 @@ import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import { fileTestCommand, multiFileTestCommand, envForRunner } from '../lib/detector.js'
-import { detectPlaywright, loadPlaywrightConfig, playwrightTestCommand, parsePlaywrightResults, readPlaywrightErrorContext } from '../lib/playwright.js'
+import { ensurePlaywrightForRun, loadPlaywrightConfig, playwrightTestCommand, parsePlaywrightResults, readPlaywrightErrorContext } from '../lib/playwright.js'
 import { snapshotRoutes, type RouteSnapshot } from '../lib/flows/snapshot.js'
 import { collectSpecHelpers, splitSpecAndHelpers, type SpecHelperFile } from '../lib/flows/spec-helpers.js'
 import { buildE2ESystemPrompt, buildE2EFixPrompt } from './prompts/e2e.js'
@@ -1105,8 +1105,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
   // and the commands fixFile issues) by normalising options up front, so everything downstream
   // — including fixFile, which reads options.env — sees the Playwright runner.
   if (options.e2e) {
-    if (!(await detectPlaywright(options.cwd))) {
-      options.log(chalk.yellow('\n  --e2e needs @playwright/test in the project, but none was found.'))
+    if (!(await ensurePlaywrightForRun(options.cwd, { log: options.log, offerInstall: !options.dryRun }))) {
       return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
     }
     options = { ...options, env: envForRunner('playwright') }

@@ -13,7 +13,7 @@ import { readFile, writeFile, mkdir, rm, access } from 'fs/promises'
 import { join } from 'path'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
-import { detectPlaywright, loadPlaywrightConfig, playwrightRunCommand, parsePlaywrightResults } from '../lib/playwright.js'
+import { ensurePlaywrightForRun, loadPlaywrightConfig, playwrightRunCommand, parsePlaywrightResults } from '../lib/playwright.js'
 import { discoverFlows, type Flow } from '../lib/flows/discover.js'
 import { snapshotRoutes, type RouteSnapshot } from '../lib/flows/snapshot.js'
 import { ensureAppServer } from '../lib/flows/app-server.js'
@@ -64,8 +64,9 @@ const emptyResult = (): E2ELoopResult => ({ flowsDiscovered: 0, specsGenerated: 
 export async function runE2ELoop(options: E2ELoopOptions): Promise<E2ELoopResult> {
   const { config, cwd, dryRun, verbose, log } = options
 
-  if (!(await detectPlaywright(cwd))) {
-    log(chalk.yellow('\n  E2E generation needs @playwright/test in the project, but none was found.'))
+  // Offer to install Playwright when it's missing (interactive, non-CI, non-dry-run). This runs
+  // before the worker pool spawns, so the prompt never races the workers.
+  if (!(await ensurePlaywrightForRun(cwd, { log, offerInstall: !dryRun }))) {
     return emptyResult()
   }
 

@@ -21,6 +21,9 @@
 
 import { readFile, readdir } from 'fs/promises'
 import { join, isAbsolute, basename } from 'path'
+import { execSync } from 'child_process'
+import chalk from 'chalk'
+import { confirm } from '@inquirer/prompts'
 import type { DetectedEnvironment, TestRunner } from './detector.js'
 
 // ---------------------------------------------------------------------------------------------
@@ -57,6 +60,60 @@ export async function detectPlaywright(cwd: string): Promise<boolean> {
   }
   const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) }
   return '@playwright/test' in deps || 'playwright' in deps
+}
+
+// The two-step manual install we point users at when we can't (or shouldn't) install for them.
+export const PLAYWRIGHT_INSTALL_HINT = 'npm install -D @playwright/test && npx playwright install'
+
+// True only for an interactive terminal that isn't CI — the gate for any blocking prompt or
+// heavy install. A `--workers` run checks this BEFORE spawning workers, so prompting is safe.
+function isInteractive(): boolean {
+  return Boolean(process.stdin.isTTY && process.stdout.isTTY) && !process.env.CI
+}
+
+// Installs @playwright/test (devDep) and the browser binaries. Returns true on success.
+// Browsers are a separate, heavy download — that's why this is opt-in, never automatic.
+export function installPlaywright(cwd: string, log: (s: string) => void): boolean {
+  try {
+    log(chalk.dim('  Installing @playwright/test...'))
+    execSync('npm install -D @playwright/test', { cwd, stdio: 'inherit' })
+    log(chalk.dim('  Downloading Playwright browsers (npx playwright install)...'))
+    execSync('npx playwright install', { cwd, stdio: 'inherit' })
+    return true
+  } catch {
+    log(chalk.red(`  Install failed. Run manually: ${PLAYWRIGHT_INSTALL_HINT}`))
+    return false
+  }
+}
+
+// Ensures @playwright/test is available before an --e2e run. If it's missing, prints the exact
+// remediation and — only when interactive (TTY, not CI) and `offerInstall` (e.g. not --dry-run) —
+// offers to install it inline. Returns true when E2E can proceed. The check sits at the top of
+// the e2e/fix loops, before any worker pool starts, so the prompt never collides with workers.
+export async function ensurePlaywrightForRun(
+  cwd: string,
+  opts: { log: (s: string) => void; offerInstall: boolean },
+): Promise<boolean> {
+  const { log, offerInstall } = opts
+  if (await detectPlaywright(cwd)) return true
+
+  log(chalk.yellow('\n  --e2e needs @playwright/test, but it is not installed in this project.'))
+  if (!offerInstall || !isInteractive()) {
+    log(chalk.dim(`  Install it with:  ${PLAYWRIGHT_INSTALL_HINT}`))
+    log(chalk.dim('  Or run `lacuna init` and choose end-to-end testing.'))
+    return false
+  }
+
+  const doInstall = await confirm({
+    message: 'Install @playwright/test and browser binaries now?',
+    default: true,
+  })
+  if (!doInstall) {
+    log(chalk.dim(`  Skipped. Install manually:  ${PLAYWRIGHT_INSTALL_HINT}`))
+    return false
+  }
+  if (!installPlaywright(cwd, log)) return false
+  return detectPlaywright(cwd)
 }
 
 // ---------------------------------------------------------------------------------------------
