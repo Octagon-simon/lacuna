@@ -1,5 +1,6 @@
 import type { DetectedEnvironment } from '../../lib/detector.js';
 export declare const PATCH_MODE_LINE_THRESHOLD = 300;
+export declare function detectWeakAsyncWait(code: string): string | null;
 export declare function buildSystemPrompt(env: DetectedEnvironment): string;
 export declare function buildGeneratePrompt(args: {
     sourceFile: string;

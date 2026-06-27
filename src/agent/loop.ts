@@ -15,6 +15,7 @@ import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError,
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile } from '../lib/typecheck.js'
+import { detectWeakAsyncWait } from './prompts/index.js'
 import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
@@ -105,6 +106,10 @@ export async function processGap(
 
   let generatedCode: string | null = null
   let lastError: string | null = null
+  // One-shot: a green-but-racy "weak wait" test is invisible to the run-loop, so we nudge the
+  // model to strengthen it once. If it still trips after the nudge we accept the file rather than
+  // burn every iteration on a heuristic that might be a false positive.
+  let weakWaitNudged = false
   let firstError: string | null = null      // error from attempt 1, kept as anchor for regressions
   let firstPassCount = 0                    // passing tests on attempt 1
   let stallRetries = 0
@@ -347,6 +352,19 @@ export async function processGap(
         if (!onStatus) log(chalk.yellow(`  Placeholder test bodies detected — retrying...`))
         onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations } as WorkerState)
         continue
+      }
+      // Tests pass — but a "weak wait" (assert state right after a call-only waitFor) passes
+      // locally and fails in slow CI. The run-loop can't see it (it's green), so scan statically
+      // and nudge once. One-shot to bound the cost of a false positive.
+      if (!weakWaitNudged && attempt < config.maxIterations) {
+        const weakWait = detectWeakAsyncWait(testCode)
+        if (weakWait) {
+          weakWaitNudged = true
+          lastError = weakWait
+          if (!onStatus) log(chalk.yellow(`  Tests pass but an async wait looks racy — strengthening it (retrying)...`))
+          onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations } as WorkerState)
+          continue
+        }
       }
       const typeErrors = await typeCheckFile(context.suggestedTestFile, cwd, env)
       if (typeErrors) {

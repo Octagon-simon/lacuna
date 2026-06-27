@@ -282,6 +282,97 @@ function detectRealRequestInError(errorOutput: string, mockApi = 'vi'): string |
   return lines.join('\n')
 }
 
+// Returns the index just AFTER the ')' that matches the '(' at openParenIdx, skipping string
+// literals, template literals, and comments (an apostrophe in a comment must not open a string).
+// -1 if unbalanced.
+function matchingParen(code: string, openParenIdx: number): number {
+  let depth = 0
+  let i = openParenIdx
+  while (i < code.length) {
+    const ch = code[i]
+    if (ch === '/' && code[i + 1] === '/') { i += 2; while (i < code.length && code[i] !== '\n') i++; continue }
+    if (ch === '/' && code[i + 1] === '*') { i += 2; while (i < code.length && !(code[i] === '*' && code[i + 1] === '/')) i++; i += 2; continue }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const q = ch; i++
+      while (i < code.length) { if (code[i] === '\\') { i += 2; continue } if (code[i] === q) { i++; break } i++ }
+      continue
+    }
+    if (ch === '(') depth++
+    else if (ch === ')') { depth--; if (depth === 0) return i + 1 }
+    i++
+  }
+  return -1
+}
+
+// Blanks out the argument span of every waitFor(...)/act(...) call in `s`, so a state read that
+// legitimately lives INSIDE a later waitFor/act isn't mistaken for an unwrapped synchronous read.
+function blankWrappedBlocks(s: string): string {
+  for (const kw of ['waitFor(', 'act(']) {
+    let idx = 0
+    while ((idx = s.indexOf(kw, idx)) !== -1) {
+      const open = idx + kw.length - 1
+      const close = matchingParen(s, open)
+      if (close === -1) { idx += kw.length; continue }
+      s = s.slice(0, idx) + ' '.repeat(close - idx) + s.slice(close)
+      idx = close
+    }
+  }
+  return s
+}
+
+// Detects the "weak wait" race in a test that PASSES locally: a `waitFor` whose body only checks
+// that a mock was *called*, followed by a synchronous read of hook state (`result.current.*`). The
+// mock is called before its promise resolves, so the state read races and gets the initial value —
+// invisible locally (microtasks flush fast), but fails in slower/contended CI. The normal run-loop
+// can't catch this because the test is green, so we scan the source statically. Returns guidance or
+// null. Conservative by design: a waitFor that already asserts a settle signal, or whose only
+// trailing reads are mock.calls[...] arg checks (fine after a call-only wait), does NOT match.
+export function detectWeakAsyncWait(code: string): string | null {
+  const CALL_MATCHER = /\.toHaveBeen(?:Called|CalledWith|CalledTimes|NthCalledWith|LastCalledWith)\b/
+  // A "settle signal" inside the waitFor body — its presence means the wait is NOT call-only.
+  const SETTLE = /result\.current\.|isLoading|isFetching|isPending|isSuccess|isError\b|getBy|findBy|queryBy|toBeInTheDocument|toBeVisible|toBeTruthy|\.toEqual|\.toStrictEqual|\.toMatchObject|\.toHaveLength|\.toBe\(/
+
+  let from = 0
+  while (true) {
+    const wf = code.indexOf('waitFor(', from)
+    if (wf === -1) break
+    const open = wf + 'waitFor'.length
+    const end = matchingParen(code, open)
+    if (end === -1) break
+    from = end
+
+    const body = code.slice(open + 1, end - 1)
+    const callOnly = CALL_MATCHER.test(body) && !SETTLE.test(body)
+    if (!callOnly) continue
+
+    // Look from here to the start of the next test for an UNWRAPPED synchronous state read.
+    let boundary = code.length
+    for (const kw of ['\n  it(', '\n  test(', '\n    it(', '\n    test(', '\nit(', '\ntest(']) {
+      const b = code.indexOf(kw, end)
+      if (b !== -1 && b < boundary) boundary = b
+    }
+    const tail = blankWrappedBlocks(code.slice(end, boundary))
+    if (/expect\(\s*result\.current\./.test(tail)) {
+      return [
+        'WEAK ASYNC WAIT — this test passes locally but will likely fail in CI.',
+        'A `waitFor` that only checks a mock was CALLED is followed by a synchronous read of hook state',
+        '(`result.current.*`). The mock is called before its promise resolves and before the setState that',
+        'consumes it runs, so the state read races and gets the INITIAL value on a slower CI machine.',
+        'Required fix: wait for the work to FINISH before reading state — add a settle signal INSIDE the waitFor',
+        '(prefer the loading flag, else the asserted value itself):',
+        '  await waitFor(() => {',
+        '    expect(service.getThing).toHaveBeenCalled()',
+        '    expect(result.current.isLoading).toBe(false)   // settle signal',
+        '  })',
+        '  expect(result.current.items).toEqual(mockItems)  // now safe to read',
+        'Keep mock.calls[...] argument assertions where they are (the call already happened); only STATE reads',
+        'need the stronger wait. Do NOT wait on a signal that is true before the work finishes.',
+      ].join('\n')
+    }
+  }
+  return null
+}
+
 // ─── System prompt ────────────────────────────────────────────────────────────
 
 export function buildSystemPrompt(env: DetectedEnvironment): string {

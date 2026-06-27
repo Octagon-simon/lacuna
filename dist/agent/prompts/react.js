@@ -19,6 +19,23 @@ export function buildReactCauses(isJSRunner, mockApi) {
 
     - findBy over waitFor: prefer findByRole/findByText/findByLabelText over waitFor(() => getByRole(...)). findBy has built-in timeout, is semantically clearer, and avoids unnecessary waitFor nesting. Use waitFor only when asserting on non-element state (e.g. mock call counts, store updates).
 
+    - WEAK-WAIT RACE (passes locally, fails in CI) — the single most important async rule: NEVER assert hook/component STATE right after a waitFor whose body only checks that a mock was *called*. A mock is called synchronously, BEFORE its promise resolves and before the setState that consumes the result runs. So this races and reads the initial value in slow CI:
+        // ❌ BROKEN — waits for the CALL, then reads STATE that isn't set yet
+        await waitFor(() => { expect(service.getThing).toHaveBeenCalled(); });
+        expect(result.current.items).toEqual(mockItems);   // reads [] in slow CI
+      Fix: wait for the work to FINISH (a settle signal), then assert — or put the state assertion itself inside waitFor:
+        // ✅ wait for the loading flag to clear (the work is done), THEN read state
+        await waitFor(() => {
+          expect(service.getThing).toHaveBeenCalled();
+          expect(result.current.isLoading).toBe(false);    // settle signal
+        });
+        expect(result.current.items).toEqual(mockItems);
+      Pick the settle signal in this order: (1) isLoading === false (or the hook's loading flag), (2) the asserted value itself inside waitFor, (3) a terminal error/empty state for failure-path tests. NEVER use a signal that is true BEFORE the work finishes (a "was called" check, a synchronously-set ref, or a call count of 1 when more calls are coming). For a hook whose mount effect fires several concurrent fetches that each toggle the same loading flag, wait for the flag to be false (terminal) — never for "the first call happened".
+
+    - CALL-ARG assertions are the exception: reading mock.calls[...] (e.g. expect(service.getThing.mock.calls[0][0].page).toBe(0)) AFTER a call-only waitFor is fine — the call already happened. Only STATE reads (result.current.*, rendered output) need the stronger settle wait. Keep the two kinds distinct: a call-arg check after a call-only wait is correct; a state read after a call-only wait is the bug.
+
+    - Failure-signature → diagnosis (when a CI assertion fails but the test passes locally, it is almost always a weak wait, NOT pollution): "expected [] to deeply equal [ {…} ]" = got initial state instead of resolved data; "expected true to be false" on a loading flag = work still in flight; "expected null to be <error>" = rejection handler hadn't run. Fix by strengthening the waitFor settle signal, not by hunting for pollution. (renderHook/render state is fresh per test and cannot be polluted across files — only module-level singletons/caches can.)
+
     - Query hierarchy rule:
       1. getByRole (preferred)
       2. getByLabelText
