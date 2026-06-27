@@ -126,7 +126,11 @@ export async function processGap(
   for (let attempt = 1; attempt <= config.maxIterations; attempt++) {
     if (!onStatus) {
       if (attempt > 1) {
-        log(chalk.yellow(`\n  Retry ${attempt}/${config.maxIterations} — fixing failures...`))
+        // Word the header by the actual reason for this retry. After a type-check
+        // failure the tests already PASS — calling it "fixing failures" is misleading.
+        const fixingTypes = lastError?.startsWith('Tests passed but TypeScript type errors')
+        const what = fixingTypes ? 'fixing type errors (tests pass)' : 'fixing failures'
+        log(chalk.yellow(`\n  Retry ${attempt}/${config.maxIterations} — ${what}...`))
       }
     }
 
@@ -348,7 +352,7 @@ export async function processGap(
       if (typeErrors) {
         if (attempt < config.maxIterations) {
           lastError = `Tests passed but TypeScript type errors were found in the generated file:\n${typeErrors}\n\nFix ALL type errors. Do not use 'as any' or '@ts-ignore'.`
-          if (!onStatus) log(chalk.yellow(`  Type errors found — retrying...`))
+          if (!onStatus) log(chalk.yellow(`  Tests pass — fixing type errors (retrying)...`))
           onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations } as WorkerState)
           continue
         }

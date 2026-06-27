@@ -415,6 +415,14 @@ async function fixFile(
   let stallRetries = 0
   const MAX_STALL_RETRIES = 2
 
+  // Keep-best across retries: a failing run can still be a net improvement over the
+  // original (e.g. attempt 1 fixes 2 of 3 broken tests). Retries sometimes regress
+  // below that high-water mark, so on exhaustion we must restore the BEST attempt —
+  // not the last one and not blindly the original. bestCode/bestPassCount start at
+  // the original so, absent any improvement, behaviour is unchanged (restore original).
+  let bestCode = testCode
+  let bestPassCount = baselinePassCount
+
   for (let attempt = 1; attempt <= config.maxIterations; attempt++) {
     if (attempt > 1) {
       if (!onStatus) log(chalk.yellow(`\n  Retry ${attempt}/${config.maxIterations}...`))
@@ -509,7 +517,8 @@ async function fixFile(
         }
         if (!onStatus) log(chalk.red(`\n  ⚠ Agent loop detected — output identical to a previous attempt. Stopping early.`))
         onStatus?.({ phase: 'failed', file: shortPath })
-        await writeFile(absTestPath, testCode, 'utf-8').catch(() => {})
+        // Keep the best attempt (original if nothing beat it) rather than the looped output.
+        await writeFile(absTestPath, bestCode, 'utf-8').catch(() => {})
         for (const [abs, orig] of helperBackups) await writeFile(abs, orig, 'utf-8').catch(() => {})
         return { success: false, error: err.message }
       }
@@ -684,7 +693,7 @@ async function fixFile(
         // Test-repair mode: the failing test(s) now PASS — that IS the fix. Residual type
         // errors (often just implicit-any in mocks) must not make us burn retries or revert to
         // the broken original. Keep the passing fix; surface the types as a follow-up.
-        if (!onStatus) log(chalk.yellow('  ⚠ Tests now pass — keeping the fix. Type errors remain; run `lacuna fix --types` to clean them up.'))
+        if (!onStatus) log(chalk.yellow(`  ⚠ Tests now pass — keeping the fix. Type errors remain; run \`lacuna fix --file ${shortPath}\` to clean them up.`))
         onStatus?.({ phase: 'passed', file: shortPath })
         return { success: true }
       }
@@ -711,6 +720,13 @@ async function fixFile(
     // rawExtracted there so the actual module error isn't buried in boilerplate.
     const extracted = enrichNoTestsError(rawExtracted, rawRunOutput)
 
+    // Track the high-water mark — the attempt with the most passing tests so far.
+    // Only collecting runs qualify (structureBroken === 0 tests is never "best").
+    if (!structureBroken && currentPassCount > bestPassCount) {
+      bestCode = testFileContent
+      bestPassCount = currentPassCount
+    }
+
     if (structureBroken) {
       errorOutput = buildStructureBrokenMessage(initialErrorOutput, rawExtracted)
       if (!onStatus) log(chalk.red(`  Fix broke file structure — 0 tests collected (attempt ${attempt}/${config.maxIterations})`))
@@ -724,19 +740,27 @@ async function fixFile(
     if (!onStatus && verbose) log(chalk.dim(errorOutput.split('\n').slice(0, 20).join('\n')))
   }
 
-  // Restore original test file — don't leave broken AI code on disk.
-  // For a type-only repair this puts back the passing (but type-erroring) file, which is
-  // strictly better than a regenerated guess — so the caller must NOT regenerate it.
-  await writeFile(absTestPath, testCode, 'utf-8').catch(() => {})
+  // Leave the BEST attempt on disk — not the last one. bestCode is the original
+  // unless some attempt collected strictly more passing tests, so a pure failure still
+  // restores the original (don't leave broken AI code on disk), while a partial win
+  // (e.g. attempt 1 fixed 2 of 3 tests but later retries regressed) is preserved.
+  // For a type-only repair this is the original passing (but type-erroring) file,
+  // which is strictly better than a regenerated guess — the caller must NOT regenerate it.
+  await writeFile(absTestPath, bestCode, 'utf-8').catch(() => {})
   // Also restore any helper/config files the E2E multi-file fix overwrote — never leave a
   // half-applied selector change behind when the repair ultimately failed.
   for (const [abs, orig] of helperBackups) await writeFile(abs, orig, 'utf-8').catch(() => {})
+  if (!onStatus && bestPassCount > baselinePassCount) {
+    log(chalk.yellow(`  Kept best attempt: ${baselinePassCount} → ${bestPassCount} passing (couldn't reach all-green).`))
+  }
   onStatus?.({ phase: 'failed', file: shortPath })
   const typeOnly = firstRun.success
   return {
+    // Report what's actually on disk now, so the regen fallback compares against the
+    // kept improvement and never replaces it with a worse from-scratch rewrite.
+    baselinePassCount: bestPassCount,
     success: false,
     typeOnly,
-    baselinePassCount,
     error: `${typeOnly ? 'Type errors remain' : 'Still failing'} after ${config.maxIterations} attempts. Last error:\n${errorOutput.slice(0, 1500)}`,
   }
 }

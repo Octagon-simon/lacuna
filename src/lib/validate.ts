@@ -537,13 +537,42 @@ export interface PatchOperation {
 //   // @@@ WITH:
 //   <replacement text>
 //   // @@@ END
+// Strips a single matching pair of outer quotes (either "..." or '...') from an
+// anchor and unescapes the wrapping quote char inside it. Models emit anchors for
+// test names that contain quotes in two ways, and both must resolve to the literal
+// name as it appears in the file:
+//   raw nested:  "shows "x" msg"   → shows "x" msg
+//   escaped:     "shows \"x\" msg" → shows "x" msg   (proper JS string literal)
+// Only the outermost pair is removed, and only the wrapping quote's escape (\" for
+// a "..." anchor, \' for a '...' anchor) plus \\ are unescaped — so inner quotes
+// of the OTHER style are left untouched. A string whose ends don't both match
+// (unquoted anchors, or one stray quote) is returned unchanged.
+function stripOuterQuotes(s: string): string {
+  if (s.length >= 2) {
+    const first = s[0]
+    const last = s[s.length - 1]
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      const inner = s.slice(1, -1)
+      // Unescape string-literal escapes in one left-to-right pass: \" -> ", \' -> ',
+      // \\ -> \ . Non-overlapping matching means \\" stays \" (escaped backslash
+      // followed by a literal quote), which is the correct interpretation.
+      return inner.replace(/\\(["'\\])/g, '$1')
+    }
+  }
+  return s
+}
+
 export function parsePatch(patchOutput: string): PatchOperation[] {
   const ops: PatchOperation[] = []
   const lines = patchOutput.split('\n')
-  // Capture the anchor either quoted ("name") or unquoted (name).
-  // Group 2 = quoted text, group 3 = unquoted text. DeepSeek and other models
-  // often drop the double-quotes, so we accept both forms.
-  const headerRe = /^\/\/ @@@ (REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):\s*(?:"([^"]*)"|(.*\S))?/
+  // Capture everything after the colon as the raw anchor; a single pair of
+  // outer quotes is stripped below. Capturing the whole remainder (rather than
+  // a `"([^"]*)"` group) is required because a test name can itself contain
+  // double quotes — e.g. it('shows "No accounts match" message') — and a
+  // greedy-stop-at-first-quote group would truncate the anchor to "shows ",
+  // which never matches the file. Models also routinely drop the outer quotes,
+  // so unquoted anchors must work too.
+  const headerRe = /^\/\/ @@@ (REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):\s*(.*)$/
   const withRe = /^\/\/ @@@ WITH:\s*$/
   const endRe = /^\/\/ @@@ END\s*$/
 
@@ -578,7 +607,7 @@ export function parsePatch(patchOutput: string): PatchOperation[] {
       if (content.endsWith('\n')) content = content.slice(0, -1)
       ops.push({ type, anchor, content })
     } else {
-      const anchor = (m[2] ?? m[3] ?? '').trim()  // quoted OR unquoted; ADD_IMPORT/ADD_AFTER_IMPORTS have no anchor
+      const anchor = stripOuterQuotes((m[2] ?? '').trim())  // ADD_IMPORT/ADD_AFTER_IMPORTS have no anchor
       const contentLines: string[] = []
       while (i < lines.length && !endRe.test(lines[i])) {
         contentLines.push(lines[i])
@@ -648,6 +677,22 @@ function findCallEnd(code: string, startIdx: number): number {
 
   while (i < code.length) {
     const ch = code[i]
+
+    // Skip line/block comments BEFORE the string check. An apostrophe inside a
+    // comment (e.g. `// channel that doesn't exist`) would otherwise be read as a
+    // string-literal opener and swallow the rest of the test body — including its
+    // closing braces — so findCallEnd never balances and returns -1.
+    if (ch === '/' && code[i + 1] === '/') {
+      i += 2
+      while (i < code.length && code[i] !== '\n') i++
+      continue
+    }
+    if (ch === '/' && code[i + 1] === '*') {
+      i += 2
+      while (i < code.length && !(code[i] === '*' && code[i + 1] === '/')) i++
+      i += 2
+      continue
+    }
 
     // Skip string literals to avoid false brace/paren counts inside strings
     if (ch === '"' || ch === "'") {
@@ -803,6 +848,20 @@ export function applyPatch(existingCode: string, ops: PatchOperation[]): string 
 
       while (i < code.length) {
         const ch = code[i]
+
+        // Skip line/block comments before the string check — an apostrophe in a
+        // comment must not be read as a string opener (see findCallEnd).
+        if (ch === '/' && code[i + 1] === '/') {
+          i += 2
+          while (i < code.length && code[i] !== '\n') i++
+          continue
+        }
+        if (ch === '/' && code[i + 1] === '*') {
+          i += 2
+          while (i < code.length && !(code[i] === '*' && code[i + 1] === '/')) i++
+          i += 2
+          continue
+        }
 
         // Skip string literals
         if (ch === '"' || ch === "'") {

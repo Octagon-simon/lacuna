@@ -91,12 +91,12 @@ lacuna generate                              lacuna fix
        ├─ Read tsconfig paths, deps, setup          ├─ Model writes a surgical fix
        ├─ Send full context to the model            ├─ Pass → next file
        ├─ Run the generated tests                   └─ Fail → record it, detect loops,
-       ├─ Pass → next file                                   retry, restore on giving up
+       ├─ Pass → next file                                   retry, keep the best attempt
        └─ Fail → retry with the error,
-                 restore original if it can't
+                 keep the best attempt
 ```
 
-Two rules hold throughout: lacuna never leaves a half-written file behind, and it never removes passing tests. If it can't improve a file, it puts the original back.
+Two rules hold throughout: lacuna never leaves a half-written file behind, and it never removes passing tests. If it can't fully fix a file, it keeps the attempt with the most passing tests — and if nothing beat the starting point, it puts the original back.
 
 This is the unit/integration layer. For browser-level tests, [`--e2e`](#end-to-end-testing-playwright) follows the same loop but targets routes instead of source files and verifies with a real browser run.
 
@@ -142,7 +142,7 @@ If you ran `analyze` in the last 10 minutes, `generate` reuses that report inste
 
 ### `lacuna fix`
 
-Finds failing tests and repairs them. Each failing file goes to the model with its error output and source; the model patches what's broken and lacuna reruns until it passes. A fix that makes the tests pass is kept even if minor type warnings remain. `fix` never reverts a working change.
+Finds failing tests and repairs them. Each failing file goes to the model with its error output and source; the model patches what's broken and lacuna reruns until it passes. A fix that makes the tests pass is kept even if minor type warnings remain. `fix` never reverts a working change — and when it can't reach all-green, it keeps the attempt with the most passing tests rather than discarding a partial improvement.
 
 ```bash
 lacuna fix
@@ -160,7 +160,7 @@ lacuna fix --e2e                             # repair failing Playwright specs (
 A few behaviors worth knowing:
 
 - **Regeneration fallback (on by default).** If repair is exhausted on a *genuinely broken* file (one with no passing tests to lose), lacuna deletes it and regenerates from source, since a clean start beats more patching. A file that already has passing tests is never deleted, and a regeneration that would lower the passing count is discarded. Turn it off with `--no-regenerate-on-failure`.
-- **Type errors (`--types`).** Selects files by TypeScript errors instead of test failures: one project-wide `tsc` finds every test file that fails type-checking, even if its tests pass. It respects each file's governing `tsconfig`: if the nearest one disables `noImplicitAny` (common in monorepo packages), implicit-`any` isn't treated as an error.
+- **Type errors (`--types`).** Selects files by TypeScript errors instead of test failures, finding every test file that fails type-checking even if its tests pass. Type-checking runs against each file's **governing `tsconfig`** (the nearest one walking up), not the repo root — so in a monorepo a package's `@/` path aliases, `jsx`, and `moduleResolution` resolve correctly and a clean file isn't flagged with false `Cannot find module`/`Cannot use JSX` errors. It also respects that config's rules: if the nearest one disables `noImplicitAny` (common in monorepo packages), implicit-`any` isn't treated as an error. Files are grouped by config and checked one scoped `tsc` run per package.
 - **Polluters (`--fix-polluters`).** For tests that pass alone but fail in the full suite, lacuna bisects the suite to find the file leaking state and fixes it; if none can be isolated, it regenerates the affected test.
 
 Without `--file`, the failing-files list is cached for 30 minutes and trimmed to whatever's still failing after each run, so re-running picks up where you left off.
