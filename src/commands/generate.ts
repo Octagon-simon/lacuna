@@ -77,6 +77,10 @@ export default class Generate extends Command {
       description: 'With --e2e: add data-testid attributes to page SOURCE files for stabler selectors (the only flag that edits your source; each injection is verified against a re-snapshot and reverted if it does not reach the DOM)',
       default: false,
     }),
+    deep: Flags.boolean({
+      description: 'With --e2e: deeply explore multi-step flows — fills and SUBMITS forms to walk wizards step by step and generate full user-journey specs. This drives real actions (creates records, can trigger payments), so use a TEST/STAGING environment.',
+      default: false,
+    }),
   }
 
   async run(): Promise<void> {
@@ -170,13 +174,14 @@ export default class Generate extends Command {
   }
 
   // E2E generation path: discover routes, snapshot the DOM, generate + verify Playwright specs.
-  private async runE2E(config: Awaited<ReturnType<typeof loadConfig>>, flags: { 'dry-run': boolean; verbose: boolean; route?: string; 'max-routes'?: number; workers: number; 'inject-testids': boolean }): Promise<void> {
+  private async runE2E(config: Awaited<ReturnType<typeof loadConfig>>, flags: { 'dry-run': boolean; verbose: boolean; route?: string; 'max-routes'?: number; workers: number; 'inject-testids': boolean; deep: boolean }): Promise<void> {
     this.log(chalk.bold('\nlacuna generate --e2e\n'))
     this.log(`${chalk.dim('Model:')}   ${chalk.cyan(config.model)}`)
     this.log(`${chalk.dim('Mode:')}    ${chalk.cyan('end-to-end')} ${chalk.dim('(Playwright specs from discovered routes)')}`)
     if (flags.route) this.log(`${chalk.dim('Route:')}   ${flags.route}`)
     if (flags.workers > 1) this.log(`${chalk.dim('Workers:')} ${flags.workers}`)
     if (flags['inject-testids']) this.log(`${chalk.dim('Testids:')} ${chalk.yellow('inject')} ${chalk.dim('(edits page source; reverted if a testid does not reach the DOM)')}`)
+    if (flags.deep) this.log(`${chalk.dim('Deep:')}    ${chalk.yellow('on')} ${chalk.dim('(walks flows by filling & SUBMITTING forms — use a test/staging environment)')}`)
     const debugPattern = debugLogPattern(config.debug)
     if (debugPattern) this.log(`${chalk.dim('Debug:')}   ${chalk.green('on')} ${chalk.dim(`→ ${debugPattern}`)}`)
     if (flags['dry-run']) this.log(chalk.yellow('  [dry-run — no files will be written]'))
@@ -192,6 +197,7 @@ export default class Generate extends Command {
         maxRoutes: flags['max-routes'],
         workers: flags.workers,
         injectTestIds: flags['inject-testids'],
+        deep: flags.deep,
         log: (msg) => this.log(msg),
       })
     } catch (err) {

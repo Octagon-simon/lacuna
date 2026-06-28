@@ -5,7 +5,7 @@ import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import { fileTestCommand, multiFileTestCommand, envForRunner } from '../lib/detector.js'
-import { ensurePlaywrightForRun, loadPlaywrightConfig, playwrightTestCommand, parsePlaywrightResults, readPlaywrightErrorContext } from '../lib/playwright.js'
+import { ensurePlaywrightForRun, loadPlaywrightConfig, playwrightTestCommand, parsePlaywrightResults, readPlaywrightErrorContext, runPlaywrightJson } from '../lib/playwright.js'
 import { snapshotRoutes, type RouteSnapshot } from '../lib/flows/snapshot.js'
 import { collectSpecHelpers, splitSpecAndHelpers, type SpecHelperFile } from '../lib/flows/spec-helpers.js'
 import { buildE2ESystemPrompt, buildE2EFixPrompt } from './prompts/e2e.js'
@@ -20,7 +20,7 @@ import type { CoverageGap } from '../lib/coverage/types.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile, findTestFilesWithTypeErrors } from '../lib/typecheck.js'
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, countTestFunctions, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -390,7 +390,10 @@ async function fixFile(
   ])
 
   // Build mocks/setup context relative to the actual test file path
-  const ctx = await buildFixFileContext(absTestPath, cwd, config).catch(() => null)
+  // Unit-test context (mocks file, source-under-test, type defs) is only consumed by the unit
+  // `generator.fix()` path. E2E repair uses `fixE2E` (spec + route snapshot + helpers) and never reads
+  // ctx, so skip it for e2e — otherwise we'd needlessly read the unit mock file for a Playwright spec.
+  const ctx = options.e2e ? null : await buildFixFileContext(absTestPath, cwd, config).catch(() => null)
 
   // E2E repair context: capture a FRESH snapshot of the spec's route once (best-effort) so the
   // repair prompt can fix selector drift against the page's current state — the dominant cause
@@ -422,6 +425,13 @@ async function fixFile(
   // the original so, absent any improvement, behaviour is unchanged (restore original).
   let bestCode = testCode
   let bestPassCount = baselinePassCount
+  // Coverage floor: the spec being repaired must not come back with FEWER test cases. A model can
+  // "fix" failures by deleting the failing tests — which goes green while silently shrinking coverage,
+  // and the pass-count regression check below can't see it (removing a FAILING test leaves the pass
+  // count unchanged). This is a repair tool, so we never accept a green achieved by dropping the
+  // user's tests; if the model can only pass by deleting, the loop exhausts and restores the best
+  // (non-shrunk) attempt.
+  const baselineTestCount = countTestFunctions(testCode)
 
   for (let attempt = 1; attempt <= config.maxIterations; attempt++) {
     if (attempt > 1) {
@@ -671,6 +681,15 @@ async function fixFile(
           '  })\n' +
           'Replace every `// body` placeholder with real arrange-act-assert code.'
         if (!onStatus) log(chalk.yellow('  Placeholder test bodies detected — retrying...'))
+        onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations })
+        continue
+      }
+      // Coverage guard: a green run achieved by DELETING test cases is not a repair. Reject it and
+      // require the dropped tests back. (Pass-count regression can't catch this — see baselineTestCount.)
+      const fixedTestCount = countTestFunctions(testFileContent)
+      if (fixedTestCount < baselineTestCount) {
+        errorOutput = `The run is green but you DELETED ${baselineTestCount - fixedTestCount} test case(s) (the spec had ${baselineTestCount}, this version has ${fixedTestCount}). Removing, skipping, or commenting out a failing test is NOT a fix. Restore ALL ${baselineTestCount} tests and make the failing one(s) genuinely pass.`
+        if (!onStatus) log(chalk.yellow(`  Green but dropped ${baselineTestCount - fixedTestCount} test(s) — requiring restore (attempt ${attempt}/${config.maxIterations}).`))
         onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations })
         continue
       }
@@ -1122,7 +1141,8 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
     // parsed from the JSON reporter. We delegate app start/stop to Playwright's own webServer
     // config rather than orchestrating it here.
     const spinner = startCoverageSpinner(chalk.dim('  Running Playwright suite to find failing specs...'), env.testRunner)
-    const suiteResult = await runCommand(playwrightTestCommand(), cwd, config.coverageTimeout * 1000, spinner.onLine)
+    // JSON to a file (runPlaywrightJson) so dev-server logs can't corrupt it.
+    const { run: suiteResult, parsed } = await runPlaywrightJson(playwrightTestCommand(), cwd, config.coverageTimeout * 1000, spinner.onLine)
     spinner.stop()
 
     if (suiteResult.timedOut) {
@@ -1137,7 +1157,6 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
     }
 
-    const parsed = parsePlaywrightResults(suiteResult.stdout + '\n' + suiteResult.stderr)
     const failed = parsed ? [...new Set(parsed.failures.map((f) => f.file))] : []
     failingFiles = failed.filter((f) => {
       const abs = f.startsWith('/') ? f : join(cwd, f)
@@ -1320,7 +1339,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
 
   let pollutersFixed = 0
   let victimsRegenerated = 0
-  if (options.fixPolluters && victimFiles.length > 0) {
+  if (options.fixPolluters && !options.e2e && victimFiles.length > 0) {
     log(chalk.bold(`\n  Scanning for test polluters (${victimFiles.length} victim file(s) pass alone but fail in suite)...`))
     const polluterResult = await findAndFixPolluters(victimFiles, options, memorySnapshot)
     pollutersFixed = polluterResult.pollutersFixed

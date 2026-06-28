@@ -15,6 +15,15 @@ export function hasTestFunctions(code: string): boolean {
   return /\b(?:it|test)\s*(?:\.(?:each|concurrent|skip|only))?\s*\(/.test(stripped)
 }
 
+// Counts top-level test cases (`test(...)` / `it(...)`), ignoring `test.describe`/`test.step` which
+// are grouping, not cases. Used to detect a retry quietly DROPPING test cases to go green (a model
+// "fixing" failures by deleting them) so coverage doesn't silently shrink across attempts.
+export function countTestFunctions(code: string): number {
+  const stripped = stripNonCode(code)
+  const m = stripped.match(/\b(?:it|test)\s*(?:\.(?:each|concurrent|skip|only))?\s*\(/g)
+  return m ? m.length : 0
+}
+
 // Returns true when the code contains placeholder test bodies — e.g. `{ // body }`.
 // A placeholder passes vitest (no assertions = no failures) but produces zero value.
 export function hasPlaceholderBodies(code: string): boolean {

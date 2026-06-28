@@ -9,13 +9,15 @@
 // carries oscillation + truncation handling), and the Playwright result parser. What's new is
 // route-driven targeting, the snapshot-as-context step, and flake confirmation.
 
-import { readFile, writeFile, mkdir, rm, access } from 'fs/promises'
+import { readFile, writeFile, mkdir, rm, access, stat } from 'fs/promises'
 import { join } from 'path'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
-import { ensurePlaywrightForRun, loadPlaywrightConfig, playwrightRunCommand, parsePlaywrightResults } from '../lib/playwright.js'
+import { ensurePlaywrightForRun, loadPlaywrightConfig, playwrightRunCommand, runPlaywrightJson, refreshAuthState } from '../lib/playwright.js'
 import { discoverFlows, type Flow } from '../lib/flows/discover.js'
-import { snapshotRoutes, type RouteSnapshot } from '../lib/flows/snapshot.js'
+import { snapshotRoutes, snapshotInteractions, type RouteSnapshot, type InteractionProbe, type InteractiveElement, type TestIdElement } from '../lib/flows/snapshot.js'
+import { exploreFlows, type Journey } from '../lib/flows/explore.js'
+import { buildFlowMap } from '../lib/flows/flowmap.js'
 import { ensureAppServer } from '../lib/flows/app-server.js'
 import { envForRunner } from '../lib/detector.js'
 import { buildE2ESystemPrompt, buildE2EGeneratePrompt, buildTestIdInjectionSystemPrompt, buildTestIdInjectionPrompt } from './prompts/e2e.js'
@@ -23,9 +25,9 @@ import { buildLibraryTestIdGuidance } from '../lib/flows/ui-libraries.js'
 import { resolveComponentLibraries } from '../lib/flows/resolve-libraries.js'
 import { collectSpecHelpers } from '../lib/flows/spec-helpers.js'
 import type { PlaywrightConfig } from '../lib/playwright.js'
-import { TestGenerator, TruncatedOutputError, OscillationError } from './generator.js'
+import { TestGenerator, TruncatedOutputError, OscillationError, debugLogPattern } from './generator.js'
 import { runCommand } from '../lib/runner.js'
-import { hasTestFunctions } from '../lib/validate.js'
+import { hasTestFunctions, countTestFunctions } from '../lib/validate.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 
@@ -38,6 +40,7 @@ export interface E2ELoopOptions {
   maxRoutes?: number     // safety cap on how many flows to process in one run
   workers?: number       // parallel workers (each owns its own generator + processes one route at a time)
   injectTestIds?: boolean // opt-in: add data-testid attributes to page sources before generating (writes source!)
+  deep?: boolean         // opt-in (--deep): walk multi-step flows by filling+submitting forms (drives real actions!)
   log: (msg: string) => void
 }
 
@@ -170,6 +173,114 @@ export async function runE2ELoop(options: E2ELoopOptions): Promise<E2ELoopResult
         : chalk.dim('  No testids were added (already covered, or components do not forward props).'))
     }
 
+    // ── Authenticated snapshots (Stage 2) ──────────────────────────────────────
+    // If the project has a saved login session (auth.setup.ts → the config's storageState path),
+    // protected routes that redirected to login in the unauthenticated pass are re-snapshotted
+    // SIGNED IN, so the model sees the real post-login DOM and we generate an authenticated spec
+    // (*.auth.spec.ts that runs under the `authenticated` project) instead of a shallow redirect
+    // assertion. Routes that still redirect even when authenticated are left as public.
+    const authedRoutes = new Set<string>()
+    // The saved-session path comes from the config's `authenticated` project (so a customized path
+    // is respected); falls back to the scaffolded default when the config doesn't declare one.
+    const storageStatePath = pwConfig.storageState ?? 'playwright/.auth/user.json'
+    let hasAuthState = await access(join(cwd, storageStatePath)).then(() => true).catch(() => false)
+
+    // Auto-refresh the login session. Token sessions (Firebase/Supabase/JWT) expire ~1h, and lacuna
+    // runs verify with --no-deps (no per-attempt re-login), so a stale storageState silently fails
+    // every authed spec — the authed snapshot may scrape past the auth-loading spinner, but the
+    // generated beforeEach then times out. So when the session is STALE (>45 min) or MISSING (but a
+    // setup/login file exists), run the `setup` project to log in fresh. Best-effort: needs valid
+    // creds; on failure we fall back to the existing session (or skip authed coverage).
+    const ageMin = hasAuthState ? await stat(join(cwd, storageStatePath)).then((st) => (Date.now() - st.mtimeMs) / 60000).catch(() => 0) : Infinity
+    const setupAvailable = (await Promise.all(
+      [join(cwd, pwConfig.testDir, 'auth.setup.ts'), join(cwd, 'e2e', 'auth.setup.ts'), join(cwd, 'tests', 'auth.setup.ts')]
+        .map((p) => access(p).then(() => true).catch(() => false)),
+    )).some(Boolean)
+    if ((!hasAuthState || ageMin > 45) && setupAvailable && !dryRun) {
+      log(chalk.dim(`\n  ${hasAuthState ? `Saved login session is ~${Math.round(ageMin)} min old (token sessions expire ~60 min)` : 'No saved login session yet'} — refreshing via the setup (login) project...`))
+      const { refreshed, reason } = await refreshAuthState(cwd, storageStatePath, config.coverageTimeout * 1000)
+      if (refreshed) { hasAuthState = true; log(chalk.green('  ✓ Login session refreshed.')) }
+      else log(chalk.yellow(`  Could not refresh the login session: ${reason}.\n    ${hasAuthState ? 'Using the existing (possibly stale) session — authenticated specs may fail.' : 'Skipping authenticated coverage.'}`))
+    }
+
+    if (hasAuthState) {
+      const gated = pending.filter((f) => {
+        const s = snapshotByRoute.get(f.route)
+        // Gated = redirected to a login URL, OR an inline login/signup form is rendered on the route.
+        return !!s?.ok && (redirectedToLogin(f.route, s.url) || looksLikeAuthWall(s))
+      })
+      if (gated.length > 0) {
+        log(chalk.dim(`\n  Found a saved login session — re-snapshotting ${gated.length} protected route(s) signed in...`))
+        const authSnap = await snapshotRoutes(gated.map((f) => f.route), cwd, pwConfig, config.coverageTimeout * 1000, storageStatePath)
+        for (const s of authSnap.snapshots) {
+          // Keep the authenticated snapshot only if login actually got us past the gate — neither a
+          // redirect to login nor an inline auth form remains.
+          if (s.ok && !redirectedToLogin(s.route, s.url) && !looksLikeAuthWall(s)) {
+            snapshotByRoute.set(s.route, s)
+            authedRoutes.add(s.route)
+          }
+        }
+        if (authedRoutes.size > 0) {
+          log(chalk.dim(`  ${authedRoutes.size} route(s) will get authenticated specs (*.auth.spec.ts).`))
+        } else {
+          const dir = pwConfig.testDir.replace(/^\.\//, '').replace(/\/$/, '')
+          log(chalk.yellow('\n  The saved session did not unlock those routes — re-snapshotting them signed in STILL showed the login screen.'))
+          log(chalk.dim('  That means the saved session isn\'t a valid logged-in session for them. Check, in order:'))
+          log(chalk.dim(`    1. ${dir}/test-config.ts has REAL credentials (not the CHANGE_ME placeholders).`))
+          log(chalk.dim(`    2. ${dir}/test-config.ts \`authRoutes.login\` points at the actual login page, and ${dir}/auth.setup.ts uses the right field/button selectors.`))
+          log(chalk.dim(`    3. if you use Firebase/Supabase/Amplify auth (session in IndexedDB), ${dir}/auth.setup.ts must save with storageState({ path, indexedDB: true }) — otherwise the session is empty.`))
+          log(chalk.dim('    4. that user actually has access to these routes (e.g. an admin account for /admin).'))
+          log(chalk.dim('  Then re-create the session:  npx playwright test --project=setup  (these routes stay public until it works).'))
+        }
+      }
+    }
+
+    // ── Flow exploration (Stage 3, one-level) ───────────────────────────────────
+    // Probe a few "opener" controls per route (Add/New/Edit/tabs/…), capture what each click reveals
+    // (a modal, form, panel — UI not on the initial page), and feed those flows to the model so it
+    // writes multi-step specs, not just landed-page assertions. One extra browser run for all probes;
+    // authenticated when a session exists, so it explores behind the login too.
+    const flowsByRoute = new Map<string, RouteFlow[]>()
+    // ── Deep flow exploration (Stage 4, --deep) ─────────────────────────────────
+    // Opt-in: WALK each opener's flow — fill+submit forms step by step — to record full journeys.
+    const journeysByRoute = new Map<string, Journey[]>()
+    {
+      const probes: InteractionProbe[] = []
+      for (const f of pending) probes.push(...pickOpenerProbes(f.route, snapshotByRoute.get(f.route), 4))
+      if (probes.length > 0 && options.deep) {
+        log(chalk.yellow(`\n  --deep: walking ${probes.length} flow(s) step-by-step (this fills & SUBMITS forms — make sure this is a test environment)...`))
+        const journeys = await exploreFlows(probes, cwd, pwConfig, config.coverageTimeout * 1000, hasAuthState ? storageStatePath : undefined, 4, (m) => log(chalk.dim(m)))
+        // Debug: dump the RAW result of every probe (incl. 0-step / failed ones, which are dropped
+        // below) so an empty/thin exploration is diagnosable — did the opener open? fields fill?
+        // advance fire? where/why did it stop? Without this the explorer is a black box reporting only
+        // a step count.
+        await writeExploreDebug(journeys, config.debug, cwd).catch(() => {})
+        for (const j of journeys) {
+          if (!j.ok || j.steps.length === 0) continue
+          const arr = journeysByRoute.get(j.route) ?? []
+          arr.push(j)
+          journeysByRoute.set(j.route, arr)
+        }
+        const total = [...journeysByRoute.values()].reduce((n, a) => n + a.reduce((m, j) => m + j.steps.length, 0), 0)
+        log(chalk.dim(total > 0 ? `  Recorded ${total} step(s) across the explored journeys.` : '  No multi-step journeys could be walked from the probed controls.'))
+      } else if (probes.length > 0) {
+        log(chalk.dim(`\n  Exploring ${probes.length} interaction(s) for multi-step flows...`))
+        const captures = await snapshotInteractions(probes, cwd, pwConfig, config.coverageTimeout * 1000, hasAuthState ? storageStatePath : undefined)
+        for (const cap of captures) {
+          if (!cap.ok) continue
+          const base = snapshotByRoute.get(cap.probe.route)
+          if (!base?.ok) continue
+          const revealed = revealedAfter(cap, base)
+          if (revealed.interactives.length === 0 && revealed.headings.length === 0) continue   // click changed nothing visible
+          const arr = flowsByRoute.get(cap.probe.route) ?? []
+          arr.push({ trigger: { role: cap.probe.role, name: cap.probe.name }, revealed })
+          flowsByRoute.set(cap.probe.route, arr)
+        }
+        const total = [...flowsByRoute.values()].reduce((n, a) => n + a.length, 0)
+        log(chalk.dim(total > 0 ? `  Found ${total} flow(s) that reveal new UI.` : '  No new UI surfaced from the probed controls.'))
+      }
+    }
+
     const exampleSpec = await findExampleSpec(testDirAbs)
     // Shared selectors/helpers the project's specs import — so generated specs reuse the project's
     // convention (central selectors object, fixtures, setup) instead of inlining their own.
@@ -196,21 +307,35 @@ export async function runE2ELoop(options: E2ELoopOptions): Promise<E2ELoopResult
         const i = nextIndex++
         if (i >= pending.length) { onStatus?.({ phase: 'idle' }); return }
         const flow = pending[i]
-        const specPath = join(testDirAbs, specFileName(flow.route))
+        const authed = authedRoutes.has(flow.route)
+        const specPath = join(testDirAbs, specFileName(flow.route, authed))
         const relSpec = specPath.replace(cwd + '/', '')
-        const specName = relSpec.split('/').pop() ?? specFileName(flow.route)
-        if (!display) log(chalk.bold(`\n  Generating: ${chalk.cyan(flow.route)} ${chalk.dim('→ ' + relSpec)}`))
+        const specName = relSpec.split('/').pop() ?? specFileName(flow.route, authed)
+        if (!display) log(chalk.bold(`\n  Generating: ${chalk.cyan(flow.route)}${authed ? chalk.dim(' (authenticated)') : ''} ${chalk.dim('→ ' + relSpec)}`))
 
         const pageSource = await readFile(join(cwd, flow.sourceFile), 'utf-8').catch(() => null)
+        // AST FlowMap: per-control → outcome (toast/redirect/modal) from the page's own handlers.
+        // Only emit controls with a CONCRETE outcome, so each assertion uses ITS OWN result —
+        // never a generic file-wide signal (the regression). External handlers are dropped here.
+        const controlOutcomes = (buildFlowMap(pageSource, cwd, join(cwd, flow.sourceFile)) ?? [])
+          .filter((a) => a.outcomes.toast || a.outcomes.redirect || a.outcomes.opensModal)
+          .map((a) => ({ control: a.control, by: a.by, outcomes: a.outcomes }))
         const userPrompt = buildE2EGeneratePrompt({
           route: flow.route,
           specFilePath: relSpec,
           baseURL: pwConfig.baseURL,
           snapshot: snapshotByRoute.get(flow.route) ?? null,
           pageSource,
+          controlOutcomes: controlOutcomes.length ? controlOutcomes : undefined,
           dynamic: flow.dynamic,
           existingSpecExample: exampleSpec?.content ?? null,
           helpers: e2eHelpers,
+          authenticated: authed,
+          flows: flowsByRoute.get(flow.route) ?? [],
+          journeys: (journeysByRoute.get(flow.route) ?? []).map((j) => ({
+            opener: j.opener,
+            steps: j.steps.map((s) => ({ filled: s.filled, advance: s.advance, interactives: s.interactives, headings: s.headings, note: s.note, toast: s.toast })),
+          })),
         })
 
         const outcome = await generateAndVerifySpec(flow, specPath, specName, userPrompt, systemPrompt, generator, options, onStatus)
@@ -222,7 +347,10 @@ export async function runE2ELoop(options: E2ELoopOptions): Promise<E2ELoopResult
           result.specsFailed++
           if (outcome.error) result.errors.push(`${flow.route}: ${outcome.error}`)
           onStatus?.({ phase: 'failed', file: relSpec })
-          if (!display) log(chalk.red(`  ${flow.route}: could not produce a passing spec.`))
+          if (!display) {
+            if (outcome.kept) log(chalk.yellow(`  ${flow.route}: spec still failing — kept at ${relSpec}. Repair just this file: \`lacuna fix --e2e --file ${relSpec}\``))
+            else log(chalk.red(`  ${flow.route}: could not produce a runnable spec.`))
+          }
         }
       }
     }
@@ -248,10 +376,23 @@ async function generateAndVerifySpec(
   generator: TestGenerator,
   options: E2ELoopOptions,
   onStatus?: (state: WorkerState) => void,   // when set (parallel mode), drive the live worker panel instead of logging
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; kept?: boolean; error?: string }> {
   const { cwd, verbose, log, config } = options
   const file = specPath.replace(cwd + '/', '')
   let failureMsg = ''
+  // Whether any attempt produced a runnable spec (had test() blocks and was written to disk).
+  // On exhaustion we KEEP that spec so `lacuna fix --e2e` can repair it — only a route that never
+  // yielded a runnable spec is cleaned up.
+  let everWritten = false
+  // Most test cases any runnable attempt had — guards against a retry quietly DROPPING tests to go
+  // green (the "delete the failing test" anti-pattern that silently shrinks coverage across attempts).
+  let maxTests = 0
+  // Keep-best (mirrors fix-loop): the attempt with the MOST passing tests (tie-break: more tests).
+  // On exhaustion we restore THIS — never the last attempt and never a shrunk green — so a fuller
+  // spec with more passing coverage always wins over a smaller all-green one.
+  let bestCode = ''
+  let bestPassed = -1
+  let bestTests = 0
 
   for (let attempt = 1; attempt <= config.maxIterations; attempt++) {
     onStatus?.(attempt === 1 ? { phase: 'generating', file } : { phase: 'retrying', file, attempt, max: config.maxIterations })
@@ -272,14 +413,32 @@ async function generateAndVerifySpec(
       continue
     }
 
+    // Coverage guard: a retry must FIX failing tests, not delete them. If this attempt has fewer test
+    // cases than the fullest we've produced, reject it and require restoration. No final-attempt
+    // exception: keep-best below restores the fuller, more-passing spec on exhaustion, so we never
+    // accept a shrunk green just because we ran out of retries.
+    const testCount = countTestFunctions(code)
+    if (attempt > 1 && testCount < maxTests) {
+      failureMsg = `You DELETED ${maxTests - testCount} test case(s) (the spec had ${maxTests}, this version has ${testCount}). NEVER remove, skip, or comment out a failing test to make the suite pass. Restore ALL ${maxTests} tests and FIX the failing one using the error above.`
+      if (!onStatus) log(chalk.yellow(`  Attempt ${attempt} dropped ${maxTests - testCount} test(s) — requiring restore.`))
+      continue
+    }
+
     onStatus?.({ phase: 'writing', file })
     await mkdir(join(specPath, '..'), { recursive: true }).catch(() => {})
     await writeFile(specPath, code, 'utf-8')
+    everWritten = true
+    maxTests = Math.max(maxTests, testCount)
 
     onStatus?.({ phase: 'running', file })
     const run = await runPlaywrightSpec(specPath, cwd)
     if (!run.pass) {
-      failureMsg = run.failure
+      // Keep-best by passing-test count (tie-break: more tests) — restored on exhaustion so the
+      // fullest, most-passing attempt wins over a later regression or a smaller all-green spec.
+      if (run.passed > bestPassed || (run.passed === bestPassed && testCount > bestTests)) {
+        bestCode = code; bestPassed = run.passed; bestTests = testCount
+      }
+      failureMsg = `${run.failure}\n\nFIX the failing test(s) above — do NOT delete, skip, or comment out any test() to make the suite pass. Keep all ${testCount} test case(s); only change what's needed to make the failing one pass.`
       if (!onStatus) {
         if (verbose) log(chalk.dim(failureMsg.split('\n').slice(0, 12).join('\n')))
         log(chalk.red(`  Spec failed (attempt ${attempt}/${config.maxIterations}).`))
@@ -301,9 +460,19 @@ async function generateAndVerifySpec(
     return { success: true }
   }
 
-  // Exhausted: don't leave a broken/flaky spec behind.
+  // Exhausted. Keep the last runnable spec on disk so `lacuna fix --e2e` can iterate on it —
+  // the generate loop and the unit loop both preserve their best attempt rather than discarding
+  // usable work. Only clean up when no attempt ever yielded a runnable spec (all truncated / had
+  // no test() blocks), since there's nothing useful to keep or repair.
+  if (everWritten) {
+    // Restore the BEST attempt (most passing tests / most coverage), not whatever the last attempt
+    // left on disk — so we never end on a regression or a shrunk-to-pass spec.
+    if (bestCode) await writeFile(specPath, bestCode, 'utf-8').catch(() => {})
+    const kept = bestTests > 0 ? ` (kept best: ${bestPassed}/${bestTests} passing)` : ''
+    return { success: false, kept: true, error: `No stable spec after ${config.maxIterations} attempts${kept} (kept for repair). Last failure:\n${failureMsg.slice(0, 800)}` }
+  }
   await rm(specPath, { force: true }).catch(() => {})
-  return { success: false, error: `No stable spec after ${config.maxIterations} attempts. Last failure:\n${failureMsg.slice(0, 800)}` }
+  return { success: false, kept: false, error: `No runnable spec after ${config.maxIterations} attempts. Last failure:\n${failureMsg.slice(0, 800)}` }
 }
 
 // Add data-testid attributes to one route's page source, then VERIFY they reached the DOM by
@@ -412,21 +581,57 @@ function isPlausibleTestIdEdit(original: string, modified: string): boolean {
   return modified.includes('data-testid')
 }
 
-async function runPlaywrightSpec(specPath: string, cwd: string): Promise<{ pass: boolean; failure: string }> {
-  const run = await runCommand(playwrightRunCommand(specPath), cwd, PER_RUN_TIMEOUT_MS)
-  if (run.success) return { pass: true, failure: '' }
-  const parsed = parsePlaywrightResults(run.stdout + '\n' + run.stderr)
+// Diagnostic dump of --deep exploration: one block per probed journey, including the ones dropped
+// for having 0 steps or failing, with each step's fills/advance/toast/note and the journey's error.
+// Written to lacuna-debug.e2e-explore.txt only when debug is on. This is how an empty/thin
+// exploration (e.g. an auth-gated route whose openers were clicked before the dashboard rendered)
+// becomes diagnosable instead of just "Recorded N steps".
+async function writeExploreDebug(journeys: Journey[], configDebug: boolean | undefined, cwd: string): Promise<void> {
+  const pattern = debugLogPattern(configDebug)
+  if (!pattern) return
+  const file = join(cwd, pattern.replace('<file>', 'e2e-explore'))
+  const lines: string[] = [`${'='.repeat(72)}`, `--deep EXPLORATION — ${new Date().toISOString()} — ${journeys.length} probe(s)`, '='.repeat(72)]
+  for (const j of journeys) {
+    const walked = j.steps.length
+    lines.push(`\n[${j.route}] click ${j.opener.role} "${j.opener.name}" → ${j.ok ? `${walked} step(s)` : 'FAILED'}${j.error ? `  error: ${j.error}` : ''}${j.ok && walked === 0 ? '  ⚠ 0 steps (dropped — opener opened nothing walkable)' : ''}`)
+    j.steps.forEach((s, i) => {
+      const fills = s.filled.length ? s.filled.map((f) => `${f.by ?? '?'}:${f.name}=${JSON.stringify(f.value)}`).join(', ') : '(no inputs filled)'
+      lines.push(`    ${i + 1}. fill ${fills}${s.advance ? ` → click "${s.advance}"` : ' (no advance)'}${s.toast ? ` → toast ${JSON.stringify(s.toast)}` : ''}${s.note ? `  [${s.note}]` : ''}`)
+    })
+  }
+  await writeFile(file, lines.join('\n') + '\n', 'utf-8')
+}
+
+async function runPlaywrightSpec(specPath: string, cwd: string): Promise<{ pass: boolean; failure: string; passed: number; failed: number }> {
+  // JSON report goes to a file so interleaved dev-server logs can't corrupt it (see runPlaywrightJson).
+  const { run, parsed } = await runPlaywrightJson(playwrightRunCommand(specPath), cwd, PER_RUN_TIMEOUT_MS)
+  const passed = parsed?.passed ?? 0
+  const failed = parsed?.failed ?? 0
+  if (run.success) return { pass: true, failure: '', passed, failed }
   const failure = parsed && parsed.failures.length > 0
     ? parsed.failures.map((f) => `${f.title}\n${f.message}`).join('\n\n').slice(0, 3000)
-    : (run.stdout + '\n' + run.stderr).trim().slice(-2000)
-  return { pass: false, failure }
+    : cleanPlaywrightFallback(run.stdout + '\n' + run.stderr)
+  return { pass: false, failure, passed, failed }
+}
+
+// Last-resort failure text when the JSON report couldn't be parsed at all: surface the human-readable
+// error lines and drop the JSON/config noise, so the model (and the user) never see a meaningless
+// slice of `config.projects`. Keeps lines that look like real Playwright errors.
+function cleanPlaywrightFallback(raw: string): string {
+  const lines = raw.split('\n')
+    .filter((l) => !/^\s*["{}\[\]]/.test(l))   // drop bare JSON structural lines
+    .filter((l) => !/^\s*"(name|testDir|testIgnore|testMatch|timeout|outputDir|repeatEach|retries|metadata|projects|config|rootDir|grep)"\s*:/.test(l))   // drop config keys
+  const errorish = lines.filter((l) => /error|expect|timed out|✘|✗|×|failed|assertion|locator|toBe|toHaveURL|not (visible|found)/i.test(l))
+  const picked = (errorish.length > 0 ? errorish : lines.filter((l) => l.trim())).slice(-25).join('\n').trim()
+  return picked || 'Playwright run failed but produced no parseable report (the app may not be reachable, or the spec failed to load).'
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────────
 
 // Derive a spec filename from a route: "/" → home.spec.ts; "/products/[id]" → products-id.spec.ts.
-function specFileName(route: string): string {
-  if (route === '/' || route === '') return 'home.spec.ts'
+function specFileName(route: string, authed = false): string {
+  const ext = authed ? 'auth.spec.ts' : 'spec.ts'
+  if (route === '/' || route === '') return `home.${ext}`
   const slug = route
     .replace(/^\//, '')
     .replace(/\[\.\.\.(\w+)\]/g, '$1')   // [...slug] → slug
@@ -435,11 +640,112 @@ function specFileName(route: string): string {
     .replace(/[^a-zA-Z0-9-]/g, '-')
     .replace(/-+/g, '-')
     .replace(/^-|-$/g, '') || 'home'
-  return `${slug}.spec.ts`
+  return `${slug}.${ext}`
 }
 
+// A route already has a spec if EITHER its public or its authenticated variant exists — so a
+// re-run never regenerates a route in the other flavour (and never duplicates coverage).
 async function specExists(testDirAbs: string, flow: Flow): Promise<boolean> {
-  try { await access(join(testDirAbs, specFileName(flow.route))); return true } catch { return false }
+  for (const authed of [false, true]) {
+    try { await access(join(testDirAbs, specFileName(flow.route, authed))); return true } catch { /* try next */ }
+  }
+  return false
+}
+
+// True when navigating to `route` (unauthenticated) bounced us to a login-looking page — i.e. the
+// route is auth-gated. Distinguishes a real login redirect from a normal one (e.g. / → /home) by
+// requiring the landed path to look like a login/auth page AND differ from the requested route.
+function redirectedToLogin(route: string, url: string | null): boolean {
+  if (!url) return false
+  let path: string
+  try { path = new URL(url).pathname } catch { return false }
+  const norm = (p: string) => p.replace(/\/+$/, '') || '/'
+  // login | log-in | log_in | signin | sign-in | sign_in | auth | authenticate (any path segment).
+  return norm(path) !== norm(route) && /(?:^|\/)(log[-_]?in|sign[-_]?in|auth|authenticate)(?:\/|$)/i.test(path)
+}
+
+// True when the snapshot is a login/signup screen rendered INLINE (no URL redirect) — common for
+// client-side route guards that render an auth form on the protected path itself. A password field
+// is the strongest signal (public pages rarely have one); otherwise we require a sign-in/up CTA
+// paired with a credential field, so a lone "Sign in" nav link on a public page isn't mistaken for
+// an auth wall. Used alongside redirectedToLogin so both redirect- and inline-gated routes are
+// re-snapshotted authenticated.
+function looksLikeAuthWall(s: RouteSnapshot | undefined): boolean {
+  if (!s?.ok) return false
+  const inter = s.interactives
+  const isField = (re: RegExp) => inter.some((i) => i.role === 'textbox' && re.test(i.name))
+  const hasPasswordField = isField(/pass(word|code)|^pin$/i)
+  const hasAuthCta = inter.some((i) =>
+    (i.role === 'button' || i.role === 'tab' || i.role === 'link') &&
+    /\b(sign[\s-]?in|log[\s-]?in|sign[\s-]?up|register|create account)\b/i.test(i.name))
+  // OAuth/SSO-only screens have no password field — a "Continue/Sign in with <provider>" button is
+  // the tell ("Continue with Google", "Sign in with GitHub"). Strong enough to stand alone.
+  const hasOAuthCta = inter.some((i) =>
+    (i.role === 'button' || i.role === 'link') &&
+    /\b(continue|sign[\s-]?in|log[\s-]?in|sign[\s-]?up)\s+with\b/i.test(i.name))
+  return hasPasswordField || hasOAuthCta || (hasAuthCta && isField(/email|username|phone/i))
+}
+
+// A discovered multi-step flow: clicking `trigger` revealed `revealed` UI that wasn't on the page.
+export interface RouteFlow {
+  trigger: { role: string; name: string }
+  revealed: { interactives: InteractiveElement[]; headings: string[]; testIds: TestIdElement[] }
+}
+
+// Pick a few controls on a route worth clicking to surface hidden UI (a form, modal, panel). Targets
+// tabs and openers (Add/New/Create/Edit/Open/…); skips destructive or navigate-away controls
+// (logout, delete, back, print, download) so exploration doesn't sign out, destroy data, or leave
+// the page. Capped per route to bound the extra browser work.
+function pickOpenerProbes(route: string, snapshot: RouteSnapshot | undefined, cap = 4): InteractionProbe[] {
+  if (!snapshot?.ok) return []
+  const OPENER = /\b(add|new|create|edit|open|invite|upload|import|connect|generate|configure|manage|details?|settings?|customi[sz]e|expand|select)\b/i
+  const SKIP = /\b(log\s?out|sign\s?out|delete|remove|destroy|cancel|close|dismiss|back|print|download|export|logo)\b/i
+  // P7 (feature boundaries): tabs ARE the sub-routes of a monolithic page (one /admin → menu, orders,
+  // team, settings…). Give them a separate, larger budget so they aren't crowded out by Add/New
+  // openers — otherwise a 6-tab dashboard explores 4 controls and silently skips whole features.
+  const tabs: InteractionProbe[] = []
+  const sections: InteractionProbe[] = []
+  const openers: InteractionProbe[] = []
+  const seen = new Set<string>()
+  // A nav/section switcher: a short, plain label that isn't an action verb or destructive. Many apps
+  // build their primary nav from plain <button>s (role=button, not role=tab) — cheflymenu's sidebar
+  // (Menu Items / Categories / Orders / Team) is exactly this, so the opener-verb filter skipped whole
+  // features. When SEVERAL such siblings exist they're almost certainly a tab/sidebar nav; each one's
+  // panel holds its own add/edit flows, which the depth-walk then chains into.
+  const isSection = (name: string): boolean => {
+    const n = name.trim()
+    return n.split(/\s+/).length <= 3 && n.length <= 22 && /[a-z]/i.test(n) && !/\d{2,}|\(\d|→|\/|%/.test(n)
+  }
+  for (const el of snapshot.interactives) {
+    if (!['button', 'tab', 'link', 'menuitem'].includes(el.role)) continue
+    const name = el.name.trim()
+    if (!name || SKIP.test(name)) continue
+    const key = `${el.role}:${name}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    if (el.role === 'tab') { tabs.push({ route, role: el.role, name }); continue }
+    if (OPENER.test(name) || /^\s*\+/.test(name)) { openers.push({ route, role: el.role, name }); continue }
+    if (isSection(name)) sections.push({ route, role: el.role, name })
+  }
+  // Sections only count as feature boundaries when there's a CLUSTER — a single stray short-named
+  // button isn't a nav, and probing it would just add noise.
+  const sectionProbes = sections.length >= 3 ? sections.slice(0, SECTION_PROBE_CAP) : []
+  return [...tabs.slice(0, TAB_PROBE_CAP), ...sectionProbes, ...openers.slice(0, cap)]
+}
+const TAB_PROBE_CAP = 8
+const SECTION_PROBE_CAP = 6
+
+// What a click revealed = the interactives/headings/testIds present AFTER the click that weren't in
+// the base (pre-click) snapshot. That delta is the new UI the flow opened.
+function revealedAfter(cap: { interactives: InteractiveElement[]; headings: string[]; testIds: TestIdElement[] }, base: RouteSnapshot): RouteFlow['revealed'] {
+  const baseEls = new Set(base.interactives.map((i) => `${i.role}:${i.name}`))
+  const baseHeadings = new Set(base.headings)
+  const baseIds = new Set(base.testIds.map((t) => t.testId))
+  return {
+    interactives: cap.interactives.filter((i) => i.name.trim() && !baseEls.has(`${i.role}:${i.name}`)).slice(0, 20),
+    headings: cap.headings.filter((h) => !baseHeadings.has(h)).slice(0, 10),
+    testIds: cap.testIds.filter((t) => t.testId && !baseIds.has(t.testId)).slice(0, 20),
+  }
 }
 
 // Find an existing spec to show the model as a style reference. Best-effort: the first *.spec.ts

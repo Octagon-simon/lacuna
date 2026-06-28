@@ -181,12 +181,15 @@ Everything above writes unit and integration tests. With `--e2e`, lacuna instead
 
 Requirements: `@playwright/test` installed and a `playwright.config.ts` with a `webServer` block (so lacuna can start your app) and a `baseURL`. Route discovery currently supports **Next.js** (app and pages router) and **React Router**.
 
-You don't have to install Playwright by hand. `lacuna init` offers to set it up (installs `@playwright/test` plus the browser binaries) for React and Next.js projects, and if you run `--e2e` without it, lacuna prints the install command and — in an interactive terminal — offers to install it on the spot. In CI or a non-interactive shell it just prints `npm install -D @playwright/test && npx playwright install` and exits, so nothing hangs.
+You don't have to set Playwright up by hand. `lacuna init` offers to do it for React and Next.js projects, and if you run `--e2e` without it, lacuna offers to install it on the spot (interactive terminals only — in CI it prints the command and exits so nothing hangs). Setting it up means: installing `@playwright/test` and the browser binaries, **scaffolding a `playwright.config.ts`** (framework-aware `webServer` command + `baseURL`, `testDir: ./e2e`) if you don't already have one — an existing config is never overwritten — and scaffolding the auth helpers described below. After the browser download, on Linux lacuna detects Playwright's "host system is missing dependencies" warning and tells you to run `sudo npx playwright install-deps` (that step needs sudo, so it can't be automated).
+
+The scaffolded config's `webServer.command`/`url` and `baseURL` are derived from your project — the package manager comes from the lockfile, the dev command from your `dev`/`start` script, and the port from that script (`-p`/`--port`/`PORT=`) or the framework default (`:3000` Next.js/CRA, `:5173` Vite). It can't infer a non-localhost host, so double-check it. A correct `webServer`/`baseURL` is also what lets `--workers` run in parallel (without it, lacuna can't confirm a shared app server and falls back to running specs one at a time).
 
 ```bash
 lacuna generate --e2e                  # discover routes, generate a spec for each
 lacuna generate --e2e --route /login   # just one route
 lacuna generate --e2e --workers 4      # generate in parallel
+lacuna generate --e2e --deep           # walk multi-step flows: fill + SUBMIT forms (test/staging only)
 lacuna generate --e2e --dry-run        # list which routes would get specs (no app, no API call)
 lacuna fix --e2e                       # repair failing Playwright specs
 ```
@@ -194,15 +197,135 @@ lacuna fix --e2e                       # repair failing Playwright specs
 How generation works:
 
 1. **Discover** the routes from your router (e.g. `app/login/page.tsx` → `/login`, or a `<Route path="/login">`).
-2. **Snapshot** each page: lacuna starts your app once via the `webServer` config and captures the accessibility tree plus any `data-testid`s, so the model writes specs against the elements that are *really there*.
-3. **Generate** one spec per route. Selectors follow a strict order: `getByRole`, `getByLabel`, `getByPlaceholder`, then `getByTestId` (only for testids actually present on the page, never invented), with `getByText` as a last resort. Brittle CSS, XPath, and arbitrary sleeps are forbidden; assertions are auto-waiting and validate the outcome of each action. Login redirects are detected and asserted rather than fabricated.
-4. **Verify**: lacuna runs each spec, confirms it isn't flaky, and retries on failure. A spec that never goes green is removed rather than left broken.
+2. **Snapshot** each page: lacuna starts your app once via the `webServer` config and captures the accessibility tree plus any `data-testid`s, so the model writes specs against the elements that are *really there*. If you've set up authentication (below), routes that redirect to login are re-snapshotted **signed in**, so the captured DOM is the real logged-in page.
+3. **Generate** one spec per route. Selectors follow a strict order: `getByRole`, `getByLabel`, `getByPlaceholder`, then `getByTestId` (only for testids actually present on the page, never invented), with `getByText` as a last resort. Brittle CSS, XPath, and arbitrary sleeps are forbidden; assertions are auto-waiting and validate the outcome of each action. Protected routes become `*.auth.spec.ts` specs that run signed in; un-set-up auth means a login redirect is asserted rather than fabricated.
+4. **Verify**: lacuna runs each spec, confirms it isn't flaky, and retries on failure. A spec that goes green and stays green is kept; one that never passes is **kept on disk for repair** (run `lacuna fix --e2e` to iterate on it) rather than discarded — only a route that never yielded a runnable spec at all is cleaned up. Retries may not **shrink the suite**: an attempt that deletes a test to go green is rejected, and lacuna keeps the attempt with the most passing tests (so coverage never silently drops across retries — this applies to `fix` too).
+
+**Going deeper (`--deep`).** By default lacuna writes one focused spec per route plus the actions a single click reveals. With `--deep` it *walks* multi-step journeys in a real browser — filling inputs (type-aware values), driving custom ARIA comboboxes/selects that a plain fill can't (Radix/Headless UI/MUI), clicking the advance/submit control, dismissing onboarding/cookie interrupts, and capturing the real success/validation **toast** to assert — step by step until the flow ends. Because it fills and **submits real forms**, use a test/staging environment (and see [Seeding](#seeding-test-data-when-flows-need-existing-records) for flows that need existing data, like an item that requires a category). Progress streams per flow so a long walk never looks stuck.
 
 If your project already uses `data-testid`s, lacuna picks them up from the snapshot and prefers them where a semantic locator isn't enough. It reads testids from your components but does not add them, it only touches test files.
 
 Specs are written to your Playwright `testDir`. Routes that already have a spec are skipped, so re-running only fills the gaps. `--dry-run` is a free preview: it lists what would be generated without starting your app or calling the model.
 
 **Repairing specs (`lacuna fix --e2e`).** When a spec breaks, lacuna captures a fresh snapshot of the page, then asks the model to diagnose the root cause (selector drift, a timing gap, an auth redirect, a removed feature) and apply the smallest fix that preserves what the test checks. It fixes selectors and synchronization rather than weakening or deleting assertions to force a pass.
+
+### Authenticated coverage (testing signed-in pages)
+
+Most of an app lives behind a login. lacuna can cover those pages too — it logs in as a test user, captures the **signed-in** DOM of each protected route, and writes specs that run authenticated. You provide the test user; lacuna never invents or commits credentials.
+
+**1. Set Playwright up** (if you haven't). `lacuna init` (choose end-to-end) or just `lacuna generate --e2e --dry-run` scaffolds everything without running the app or calling the model:
+
+| File | What it is |
+|---|---|
+| `playwright.config.ts` | Three projects: `setup` (logs in), `chromium` (public specs), `authenticated` (`*.auth.spec.ts`, reuses the saved session). |
+| `e2e/test-config.ts` | Exports `testUser { email, password }` (env-backed) and `authRoutes { login, afterLogin }` — **you fill these in**. |
+| `e2e/auth.setup.ts` | A setup spec that logs in and saves the session to `playwright/.auth/user.json`. |
+| `.gitignore` | `playwright/.auth/` is added so the saved session is never committed. |
+
+On Linux, run `sudo npx playwright install-deps` once so the browsers can launch.
+
+**2. Fill in the test user.** Edit `e2e/test-config.ts` with a real seeded account (or set `E2E_EMAIL` / `E2E_PASSWORD`), and set `authRoutes.login` to your login path:
+
+```ts
+export const testUser = {
+  email: process.env.E2E_EMAIL ?? 'qa@yourapp.com',
+  password: process.env.E2E_PASSWORD ?? 'a-real-test-password',
+}
+export const authRoutes = { login: '/login', afterLogin: '/dashboard' }
+```
+
+**3. Point the login helper at your form.** The scaffolded `e2e/auth.setup.ts` uses generic selectors — adjust them to your actual login form (the field labels and the submit button), and change the post-login wait to a real signal:
+
+```ts
+await page.getByLabel(/email/i).fill(testUser.email)
+await page.getByLabel(/password/i).fill(testUser.password)
+await page.getByRole('button', { name: /sign in/i }).click()
+await page.waitForURL('**/dashboard')   // a real "you're logged in" signal
+```
+
+**4. Capture the session.** Run the setup project once — it logs in and writes the saved session:
+
+```bash
+npx playwright test --project=setup
+ls playwright/.auth/user.json    # success = this file now exists
+```
+
+**5. Generate.** Now `lacuna generate --e2e` does a two-pass capture: public routes are snapshotted normally; routes that redirect to login are **re-snapshotted signed in** and get `*.auth.spec.ts` specs that exercise the logged-in UI. Token sessions (Firebase/Supabase/JWT) expire after ~1 hour, so if the saved session is stale or missing lacuna **auto-refreshes** it by running the `setup` project before capturing (you'll see `✓ Login session refreshed.`); if no valid credentials are configured it falls back gracefully.
+
+```bash
+lacuna generate --e2e
+# Generating: /admin (authenticated) → e2e/admin.auth.spec.ts
+```
+
+**6. Run everything.** Plain `npx playwright test` runs the `setup` project first (fresh login), then the public and authenticated specs:
+
+```bash
+npx playwright test
+```
+
+Notes:
+- Public routes stay `*.spec.ts`; protected routes become `*.auth.spec.ts`. Re-running `generate --e2e` skips a route if **either** variant already exists, so there are no duplicates.
+- lacuna's own snapshot/verify runs never need the credentials — only the `authenticated` project and the saved session do. So generating specs works even before you've filled in the test user (protected routes just stay shallow until you do).
+- If a protected route still snapshots as the login page, the saved session didn't unlock it — re-check the selectors in `auth.setup.ts` and re-run `npx playwright test --project=setup`.
+- **Firebase / Supabase / Amplify auth** keep the session in **IndexedDB**, which `storageState()` does *not* capture by default — so the saved session is empty and protected pages stay locked even though login succeeded. The scaffolded `auth.setup.ts` saves with `storageState({ path, indexedDB: true })` (Playwright ≥ 1.51) to handle this; if you wrote your own setup, add `indexedDB: true`.
+
+#### How a route is detected as protected (and what it can't see)
+
+lacuna decides a route is auth-gated when its signed-out snapshot either **redirects to a login URL** (`/login`, `/users/sign_in`, `/auth/...`, etc.) or **renders a login form inline** (a password field, an OAuth "Continue with…" button, or a sign-in/up button next to an email field). It then re-snapshots that route with your saved session and only treats it as authenticated if the login wall is *gone*. This is a heuristic with a safety net — a wrong guess never produces a broken spec:
+
+- A **false positive** (a public page that looks login-ish, e.g. a newsletter "Sign up" box) is re-checked signed in, still looks the same, and **stays a public `*.spec.ts`**. Cost is one extra snapshot.
+- A **false negative** (a login screen lacuna doesn't recognise) just falls back to a normal unauthenticated spec — same as if auth weren't set up.
+
+Cases it currently does **not** auto-detect, so they fall back to public specs (write the `*.auth.spec.ts` by hand, or `lacuna fix --e2e` it):
+- **Magic-link / passwordless** screens (email only, no password or OAuth button).
+- **Non-English** login UIs — the keywords it matches (`password`, `sign in`, `login`) are English.
+
+And one that's about *which* session you save, not detection:
+- **Role-based pages** (e.g. `/admin`): capture the session as a user who actually has that role. A logged-in-but-unauthorized session makes lacuna write a spec against the "access denied" page. The saved-session path is read from your config's `authenticated` project, so a custom `storageState` location works too.
+
+### Seeding test data (when flows need existing records)
+
+Many real flows can't reach success from an empty account. "Add a menu item" needs a **category** to select; "create an order" needs a **product**; "assign a teammate" needs an **invite**. On a fresh test user those prerequisites don't exist, so the flow dead-ends at validation — and **no test, however well written, can get past it**. The fix is *seeding*: put known, controlled data into your database **before** tests run.
+
+This matters for lacuna specifically because `lacuna generate --e2e --deep` *drives* each flow (filling forms, submitting, and asserting the real outcome). If a required field can't be satisfied, the deepest it can honestly go is the validation message. Seed the prerequisite and the same run reaches the success toast / created row instead.
+
+What makes data "seeded" (not just inserted):
+- **Deterministic** — the same fixed records every run (use fixed IDs/keys), so specs can rely on them and cleanup is exact.
+- **Isolated** — scoped to the *test* user, never real data.
+- **Set up before, torn down after** — created in Playwright's `globalSetup`, removed in `globalTeardown`, so re-runs don't pile up duplicates. (`globalSetup` is not a project, so it runs on every `playwright test` invocation — including lacuna's own verify runs — which is what you want: the data is present whenever specs run.)
+
+The recommended pattern — seed through your backend's **admin/service-role client** (fast, bypasses the UI and security rules), keyed to the test user:
+
+```ts
+// e2e/seed.ts  — example shape; swap in your own DB client (Firebase Admin, Supabase service role, Prisma…)
+export async function seedTestData() {
+  const uid = await getTestUserId()                 // resolve the test user once
+  await db.set(`categories/${'e2e-seed-category'}`, {  // FIXED key → idempotent + exact cleanup
+    userId: uid, name: 'E2E Seed Category', order: 0,
+  })
+}
+export async function cleanupTestData() {
+  await db.remove(`categories/${'e2e-seed-category'}`)
+}
+```
+
+```ts
+// e2e/global-setup.ts                      // e2e/global-teardown.ts
+import { seedTestData } from './seed'       // import { cleanupTestData } from './seed'
+export default async () => { await seedTestData() }   // export default async () => { await cleanupTestData() }
+```
+
+```ts
+// playwright.config.ts — add at the top level
+globalSetup: './e2e/global-setup.ts',
+globalTeardown: './e2e/global-teardown.ts',
+```
+
+Notes:
+- A standalone setup script doesn't get your framework's automatic `.env` loading. Load it yourself (e.g. `dotenv`), and make sure the script uses **service-account / service-role** credentials, not the public client keys.
+- The test user must already exist in your auth provider (the same one in `e2e/test-config.ts`).
+- Match the seeded record's fields to your app's real model — the same shape your create-form would write.
+- Seed only the *prerequisites* a flow needs to start. lacuna still drives the actual create/edit/delete and asserts their outcomes; seeding just gets the flow off the ground.
 
 ---
 

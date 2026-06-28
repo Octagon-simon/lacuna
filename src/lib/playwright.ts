@@ -19,11 +19,13 @@
 // green, non-flaky browser run rather than executed source lines. Everything below is shaped
 // around that reality.
 
-import { readFile, readdir } from 'fs/promises'
+import { readFile, readdir, writeFile, access, mkdir, rm, stat } from 'fs/promises'
 import { join, isAbsolute, basename } from 'path'
+import { tmpdir } from 'os'
 import { execSync } from 'child_process'
 import chalk from 'chalk'
 import { confirm } from '@inquirer/prompts'
+import { runCommand, type RunResult } from './runner.js'
 import type { DetectedEnvironment, TestRunner } from './detector.js'
 
 // ---------------------------------------------------------------------------------------------
@@ -77,13 +79,212 @@ export function installPlaywright(cwd: string, log: (s: string) => void): boolea
   try {
     log(chalk.dim('  Installing @playwright/test...'))
     execSync('npm install -D @playwright/test', { cwd, stdio: 'inherit' })
-    log(chalk.dim('  Downloading Playwright browsers (npx playwright install)...'))
-    execSync('npx playwright install', { cwd, stdio: 'inherit' })
+    // Capture combined output (2>&1) so we can detect the Linux host-validation warning that
+    // Playwright prints when the OS is missing the system libs browsers need to launch. We trade
+    // the live progress bar for that detection, so warn it may take a minute.
+    log(chalk.dim('  Downloading Playwright browsers (one-time, ~300MB — this can take a minute)...'))
+    const out = execSync('npx playwright install 2>&1', { cwd, encoding: 'utf-8', maxBuffer: 64 * 1024 * 1024 })
+    warnIfHostDepsMissing(out, log)
     return true
-  } catch {
+  } catch (err) {
+    // Even on a non-zero exit, surface the host-deps hint if the captured output mentions it.
+    const out = (err as { stdout?: string | Buffer })?.stdout
+    if (out) warnIfHostDepsMissing(out.toString(), log)
     log(chalk.red(`  Install failed. Run manually: ${PLAYWRIGHT_INSTALL_HINT}`))
     return false
   }
+}
+
+// Playwright downloads the browser binaries fine but still needs OS-level shared libraries to
+// LAUNCH them. On Linux it prints a "Host system is missing dependencies" block pointing at
+// `playwright install-deps` (which needs sudo, so lacuna can't run it). Surface that clearly —
+// otherwise browsers fail to start later with a cryptic error.
+function warnIfHostDepsMissing(output: string, log: (s: string) => void): void {
+  if (!/missing dependencies|install-deps/i.test(output)) return
+  log(chalk.yellow('\n  ⚠ Browsers downloaded, but your OS is missing system libraries to RUN them.'))
+  log(chalk.yellow('    Run once (needs sudo, so lacuna can\'t do it for you):'))
+  log(chalk.cyan('      sudo npx playwright install-deps'))
+  log(chalk.dim('    Without it, browser launches may fail and specs will error at run time.'))
+}
+
+// Scaffolds a minimal, framework-aware playwright.config.ts when the project has none. Lacuna's
+// E2E loop needs a `webServer` (to boot the app for snapshots/runs) and a `baseURL` (so specs can
+// `goto('/x')` and so parallel `--workers` can share one server) — without a config it falls back
+// to sequential and can't start the app. Never overwrites an existing config. Returns true if it
+// created one.
+// Derives the dev-server command + URL from package.json and the lockfile, so the scaffolded
+// webServer is right more often without the user editing it. Picks the package manager from the
+// lockfile, the `dev` (else `start`) script, and an explicit port from the script (`-p`, `--port`,
+// `PORT=`) — falling back to the framework's default port. Host beyond localhost can't be inferred.
+async function detectDevServer(cwd: string): Promise<{ command: string; url: string }> {
+  const has = async (p: string) => { try { await access(join(cwd, p)); return true } catch { return false } }
+  let pkg: { dependencies?: Record<string, string>; devDependencies?: Record<string, string>; scripts?: Record<string, string> } = {}
+  try { pkg = JSON.parse(await readFile(join(cwd, 'package.json'), 'utf-8')) } catch { /* defaults */ }
+  const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) }
+  const scripts = pkg.scripts ?? {}
+
+  const scriptName = scripts.dev ? 'dev' : scripts.start ? 'start' : 'dev'
+  const scriptBody = scripts[scriptName] ?? ''
+
+  // Package manager → run command. yarn/pnpm/bun take a bare script name; npm needs `run`.
+  const pm = (await has('pnpm-lock.yaml')) ? 'pnpm'
+    : (await has('yarn.lock')) ? 'yarn'
+      : (await has('bun.lockb')) ? 'bun'
+        : 'npm'
+  const command = pm === 'npm' ? `npm run ${scriptName}` : `${pm} ${scriptName}`
+
+  // Explicit port in the script wins; else framework default (Vite 5173, everything else 3000).
+  const portMatch = scriptBody.match(/(?:--port[=\s]+|(?:^|\s)-p\s+|PORT[=\s]+)(\d{2,5})/)
+  const port = portMatch ? Number(portMatch[1]) : (('vite' in deps && !('next' in deps)) ? 5173 : 3000)
+  return { command, url: `http://localhost:${port}` }
+}
+
+export async function ensurePlaywrightConfig(cwd: string, log: (s: string) => void): Promise<boolean> {
+  const exists = async (p: string) => { try { await access(p); return true } catch { return false } }
+  for (const name of ['playwright.config.ts', 'playwright.config.js', 'playwright.config.mjs']) {
+    if (await exists(join(cwd, name))) {
+      // A config from before the auth-aware layout won't have the `setup`/`authenticated` projects,
+      // so authenticated specs can't run. Nudge rather than silently overwrite the user's config.
+      const content = await readFile(join(cwd, name), 'utf-8').catch(() => '')
+      if (!/name:\s*['"]setup['"]/.test(content)) {
+        log(chalk.yellow(`  Note: ${name} has no \`setup\`/\`authenticated\` projects.`))
+        log(chalk.dim(`    Delete ${name} and re-run to regenerate the auth-aware config (re-check webServer.command after), or add the projects by hand.`))
+      }
+      return false
+    }
+  }
+
+  const { command, url: baseURL } = await detectDevServer(cwd)
+
+  const content = `import { defineConfig, devices } from '@playwright/test'
+
+// Created by \`lacuna\` when setting up end-to-end testing. Adjust webServer.command / url and
+// baseURL below to match how YOUR app actually starts (port, dev command, etc.).
+export default defineConfig({
+  testDir: './e2e',
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  reporter: 'html',
+  use: {
+    baseURL: '${baseURL}',
+    trace: 'on-first-retry',
+  },
+  projects: [
+    // Logs in once and saves the signed-in storage state (auth.setup.ts). Pinned to the e2e root so
+    // the auth helpers live there even if you move specs into a nested testDir (e.g. ./e2e/tests).
+    { name: 'setup', testDir: './e2e', testMatch: /.*\\.setup\\.ts/ },
+    // Public / unauthenticated specs. The default project lacuna's snapshot + verify runs use.
+    {
+      name: 'chromium',
+      use: { ...devices['Desktop Chrome'] },
+      testIgnore: /.*\\.(setup\\.ts|auth\\.spec\\.ts)$/,
+    },
+    // Authenticated specs (name them *.auth.spec.ts). These reuse the saved storage state, so they
+    // start already signed in. Requires test-config.ts to be filled with a real test user.
+    {
+      name: 'authenticated',
+      testMatch: /.*\\.auth\\.spec\\.ts/,
+      use: { ...devices['Desktop Chrome'], storageState: 'playwright/.auth/user.json' },
+      dependencies: ['setup'],
+    },
+  ],
+  webServer: {
+    command: '${command}',
+    url: '${baseURL}',
+    reuseExistingServer: !process.env.CI,
+    timeout: 120 * 1000,
+  },
+})
+`
+  await writeFile(join(cwd, 'playwright.config.ts'), content, 'utf-8')
+  log(chalk.green('  ✓ Created playwright.config.ts (testDir ./e2e, webServer + baseURL).'))
+  log(chalk.dim(`    Edit webServer.command/url if your dev server isn't \`${command}\` on ${baseURL}.`))
+  return true
+}
+
+// Scaffolds the auth helpers most Playwright projects keep: a fillable test-user config and a
+// `setup` spec that logs in once and saves the signed-in storage state. Created only when missing
+// (never overwrites), and gitignores the saved state. Lacuna never invents credentials — the user
+// fills test-config.ts with a real seeded test user and adjusts the login selectors. These
+// files don't affect lacuna's runs (which target specific specs, not *.setup.ts/*.auth.spec.ts);
+// they exist so authenticated coverage CAN be written. Returns true if it created anything.
+export async function ensureE2EAuthScaffolding(cwd: string, log: (s: string) => void): Promise<boolean> {
+  const exists = async (p: string) => { try { await access(p); return true } catch { return false } }
+  // Put the auth helpers at the E2E ROOT (the first segment of testDir — e.g. 'e2e' for both './e2e'
+  // and './e2e/tests'), NOT the nested specs dir. The generated config's `setup` project is pinned to
+  // this root, so auth.setup.ts is discovered there while your actual specs can live in a nested
+  // testDir like e2e/tests. test-config.ts sits beside it (auth.setup imports './test-config').
+  const { testDir } = await loadPlaywrightConfig(cwd)
+  const dirLabel = testDir.replace(/^\.\//, '').replace(/\/$/, '').split('/')[0] || 'e2e'
+  const testsDir = join(cwd, dirLabel)
+  await mkdir(testsDir, { recursive: true }).catch(() => {})
+  // If the auth helpers already exist anywhere in the e2e tree, don't scaffold placeholders that
+  // would shadow the user's filled-in copies.
+  if (await exists(join(testsDir, 'auth.setup.ts'))) return false
+  let created = false
+
+  const configPath = join(testsDir, 'test-config.ts')
+  if (!(await exists(configPath))) {
+    await writeFile(configPath, `// E2E test configuration. Fill in a SEEDED test user your app already has.
+// Keep real credentials OUT of git — these read env vars so CI can inject them.
+export const testUser = {
+  email: process.env.E2E_EMAIL ?? 'CHANGE_ME@example.com',
+  password: process.env.E2E_PASSWORD ?? 'CHANGE_ME',
+}
+
+// Where your login form lives, and where a successful login lands.
+export const authRoutes = {
+  login: '/login',
+  afterLogin: '/',
+}
+`, 'utf-8')
+    created = true
+  }
+
+  const setupPath = join(testsDir, 'auth.setup.ts')
+  if (!(await exists(setupPath))) {
+    await writeFile(setupPath, `import { test as setup, expect } from '@playwright/test'
+import { testUser, authRoutes } from './test-config'
+
+// Saved signed-in browser state. The 'authenticated' project in playwright.config.ts reuses it so
+// any *.auth.spec.ts spec starts already logged in.
+const authFile = 'playwright/.auth/user.json'
+
+setup('authenticate', async ({ page }) => {
+  await page.goto(authRoutes.login)
+  // Adjust these selectors to match your login form (lacuna can't see it without a real run).
+  await page.getByLabel(/email/i).fill(testUser.email)
+  await page.getByLabel(/password/i).fill(testUser.password)
+  await page.getByRole('button', { name: /sign ?in|log ?in|continue/i }).click()
+  // Confirm login succeeded with a real signed-in signal. The password field disappearing works
+  // whether your app redirects OR renders the form inline (URL unchanged) — replace with something
+  // stronger if you have it (a dashboard heading, an avatar menu, a known testid).
+  await expect(page.getByLabel(/password/i)).toBeHidden()
+  // indexedDB:true is REQUIRED for auth SDKs that keep the session in IndexedDB (Firebase, some
+  // Supabase/Amplify setups). Without it the saved state has no token and protected pages still show
+  // the login form. Harmless for cookie/localStorage auth. Needs Playwright >= 1.51.
+  await page.context().storageState({ path: authFile, indexedDB: true })
+})
+`, 'utf-8')
+    created = true
+  }
+
+  // Never commit the saved session.
+  const gitignorePath = join(cwd, '.gitignore')
+  const ignoreEntry = 'playwright/.auth/'
+  let gitignore = ''
+  try { gitignore = await readFile(gitignorePath, 'utf-8') } catch { /* none yet */ }
+  if (!gitignore.split('\n').some((l) => l.trim() === ignoreEntry)) {
+    await writeFile(gitignorePath, gitignore + (gitignore && !gitignore.endsWith('\n') ? '\n' : '') + ignoreEntry + '\n', 'utf-8')
+  }
+
+  if (created) {
+    log(chalk.green(`  ✓ Scaffolded auth helpers: ${dirLabel}/test-config.ts + ${dirLabel}/auth.setup.ts.`))
+    log(chalk.dim(`    To enable authenticated coverage: fill ${dirLabel}/test-config.ts with a real test user,`))
+    log(chalk.dim(`    fix the login route + selectors in ${dirLabel}/auth.setup.ts, then name authed specs *.auth.spec.ts.`))
+  }
+  return created
 }
 
 // Ensures @playwright/test is available before an --e2e run. If it's missing, prints the exact
@@ -95,7 +296,13 @@ export async function ensurePlaywrightForRun(
   opts: { log: (s: string) => void; offerInstall: boolean },
 ): Promise<boolean> {
   const { log, offerInstall } = opts
-  if (await detectPlaywright(cwd)) return true
+  if (await detectPlaywright(cwd)) {
+    // Installed already — but a missing config is what forces the sequential fallback and stops
+    // the app from booting, so scaffold one (and the auth helpers) if absent.
+    await ensurePlaywrightConfig(cwd, log)
+    await ensureE2EAuthScaffolding(cwd, log)
+    return true
+  }
 
   log(chalk.yellow('\n  --e2e needs @playwright/test, but it is not installed in this project.'))
   if (!offerInstall || !isInteractive()) {
@@ -113,7 +320,10 @@ export async function ensurePlaywrightForRun(
     return false
   }
   if (!installPlaywright(cwd, log)) return false
-  return detectPlaywright(cwd)
+  if (!(await detectPlaywright(cwd))) return false
+  await ensurePlaywrightConfig(cwd, log)        // complete the setup with a runnable config
+  await ensureE2EAuthScaffolding(cwd, log)      // + the auth helpers (test user, login setup)
+  return true
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -131,6 +341,10 @@ export interface PlaywrightConfig {
   // and the URL it waits on. Null when the project expects an already-running app.
   webServerCommand: string | null
   webServerUrl: string | null
+  // Saved auth session path (the `authenticated` project's `storageState`), if the config declares
+  // one — so the E2E loop's authenticated dual-pass uses the project's real path, not a hardcoded
+  // guess. Null when no storageState is configured.
+  storageState: string | null
   // Path to the resolved config file, for diagnostics.
   configPath: string | null
 }
@@ -149,6 +363,7 @@ export async function loadPlaywrightConfig(cwd: string): Promise<PlaywrightConfi
     testDir: 'tests', // Playwright's default when testDir is unset
     webServerCommand: null,
     webServerUrl: null,
+    storageState: null,
     configPath: null,
   }
 
@@ -169,6 +384,7 @@ export async function loadPlaywrightConfig(cwd: string): Promise<PlaywrightConfi
     testDir: matchStringField(raw, 'testDir') ?? fallback.testDir,
     webServerCommand: matchWebServerField(raw, 'command'),
     webServerUrl: matchWebServerField(raw, 'url'),
+    storageState: matchStringField(raw, 'storageState'),
     configPath,
   }
 }
@@ -199,7 +415,10 @@ function matchWebServerField(src: string, key: string): string | null {
 // takes a path filter as a positional arg. We delegate app start/stop entirely to Playwright's
 // own webServer machinery (see design note 2) rather than orchestrating it ourselves.
 export function playwrightRunCommand(testFile: string): string {
-  return `npx playwright test ${shellQuote(testFile)} --reporter=json`
+  // --no-deps: don't run the `setup` (login) project before every verify/repair attempt. The saved
+  // storageState already exists (the user ran setup once), and the `authenticated` project loads it
+  // regardless of deps — so this skips a slow, flaky re-login on each of lacuna's runs.
+  return `npx playwright test ${shellQuote(testFile)} --no-deps --reporter=json`
 }
 
 // Whole-suite run (selection phase / verification sweeps).
@@ -207,8 +426,55 @@ export function playwrightTestCommand(): string {
   return 'npx playwright test --reporter=json'
 }
 
+// Refresh the saved login session by running the `setup` project (auth.setup.ts logs in and writes
+// storageState). Needed because token sessions (Firebase/Supabase/JWT) expire ~1h and lacuna runs
+// verify with --no-deps, so nothing re-logs-in mid-run — a stale session makes every authed spec
+// fail. Succeeds only if setup exits clean AND a NEWER storageState file lands (so a no-op/failed
+// login that leaves a stale file in place is reported as failure, not a false success). The dev
+// server is already up by the time we call this; the config's reuseExistingServer attaches to it.
+// Failure is expected when creds aren't configured (placeholder test-config) — caller falls back.
+export async function refreshAuthState(
+  cwd: string,
+  storageStatePath: string,
+  timeoutMs: number,
+): Promise<{ refreshed: boolean; reason: string }> {
+  const abs = join(cwd, storageStatePath)
+  const before = await stat(abs).then((s) => s.mtimeMs).catch(() => 0)
+  const run = await runCommand('npx playwright test --project=setup --reporter=line', cwd, timeoutMs)
+  const after = await stat(abs).then((s) => s.mtimeMs).catch(() => 0)
+  if (run.success && after > before) return { refreshed: true, reason: 'ok' }
+  const reason = run.timedOut
+    ? 'login timed out'
+    : run.exitCode !== 0
+      ? 'login/setup failed (likely missing or invalid test credentials — set them in your test-config / env)'
+      : 'setup ran but wrote no new session'
+  return { refreshed: false, reason }
+}
+
 function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`
+}
+
+// Runs a Playwright `--reporter=json` command but routes the JSON report to a FILE (via
+// PLAYWRIGHT_JSON_OUTPUT_NAME) instead of stdout. The dev-server (`webServer`) prints its own logs
+// to the test runner's stdout, which interleave with / surround the JSON and break JSON.parse —
+// the reason `parsePlaywrightResults` returned null and callers surfaced raw config-JSON garbage as
+// "the error". A file the reporter writes directly is always clean. Falls back to parsing stdout if
+// the file wasn't produced (e.g. the run crashed before the reporter ran). Unique filename per call,
+// so parallel workers never collide. Returns the RunResult plus the parsed report (or null).
+export async function runPlaywrightJson(
+  command: string,
+  cwd: string,
+  timeoutMs: number,
+  onLine?: (line: string) => void,
+): Promise<{ run: RunResult; parsed: PlaywrightRunResult | null }> {
+  const jsonFile = join(tmpdir(), `lacuna-pw-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.json`)
+  const run = await runCommand(`PLAYWRIGHT_JSON_OUTPUT_NAME=${shellQuote(jsonFile)} ${command}`, cwd, timeoutMs, onLine)
+  let parsed: PlaywrightRunResult | null = null
+  try { parsed = parsePlaywrightResults(await readFile(jsonFile, 'utf-8')) } catch { /* file missing/unparseable — fall back */ }
+  if (!parsed) parsed = parsePlaywrightResults(run.stdout + '\n' + run.stderr)
+  await rm(jsonFile, { force: true }).catch(() => {})
+  return { run, parsed }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -288,6 +554,19 @@ export function parsePlaywrightResults(stdout: string): PlaywrightRunResult | nu
   }
 
   for (const suite of report.suites ?? []) walkSuite(suite, [])
+
+  // Surface top-level errors (a failed `setup`/dependency project, a config/load error, a global
+  // hook throw) — these aren't attached to any spec, so without this the run looks like 0 failures
+  // and the caller falls back to dumping raw config JSON as "the error".
+  if (report.errors && report.errors.length > 0) {
+    failures.push({
+      file: '(run error)',
+      title: 'Playwright run error (setup / config / load — not a test assertion)',
+      message: summariseErrors(report.errors),
+      attachments: [],
+    })
+    if (failed === 0) failed = report.errors.length
+  }
 
   return { passed, failed, flaky, failures }
 }
@@ -380,6 +659,7 @@ function collectAttachments(results: PwResult[] | undefined): string[] {
 interface PlaywrightJsonReport {
   suites?: PwSuite[]
   config?: { rootDir?: string }
+  errors?: PwError[]   // top-level errors not tied to a test (global/project setup, config, load)
 }
 interface PwSuite {
   title?: string
