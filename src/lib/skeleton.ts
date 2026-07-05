@@ -382,6 +382,25 @@ function findSignatureBlockOpen(lines: string[], start: number): number {
 // share the `name(...) {` / `= {` shape, so we never descend into them to collapse.)
 const CONTAINER_DECL = /^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:class|namespace|module)\b/
 
+// First line in body [from, to] that begins a JSX return — either `return <Foo…` (inline/early
+// return) or `return (` immediately followed by a `<…` line. Returns -1 for non-JSX functions.
+// Used to preserve a component's render output (the test contract) instead of collapsing it.
+function findJsxReturnLine(lines: string[], from: number, to: number): number {
+  for (let i = from; i <= to; i++) {
+    const t = lines[i].trim()
+    if (/\breturn\s*</.test(t)) return i                 // return <Foo …  (early or inline)
+    if (/\breturn\s*\(\s*$/.test(t)) {
+      for (let k = i + 1; k <= to; k++) {                // `return (` — confirm JSX follows
+        const nt = lines[k].trim()
+        if (!nt) continue
+        return nt.startsWith('<') ? i : -1
+      }
+      return -1
+    }
+  }
+  return -1
+}
+
 // Line index of the first `{` at/after `start` — used for container headers (`class X {`,
 // `class X extends Y {` possibly spanning lines), which open a block directly with no param list.
 function findBraceOpenLine(lines: string[], start: number): number {
@@ -453,9 +472,20 @@ function skeletonizeRange(
         result.push(...lines.slice(i, blockEnd + 1))
       } else {
         // Collapse to a signature stub — keep the full (possibly multi-line) signature, replace
-        // the body with a stub comment.
-        const sigText = lines.slice(i, blockOpen + 1).join('\n').replace(/\{[^{}]*$/, '').trimEnd()
-        result.push(`${sigText} { /* ... (${bodyLines} line${bodyLines === 1 ? '' : 's'}) */ }`)
+        // the body with a stub comment. EXCEPTION: a component/render function whose body returns
+        // JSX — that JSX (labels, testIDs, conditional branches) is exactly what a testing-library
+        // test asserts against, so collapsing it blinds the model to the render contract. Preserve
+        // the JSX return; collapse only the setup (hooks/handlers) above the first JSX return.
+        const jsxStart = findJsxReturnLine(lines, blockOpen + 1, blockEnd - 1)
+        if (jsxStart >= 0) {
+          result.push(...lines.slice(i, blockOpen + 1))           // signature line(s) incl. `{`
+          const collapsed = jsxStart - (blockOpen + 1)
+          if (collapsed > 0) result.push(`  /* ... ${collapsed} setup line${collapsed === 1 ? '' : 's'} collapsed */`)
+          result.push(...lines.slice(jsxStart, blockEnd + 1))     // JSX return … through closing `}`
+        } else {
+          const sigText = lines.slice(i, blockOpen + 1).join('\n').replace(/\{[^{}]*$/, '').trimEnd()
+          result.push(`${sigText} { /* ... (${bodyLines} line${bodyLines === 1 ? '' : 's'}) */ }`)
+        }
       }
 
       i = blockEnd + 1

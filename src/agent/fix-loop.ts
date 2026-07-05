@@ -18,7 +18,7 @@ import type { CoverageGap } from '../lib/coverage/types.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile, findTestFilesWithTypeErrors, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js'
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, parseFailCount, buildStructureBrokenMessage, buildRegressionMessage, buildUnhandledErrorMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, dedupeImports, dedupeTestBlocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, parseFailCount, buildStructureBrokenMessage, buildRegressionMessage, buildUnhandledErrorMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, dedupeImports, dedupeTestBlocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -511,6 +511,7 @@ async function fixFile(
 
     testFileContent = deduplicateViMocks(testFileContent)
     testFileContent = typeImportOriginalCalls(testFileContent)
+    testFileContent = ensureMockedImports(testFileContent)
     testFileContent = dedupeImports(testFileContent)
     testFileContent = dedupeTestBlocks(testFileContent)
 

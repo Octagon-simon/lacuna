@@ -20,7 +20,7 @@ import { typeCheckFile, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js'
 import { formatFile } from '../lib/format.js'
 import { routeTestToNodeEnv } from '../lib/env-route.js'
 import { detectWeakAsyncWait } from './prompts/index.js'
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, dedupeImports, dedupeTestBlocks, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, dedupeImports, dedupeTestBlocks, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -332,6 +332,7 @@ export async function processGap(
 
     testCode = deduplicateViMocks(testCode)
     testCode = typeImportOriginalCalls(testCode)
+    testCode = ensureMockedImports(testCode)
     testCode = dedupeImports(testCode)
     testCode = dedupeTestBlocks(testCode)
 
