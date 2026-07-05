@@ -1,7 +1,9 @@
-import { Command, Flags } from '@oclif/core'
+import { Command, Flags, Args } from '@oclif/core'
+import { stat } from 'fs/promises'
+import { resolve, relative } from 'path'
 import chalk from 'chalk'
 import { loadConfig } from '../lib/config.js'
-import { detectEnvironment } from '../lib/detector.js'
+import { detectEnvironment, fileTestCommand, scopedTestCommand } from '../lib/detector.js'
 import { runCommand } from '../lib/runner.js'
 
 export default class Run extends Command {
@@ -9,7 +11,16 @@ export default class Run extends Command {
 
   static examples = [
     '$ lacuna run',
+    '$ lacuna run src/payments',
   ]
+
+  // Optional positional: a test file or directory to run instead of the whole suite.
+  static args = {
+    path: Args.string({
+      description: 'Test file or directory to run instead of the whole suite',
+      required: false,
+    }),
+  }
 
   static flags = {
     verbose: Flags.boolean({
@@ -20,7 +31,7 @@ export default class Run extends Command {
   }
 
   async run(): Promise<void> {
-    const { flags } = await this.parse(Run)
+    const { args, flags } = await this.parse(Run)
     const config = await loadConfig()
     if (config.testEnv) Object.assign(process.env, config.testEnv)
     const env = await detectEnvironment(process.cwd(), config.testRunner)
@@ -33,10 +44,32 @@ export default class Run extends Command {
       this.exit(1)
     }
 
-    this.log(`${chalk.dim('Runner:')} ${chalk.cyan(env.testRunner)}\n`)
-    this.log(chalk.dim(`$ ${env.testCommand}\n`))
+    // Resolve the optional scope: a file runs just that file, a directory runs only the tests
+    // under it (scopedTestCommand; falls back to the full command for runners we can't narrow).
+    let testCommand = env.testCommand
+    let scopeLabel: string | undefined
+    if (args.path) {
+      const abs = resolve(process.cwd(), args.path)
+      let isDir = false
+      try {
+        isDir = (await stat(abs)).isDirectory()
+      } catch {
+        this.error(`Path not found: ${args.path}`)
+      }
+      if (isDir) {
+        const rel = relative(process.cwd(), abs) || '.'
+        testCommand = scopedTestCommand(env, rel) ?? env.testCommand
+      } else {
+        testCommand = fileTestCommand(env, abs)
+      }
+      scopeLabel = args.path
+    }
 
-    const result = await runCommand(env.testCommand)
+    this.log(`${chalk.dim('Runner:')} ${chalk.cyan(env.testRunner)}`)
+    if (scopeLabel) this.log(`${chalk.dim('Scope:')}  ${chalk.cyan(scopeLabel)}`)
+    this.log(chalk.dim(`\n$ ${testCommand}\n`))
+
+    const result = await runCommand(testCommand)
 
     if (flags.verbose) {
       this.log(result.stdout)

@@ -296,6 +296,23 @@ function extractDeclaredName(line: string): string | null {
   return null
 }
 
+// Keywords that open a `name(...) {` shaped block but are control flow, NOT a method.
+const CONTROL_KEYWORDS = /^(?:if|for|while|switch|catch|else|do|with|return|function|class|await|yield|new)\b/
+
+// Extracts a class/object METHOD name from a declaration line (`async foo(...) {`,
+// `private bar<T>(): X {`, `get baz() {`, `constructor(...) {`), guarding against control-flow
+// (`if (...) {`, `for (...) {`) that shares the `name(...) {` shape. Methods aren't top-level
+// declarations, so `extractDeclaredName` misses them — this lets a class body collapse its
+// non-target methods to signatures instead of dumping every method verbatim.
+function extractMethodName(line: string): string | null {
+  const s = line.trim()
+  if (CONTROL_KEYWORDS.test(s)) return null
+  const m = s.match(
+    /^(?:(?:public|private|protected|static|readonly|async|override|abstract|get|set)\s+)*\*?\s*([A-Za-z_$][\w$]*)\s*(?:<[^>]*>)?\s*\(/,
+  )
+  return m ? m[1] : null
+}
+
 // ─── Skeleton builder ─────────────────────────────────────────────────────────
 
 export function shouldUseSkeleton(code: string): boolean {
@@ -305,17 +322,92 @@ export function shouldUseSkeleton(code: string): boolean {
 /**
  * Returns a skeletonized version of sourceCode.
  * expandFunctions: names of functions whose full body must be included (the uncovered ones).
+ * expandLines: 1-based line numbers that MUST stay visible — the enclosing block of any such
+ *   line is kept expanded (recursing into classes so only the target method survives, its
+ *   siblings collapse). This is the reliable path when the coverage report names functions
+ *   anonymously (`(anonymous_23)`) or when the target lives inside a class method — name
+ *   matching alone then expands nothing and the whole class collapses to an empty shell.
  * If the file is short enough, returns the original code unchanged.
  */
-export function buildSourceSkeleton(sourceCode: string, expandFunctions: string[] = []): string {
+export function buildSourceSkeleton(
+  sourceCode: string,
+  expandFunctions: string[] = [],
+  expandLines: number[] = [],
+): string {
   if (!shouldUseSkeleton(sourceCode)) return sourceCode
 
   const lines = sourceCode.split('\n')
   const expandSet = new Set(expandFunctions)
-  const result: string[] = []
-  let i = 0
+  const lineSet = new Set(expandLines)  // 1-based
+  const out: string[] = []
+  skeletonizeRange(lines, 0, lines.length - 1, expandSet, lineSet, out)
+  return out.join('\n')
+}
 
-  while (i < lines.length) {
+// True if any target (1-based) line falls within the block spanning [start, end] (0-based).
+function blockHasTargetLine(lineSet: Set<number>, start: number, end: number): boolean {
+  if (lineSet.size === 0) return false
+  for (let n = start + 1; n <= end + 1; n++) if (lineSet.has(n)) return true
+  return false
+}
+
+// Given a declaration starting at `start` (a function/method/const-arrow line), returns the line
+// index where its body `{` opens — handling MULTI-LINE signatures (params spread over many lines,
+// so the `{` isn't on the `name(` line). Returns -1 when this is NOT a block declaration: a call
+// like `foo(a, {b});`, or a field like `const x = (expr) as T;`. The braces inside the param
+// list (default args, object-type params) are at paren-depth > 0 and correctly ignored — only a
+// `{` AFTER the params close (optionally past a `: ReturnType` annotation or an `=>`) counts.
+function findSignatureBlockOpen(lines: string[], start: number): number {
+  let parenDepth = 0
+  let seenParen = false
+  const end = Math.min(start + 30, lines.length - 1)
+  for (let i = start; i <= end; i++) {
+    const line = lines[i]
+    for (let j = 0; j < line.length; j++) {
+      const ch = line[j]
+      if (ch === '(') { parenDepth++; seenParen = true }
+      else if (ch === ')') { parenDepth-- }
+      else if (parenDepth === 0 && seenParen) {
+        if (ch === '{') return i                              // body opens
+        if (ch === ';') return -1                             // statement/call — not a body
+        if (ch === '=' && line[j + 1] !== '>') return -1      // assignment (not `=>`) — a field
+      }
+    }
+  }
+  return -1
+}
+
+// A class/namespace/module block whose direct children are methods/fields — the only context
+// where method-name collapsing is safe. (Function BODIES contain calls and object literals that
+// share the `name(...) {` / `= {` shape, so we never descend into them to collapse.)
+const CONTAINER_DECL = /^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(?:class|namespace|module)\b/
+
+// Line index of the first `{` at/after `start` — used for container headers (`class X {`,
+// `class X extends Y {` possibly spanning lines), which open a block directly with no param list.
+function findBraceOpenLine(lines: string[], start: number): number {
+  const end = Math.min(start + 10, lines.length - 1)
+  for (let i = start; i <= end; i++) if (lines[i].includes('{')) return i
+  return -1
+}
+
+// Processes lines [from, to] (inclusive, 0-based), appending the skeletonized output.
+//   inContainer=true  → we're directly inside a class/namespace body: collapse non-target
+//                       methods to signatures, recurse into nested classes.
+//   inContainer=false → module scope: only top-level function/class/const decls are considered.
+// A class is always recursed (so its non-target methods collapse); a function/method that holds
+// a target line is emitted WHOLE (never descended into — that avoids misreading its call sites
+// as declarations); everything else with a name collapses to a signature stub.
+function skeletonizeRange(
+  lines: string[],
+  from: number,
+  to: number,
+  expandSet: Set<string>,
+  lineSet: Set<number>,
+  result: string[],
+  inContainer = false,
+): void {
+  let i = from
+  while (i <= to) {
     const line = lines[i]
     const trimmed = line.trim()
 
@@ -334,24 +426,36 @@ export function buildSourceSkeleton(sourceCode: string, expandFunctions: string[
       continue
     }
 
-    // ── Detect a block-opening declaration ────────────────────────────────────
-    const name = extractDeclaredName(trimmed)
-    const opensBlock = /\{/.test(trimmed) && !/^\s*\/\//.test(trimmed)
+    // ── Detect a collapsible declaration ──────────────────────────────────────
+    // Module scope: top-level function/class/const. Inside a class: also methods.
+    const name = extractDeclaredName(trimmed) ?? (inContainer ? extractMethodName(trimmed) : null)
+    const isContainer = name != null && CONTAINER_DECL.test(trimmed)
+    // Container headers open a block directly (`class X {`, no params); everything else must be
+    // validated as a real signature — never trust a bare `{` on the line, which could be an
+    // object arg in a call (`foo({a});`) or an object field initializer.
+    const blockOpen = !name ? -1
+      : isContainer ? findBraceOpenLine(lines, i)
+      : findSignatureBlockOpen(lines, i)
 
-    if (name && opensBlock) {
-      const blockEnd = findBlockEnd(lines, i)
+    if (name && blockOpen >= 0) {
+      const blockEnd = findBlockEnd(lines, blockOpen)
       const bodyLines = blockEnd - i
 
-      if (expandSet.has(name)) {
-        // Full implementation — the AI needs this to write assertions
+      if (isContainer) {
+        // Segment the class body by BRACE DEPTH (not regex per line): each member is a run
+        // between depth-0 boundaries, so calls/object-literals nested inside a method body
+        // (`this.logger.error('x', { … })`) can never be misread as a member declaration.
+        result.push(...lines.slice(i, blockOpen + 1))
+        skeletonizeContainerBody(lines, blockOpen + 1, blockEnd - 1, expandSet, lineSet, result)
+        if (blockEnd > blockOpen) result.push(lines[blockEnd])
+      } else if (expandSet.has(name) || blockHasTargetLine(lineSet, i, blockEnd)) {
+        // Named uncovered function OR a function/method containing a target line: emit whole.
         result.push(...lines.slice(i, blockEnd + 1))
       } else {
-        // Collapse: show the signature line with a stub body
-        const sigLine = line.replace(/\{[\s\S]*/, '').trimEnd()
-        result.push(
-          `${sigLine}${sigLine.trimEnd().endsWith(')') || sigLine.trimEnd().endsWith('>') ? ' ' : ''}` +
-          `{ /* ... (${bodyLines} line${bodyLines === 1 ? '' : 's'}) */ }`,
-        )
+        // Collapse to a signature stub — keep the full (possibly multi-line) signature, replace
+        // the body with a stub comment.
+        const sigText = lines.slice(i, blockOpen + 1).join('\n').replace(/\{[^{}]*$/, '').trimEnd()
+        result.push(`${sigText} { /* ... (${bodyLines} line${bodyLines === 1 ? '' : 's'}) */ }`)
       }
 
       i = blockEnd + 1
@@ -361,6 +465,77 @@ export function buildSourceSkeleton(sourceCode: string, expandFunctions: string[
     result.push(line)
     i++
   }
+}
 
-  return result.join('\n')
+// Skeletonizes the INSIDE of a class/namespace body [from, to] by segmenting members on brace
+// depth. A member is either a block (method/getter/nested class — opens `{`, closes at the
+// matching `}`) or a field/statement (ends in `;` at depth 0). Depth tracking is string-aware,
+// so braces in strings/params/nested calls don't split members. Non-target methods collapse to
+// a signature stub; a member holding a target line (or a name in expandSet) is emitted whole.
+function skeletonizeContainerBody(
+  lines: string[],
+  from: number,
+  to: number,
+  expandSet: Set<string>,
+  lineSet: Set<number>,
+  result: string[],
+): void {
+  let depth = 0
+  let parenDepth = 0   // braces inside a param list (`= {}` defaults, object-type params) don't count
+  let inString: '"' | "'" | '`' | null = null
+  let escaped = false
+  let memberStart = from
+  let braceOpenLine = -1
+
+  const emitMember = (start: number, end: number, sigOpen: number) => {
+    if (sigOpen < 0) { result.push(...lines.slice(start, end + 1)); return } // field/statement
+    // A nested class inside the body → recurse so ITS methods collapse too.
+    const firstCode = lines.slice(start, sigOpen + 1).find((l) => CONTAINER_DECL.test(l.trim()))
+    if (firstCode) { skeletonizeRange(lines, start, end, expandSet, lineSet, result); return }
+    let name: string | null = null
+    for (let k = start; k <= sigOpen; k++) {
+      name = extractDeclaredName(lines[k].trim()) ?? extractMethodName(lines[k].trim())
+      if (name) break
+    }
+    const bodyLines = end - sigOpen   // size of the BODY (from its `{` line), not the signature
+    const keepWhole = (name != null && expandSet.has(name))
+      || blockHasTargetLine(lineSet, start, end)
+      || bodyLines <= 1                // empty/one-line body (`{}`) — nothing worth collapsing
+    if (keepWhole) { result.push(...lines.slice(start, end + 1)); return }
+    // Keep the full (possibly multi-line) signature; replace only the body with a stub. The body
+    // opens on sigOpen, so strip from the LAST `{` on that line onward.
+    const sigHead = lines.slice(start, sigOpen).join('\n')
+    const sigTail = lines[sigOpen].replace(/\{(?![^]*\{).*$/, '').trimEnd()
+    const sigText = (sigHead ? sigHead + '\n' : '') + sigTail
+    result.push(`${sigText} { /* ... (${bodyLines} line${bodyLines === 1 ? '' : 's'}) */ }`)
+  }
+
+  for (let i = from; i <= to; i++) {
+    const line = lines[i]
+    for (let j = 0; j < line.length; j++) {
+      const ch = line[j]
+      if (escaped) { escaped = false; continue }
+      if (ch === '\\' && inString) { escaped = true; continue }
+      if (inString) { if (ch === inString) inString = null; continue }
+      if (ch === '"' || ch === "'" || ch === '`') { inString = ch; continue }
+
+      // Track parens so braces inside a (possibly multi-line) param list are ignored — a member
+      // body brace is only one seen while NOT inside parentheses.
+      if (ch === '(') { parenDepth++; continue }
+      if (ch === ')') { if (parenDepth > 0) parenDepth--; continue }
+      if (parenDepth > 0) continue
+
+      if (ch === '{') { if (depth === 0) braceOpenLine = i; depth++ }
+      else if (ch === '}') {
+        depth--
+        if (depth === 0) { emitMember(memberStart, i, braceOpenLine); memberStart = i + 1; braceOpenLine = -1 }
+      } else if (ch === ';' && depth === 0) {
+        // Field / statement member (no block). Emit its lines verbatim (fields are short).
+        result.push(...lines.slice(memberStart, i + 1))
+        memberStart = i + 1
+      }
+    }
+  }
+  // Trailing lines with no terminator (blank lines / comments before the class close) — verbatim.
+  if (memberStart <= to) result.push(...lines.slice(memberStart, to + 1))
 }

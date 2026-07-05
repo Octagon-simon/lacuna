@@ -568,6 +568,10 @@ async function ensureTestRunnerSetup(
         `    restoreMocks: true,`,
         `    clearMocks: true,`,
         `    coverage: {`,
+        `      // Coverage instrumentation + report generation is the biggest single cost in a`,
+        `      // large suite. Keep it OFF for the inner loop (plain \`vitest run\`); opt in with the`,
+        `      // \`test:cov\` script or \`--coverage\` when you actually need a report.`,
+        `      enabled: false,`,
         `      provider: 'v8',`,
         `      reporter: ['lcov', 'text-summary'],`,
         `      reportsDirectory: './coverage',`,
@@ -579,7 +583,8 @@ async function ensureTestRunnerSetup(
       await writeFile(configPath, content)
       log(chalk.green(`  ✓ Created vitest.config.ts at project root`))
     }
-    log(chalk.dim(`\n  Add to package.json scripts: "test": "vitest run --coverage"`))
+    log(chalk.dim(`\n  Add to package.json scripts: "test": "vitest run", "test:cov": "vitest run --coverage"`))
+    log(chalk.dim(`  (Keep coverage out of the inner loop — it's the biggest cost. Run test:cov / CI for reports.)`))
 
   } else if (runner === 'jest') {
     const configPath = resolve(cwd, 'jest.config.js')
@@ -614,7 +619,8 @@ async function ensureTestRunnerSetup(
       await writeFile(configPath, content)
       log(chalk.green(`  ✓ Created jest.config.js`))
     }
-    log(chalk.dim(`\n  Add to package.json scripts: "test": "jest --coverage"`))
+    log(chalk.dim(`\n  Add to package.json scripts: "test": "jest", "test:cov": "jest --coverage"`))
+    log(chalk.dim(`  (Keep coverage out of the inner loop — it's the biggest cost. Run test:cov / CI for reports.)`))
 
   } else if (runner === 'mocha') {
     const configPath = resolve(cwd, '.mocharc.json')

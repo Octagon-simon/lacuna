@@ -17,6 +17,8 @@ export function buildReactCauses(isJSRunner: boolean, mockApi: string): string {
 
     - waitFor safety rule: always provide a timeout (e.g. { timeout: 2000 }). Never allow unbounded waitFor loops in agent-generated tests.
 
+    - NO timeout band-aids: never paper over a flaky test by inflating waits — no per-test \`{ timeout: 5000 }\`, no \`it(..., 10000)\`, no \`waitFor(..., { timeout: 8000 })\` to "make it pass". A long timeout only hides a weak wait (see the WEAK-WAIT rule below) and, when the test genuinely fails, it burns the full timeout as wall-clock. Fix the condition being waited on (wait for a real settle signal), don't extend the clock.
+
     - findBy over waitFor: prefer findByRole/findByText/findByLabelText over waitFor(() => getByRole(...)). findBy has built-in timeout, is semantically clearer, and avoids unnecessary waitFor nesting. Use waitFor only when asserting on non-element state (e.g. mock call counts, store updates).
 
     - WEAK-WAIT RACE (passes locally, fails in CI) — the single most important async rule: NEVER assert hook/component STATE right after a waitFor whose body only checks that a mock was *called*. A mock is called synchronously, BEFORE its promise resolves and before the setState that consumes the result runs. So this races and reads the initial value in slow CI:
@@ -60,5 +62,9 @@ export function buildReactCauses(isJSRunner: boolean, mockApi: string): string {
     - Infinite retry guard: never generate recursive waitFor → trigger → waitFor chains. If a condition does not resolve within a single waitFor block, fail explicitly.
 
     - React 18 act() flush rule: when an event handler awaits a service mock and then calls setState, do NOT try to wrap the event in await act(async () => { ... }) — act flushes only one microtask level and misses multi-hop mockResolvedValue chains. The correct fix is await waitFor(() => expect(element).toBeInTheDocument()) after the triggering event. waitFor polls inside act until the assertion passes, draining all async hops.
+
+    - EMPTY / CLEARED inputs (user-event v14): NEVER call userEvent.type(el, '') — v14 throws "Expected key descriptor but found \\"\\"". To test an empty or cleared field, use \`await user.clear(el)\` or \`fireEvent.change(el, { target: { value: '' } })\`. To type-then-clear: \`await user.type(el, 'x'); await user.clear(el)\`. type() is only for non-empty strings.
+
+    - SETTING a value vs EXERCISING typing: userEvent.type() simulates every keystroke — a full event sequence and a React re-render per character — which is slow and unnecessary when you just need a value in the field. To populate an input, use \`fireEvent.change(el, { target: { value: 'abc' } })\` (one update). Reserve userEvent.type() for tests that genuinely exercise per-keystroke behavior (debounce, max-length, key handlers, incremental validation).
 `
 }

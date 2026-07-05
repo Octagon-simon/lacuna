@@ -49,7 +49,7 @@ export function hasPlaceholderBodies(code: string): boolean {
 // come from the authoritative Tests summary line, so they override the substring match.
 export function isZeroTestsOutput(raw: string): boolean {
   if (parsePassCount(raw) > 0 || parseFailCount(raw) > 0) return false
-  return /Tests:?\s+(?:0\s+total|no tests)\b|no tests? found|found 0 tests/i.test(raw)
+  return /Tests:?\s+(?:0\s+total|no tests)\b|no tests? found|found 0 tests/i.test(stripAnsi(raw))
 }
 
 // If the runner output indicates "no tests found", replace it with a clear instruction
@@ -75,16 +75,33 @@ export function enrichNoTestsError(extracted: string, rawOutput: string = extrac
   )
 }
 
+// Strips ANSI SGR (color/style) escape codes. The runner colorizes its output when a TTY is
+// present OR when FORCE_COLOR is set in the environment lacuna spawns it from — and a colored
+// summary line looks like "\x1B[2m      Tests \x1B[22m \x1B[1m\x1B[32m15 passed\x1B[39m (15)".
+// The leading escape defeats a `^\s*Tests` anchor, so the count parsers below MUST strip first
+// (extractTestFailure already does this for display, which is why the shown summary looked clean
+// while the parsed count silently fell back to the "Test Files  1 passed" line).
+const ANSI_SGR_RE = /\x1B\[[0-9;]*m/g
+function stripAnsi(s: string): string {
+  return s.replace(ANSI_SGR_RE, '')
+}
+
 // Extracts the number of passing tests from the runner summary footer.
 // Targets the "Tests  N failed | M passed (total)" line specifically to avoid
 // false matches from file-level headers like "(1 passed)" or test descriptions.
 export function parsePassCount(output: string): number {
+  const clean = stripAnsi(output)
   // Prefer the Tests summary line: "Tests  1 failed | 15 passed (16)" or "Tests  15 passed (15)"
-  const summaryLine = output.match(/^\s*Tests\b[^\n]*?(\d+)\s+passed/m)
+  const summaryLine = clean.match(/^\s*Tests\b[^\n]*?(\d+)\s+passed/m)
   if (summaryLine) return parseInt(summaryLine[1], 10)
-  // Fallback: any "N passed" in the output
-  const m = output.match(/(\d+)\s+passed/)
-  return m ? parseInt(m[1], 10) : 0
+  // Fallback: first "N passed" — but NEVER the file-count line ("Test Files  1 passed"), which
+  // would misreport a 15-passing run as 1 and trigger a phantom regression.
+  for (const line of clean.split('\n')) {
+    if (/Test\s+Files/i.test(line)) continue
+    const m = line.match(/(\d+)\s+passed/)
+    if (m) return parseInt(m[1], 10)
+  }
+  return 0
 }
 
 // Extracts the number of failing tests from the runner summary footer.
@@ -92,7 +109,7 @@ export function parsePassCount(output: string): number {
 // appears in too many noise lines (per-test FAIL markers, stack frames) to match loosely.
 // Used alongside parsePassCount to prove tests were actually collected.
 export function parseFailCount(output: string): number {
-  const summaryLine = output.match(/^\s*Tests\b[^\n]*?(\d+)\s+failed/m)
+  const summaryLine = stripAnsi(output).match(/^\s*Tests\b[^\n]*?(\d+)\s+failed/m)
   return summaryLine ? parseInt(summaryLine[1], 10) : 0
 }
 
@@ -251,6 +268,89 @@ export function sanitizeMocksContent(raw: string): { code: string; stripped: boo
   const hasRealCode = result.split('\n').some(l => l.trim() && !l.trim().startsWith('//') && !l.trim().startsWith('/*') && !l.trim().startsWith('*'))
   if (!hasRealCode) return { code: '', stripped: true }
   return { code: result, stripped }
+}
+
+// Vitest/Jest partial mocks call `importOriginal()` to pull the real module, then spread it:
+// `const actual = await importOriginal(); return { ...actual, ... }`. Untyped, importOriginal
+// returns `unknown`, so `{ ...actual }` fails type-checking with TS2698 "Spread types may only
+// be created from object types". The fix is mechanical: give the call the module's type via a
+// generic — `importOriginal<typeof import('<the vi.mock path>')>()`. We infer the module path
+// from the enclosing `vi.mock('PATH', ...)` (the nearest preceding mock call). Adding the
+// generic is always safe (it only supplies a type), so we apply it to every untyped call.
+export function typeImportOriginalCalls(code: string): string {
+  if (!code.includes('importOriginal')) return code
+
+  // Match a call site `importOriginal(` — capturing an optional `<` that means it's already
+  // typed (skip those). The bare param declaration `(importOriginal) =>` has no following `(`,
+  // so it never matches.
+  const callRe = /\bimportOriginal\s*(<)?\s*\(/g
+  let out = ''
+  let last = 0
+  let m: RegExpExecArray | null
+  while ((m = callRe.exec(code)) !== null) {
+    if (m[1]) continue // already has a type argument
+    const before = code.slice(0, m.index)
+    const mockMatch = [...before.matchAll(/\b(?:vi|jest)\.mock\(\s*['"`]([^'"`]+)['"`]/g)].pop()
+    if (!mockMatch) continue // can't resolve the module path — leave it for the model
+    const insertAt = m.index + 'importOriginal'.length
+    out += code.slice(last, insertAt) + `<typeof import('${mockMatch[1]}')>`
+    last = insertAt
+  }
+  return out + code.slice(last)
+}
+
+// Collapses duplicate named imports from the SAME module into one statement, and de-dupes
+// repeated specifiers within a single import. The model sometimes emits two
+// `import { A } from '../index'` + `import { A, b } from '../index'` lines — not a TS error
+// (no duplicate identifier), so the type-check loop never catches it, but ESLint's
+// no-duplicate-imports flags it and it just reads badly. Deliberately CONSERVATIVE: only
+// single-line, purely-named imports (`import { … } from 'x'`) are touched. Default, namespace
+// (`* as`), side-effect, `import type`, and multi-line imports are left exactly as-is so we
+// never corrupt a valid file. Specifier tokens (incl. `a as b`, inline `type X`) are preserved
+// verbatim and de-duped by exact text.
+export function dedupeImports(code: string): string {
+  const lines = code.split('\n')
+  const NAMED_RE = /^(\s*)import\s+\{([^{}]*)\}\s+from\s+(['"])([^'"]+)\3(\s*;?\s*)$/
+
+  const firstLineFor = new Map<string, number>()  // module → line index of the kept import
+  const namesFor = new Map<string, string[]>()     // module → ordered, de-duped specifiers
+  const drop = new Set<number>()
+  let changed = false
+
+  for (let i = 0; i < lines.length; i++) {
+    const m = lines[i].match(NAMED_RE)
+    if (!m) continue
+    const mod = m[4]
+    const names = m[2].split(',').map((s) => s.trim()).filter(Boolean)
+
+    if (!firstLineFor.has(mod)) {
+      firstLineFor.set(mod, i)
+      namesFor.set(mod, [])
+    } else {
+      drop.add(i)        // fold this duplicate into the first import for the module
+      changed = true
+    }
+    const acc = namesFor.get(mod)!
+    for (const n of names) {
+      if (!acc.includes(n)) acc.push(n)
+      else changed = true  // repeated specifier (within-line or across lines)
+    }
+  }
+
+  if (!changed) return code
+
+  const out: string[] = []
+  for (let i = 0; i < lines.length; i++) {
+    if (drop.has(i)) continue
+    const m = lines[i].match(NAMED_RE)
+    if (m && firstLineFor.get(m[4]) === i) {
+      const [, indent, , quote, mod, tail] = m
+      out.push(`${indent}import { ${namesFor.get(mod)!.join(', ')} } from ${quote}${mod}${quote}${tail.includes(';') ? ';' : ''}`)
+    } else {
+      out.push(lines[i])
+    }
+  }
+  return out.join('\n')
 }
 
 // Merges duplicate vi.mock() calls for the same module path into one.
@@ -429,6 +529,29 @@ export function buildRegressionMessage(
     `${RULE_DIVIDER}\n\n` +
     `Do NOT modify tests that were already passing.\n` +
     `ONLY fix the test that was originally failing.`
+  )
+}
+
+// Message for the case where every collected test PASSES but the run still exits non-zero because
+// the runner caught an UNHANDLED error (an unhandled promise rejection, or a suite-level error
+// thrown outside any test/assertion). The model otherwise sees "still failing" with no failing
+// assertion to anchor on and oscillates. This names the real problem and the standard fix.
+export function buildUnhandledErrorMessage(currentError: string, passCount: number): string {
+  return (
+    `All ${passCount} tests PASS, but the run still FAILED — the runner caught an unhandled error ` +
+    `(an unhandled promise rejection, or an error thrown outside any test). These fail the run and ` +
+    `cause false-positive/flaky results in CI, so they must be eliminated — not ignored.\n\n` +
+    `Most common cause: an async action or a mount effect fires a promise that REJECTS and nothing ` +
+    `awaits or catches it within the test's scope (e.g. a fetch mocked with mockRejectedValue whose ` +
+    `rejection escapes after the test body returns). Fix by handling the rejection INSIDE the test: ` +
+    `await the settling of the error path (e.g. \`await waitFor(() => expect(<error state>)...)\` or ` +
+    `\`await expect(promise).rejects.toThrow(...)\`) so no rejection outlives the test. If a specific ` +
+    `test is meant to exercise the rejection, assert it explicitly. Do NOT silence it with an empty ` +
+    `try/catch or by deleting the test.\n\n` +
+    `Runner output:\n` +
+    `${RULE_DIVIDER}\n` +
+    `${currentError}\n` +
+    `${RULE_DIVIDER}`
   )
 }
 
@@ -1016,6 +1139,119 @@ function removeEmptyDescribeBlocks(code: string): string {
     code = out.join('\n')
   }
   return code
+}
+
+// Scans from the `{` at `openIdx` to its matching `}`, skipping strings/comments/template
+// expressions so braces inside quoted text don't miscount. Returns the index of the matching
+// `}`, or -1 if unbalanced.
+function scanToMatchingBrace(code: string, openIdx: number): number {
+  let i = openIdx
+  let depth = 0
+  while (i < code.length) {
+    const ch = code[i]
+    if (ch === '/' && code[i + 1] === '/') { i += 2; while (i < code.length && code[i] !== '\n') i++; continue }
+    if (ch === '/' && code[i + 1] === '*') { i += 2; while (i < code.length && !(code[i] === '*' && code[i + 1] === '/')) i++; i += 2; continue }
+    if (ch === '"' || ch === "'") {
+      const q = ch; i++
+      while (i < code.length) { if (code[i] === '\\') { i += 2; continue } if (code[i] === q) { i++; break } i++ }
+      continue
+    }
+    if (ch === '`') {
+      i++
+      while (i < code.length) {
+        if (code[i] === '\\') { i += 2; continue }
+        if (code[i] === '`') { i++; break }
+        if (code[i] === '$' && code[i + 1] === '{') { i += 2; let t = 1; while (i < code.length && t > 0) { if (code[i] === '{') t++; else if (code[i] === '}') t--; i++ } continue }
+        i++
+      }
+      continue
+    }
+    if (ch === '{') { depth++; i++; continue }
+    if (ch === '}') { depth--; if (depth === 0) return i; i++; continue }
+    i++
+  }
+  return -1
+}
+
+// Index of the FIRST `{` in `block` (the callback-body opener), skipping strings/comments.
+function firstBodyBrace(block: string): number {
+  let i = 0
+  while (i < block.length) {
+    const ch = block[i]
+    if (ch === '/' && block[i + 1] === '/') { i += 2; while (i < block.length && block[i] !== '\n') i++; continue }
+    if (ch === '/' && block[i + 1] === '*') { i += 2; while (i < block.length && !(block[i] === '*' && block[i + 1] === '/')) i++; i += 2; continue }
+    if (ch === '"' || ch === "'") { const q = ch; i++; while (i < block.length) { if (block[i] === '\\') { i += 2; continue } if (block[i] === q) { i++; break } i++ } continue }
+    if (ch === '`') { i++; while (i < block.length && block[i] !== '`') { if (block[i] === '\\') i++; i++ } i++; continue }
+    if (ch === '{') return i
+    i++
+  }
+  return -1
+}
+
+// A block's identity for duplicate detection: every line trimmed, blanks dropped, rejoined.
+// So two blocks that differ only in indentation/blank lines still compare equal (a re-emitted
+// copy), while any real difference in test names or assertions keeps them distinct.
+function normalizeBlockSig(block: string): string {
+  return block.split('\n').map((l) => l.trim()).filter((l) => l !== '').join('\n')
+}
+
+// Removes a describe()/it()/test() block that is an EXACT duplicate (identical normalized text)
+// of an earlier SIBLING block in the same scope. Models in extend/improve mode ("preserve existing
+// tests, only add new ones") sometimes re-emit an existing describe verbatim instead of adding
+// genuinely new cases — producing two identical `describe('X', …)` blocks. Removing a byte-identical
+// copy is semantically a no-op (the tests were redundant). By design this ONLY drops exact-duplicate
+// SIBLINGS: it never merges different-content blocks (that needs judgment — left to the prompt), and
+// never removes an identical it() that lives under a DIFFERENT describe (a different parent's
+// beforeEach can make it a distinct test). String/comment-aware via findCallEnd, so it can't
+// mis-slice on braces inside quoted text; on any parse failure it leaves the remainder untouched.
+export function dedupeTestBlocks(code: string): string {
+  return dedupeScope(code)
+}
+
+function dedupeScope(code: string): string {
+  const seen = new Set<string>()
+  let out = ''
+  let cursor = 0 // next unprocessed char in `code`
+  let i = 0
+  while (i < code.length) {
+    const m = code.slice(i).match(/\b(?:describe|it|test)\s*\(/)
+    if (!m || m.index === undefined) break
+    const callStart = i + m.index
+    const parenIdx = callStart + m[0].length - 1 // the `(`
+    const end = findCallEnd(code, parenIdx)
+    if (end === -1) break // unparseable — leave the rest as-is (safe)
+
+    const block = code.slice(callStart, end)
+    const sig = normalizeBlockSig(block)
+    const gap = code.slice(cursor, callStart)
+    const isDescribe = /^describe\b/.test(block)
+
+    if (seen.has(sig)) {
+      // Exact-duplicate sibling — drop it, and collapse the blank line that preceded it plus a
+      // single blank line that follows, so removal doesn't leave a widening gap.
+      out += gap.replace(/[ \t]*\n[ \t]*\n[ \t]*$/, '\n')
+      cursor = end
+      let k = end
+      while (k < code.length && (code[k] === ' ' || code[k] === '\t')) k++
+      if (code[k] === '\n') cursor = k + 1
+    } else {
+      seen.add(sig)
+      out += gap + (isDescribe ? dedupeDescribeBody(block) : block)
+      cursor = end
+    }
+    i = end
+  }
+  out += code.slice(cursor)
+  return out
+}
+
+// Recurse into a describe block's callback body so nested sibling duplicates are also collapsed.
+function dedupeDescribeBody(block: string): string {
+  const open = firstBodyBrace(block)
+  if (open === -1) return block
+  const close = scanToMatchingBrace(block, open)
+  if (close === -1) return block
+  return block.slice(0, open + 1) + dedupeScope(block.slice(open + 1, close)) + block.slice(close)
 }
 
 // Convenience wrapper: parses then applies. Returns null if no ops parsed or apply fails.

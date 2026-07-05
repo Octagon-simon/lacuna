@@ -1,16 +1,19 @@
-import { Command, Flags } from '@oclif/core'
+import { Command, Flags, Args } from '@oclif/core'
+import { stat } from 'fs/promises'
+import { resolve } from 'path'
 import chalk from 'chalk'
 import { loadConfig, applyModelOverride } from '../lib/config.js'
 import { detectEnvironment } from '../lib/detector.js'
 import { runFixLoop } from '../agent/fix-loop.js'
 import { debugLogPattern } from '../agent/generator.js'
-import { showStarNudge, showIssueNudge } from '../lib/feedback.js'
+import { showOutcomeNudge } from '../lib/feedback.js'
 
 export default class Fix extends Command {
   static description = 'Find and fix failing tests using AI — preserves existing tests, only repairs what is broken'
 
   static examples = [
     '$ lacuna fix',
+    '$ lacuna fix src/payments',
     '$ lacuna fix --workers 4',
     '$ lacuna fix --file src/utils/math.test.ts',
     '$ lacuna fix --dry-run',
@@ -18,6 +21,15 @@ export default class Fix extends Command {
     '$ lacuna fix --fix-polluters',
     '$ lacuna fix --e2e',
   ]
+
+  // Optional positional: a test file (single-file mode) OR a directory (only repair failing
+  // tests under that subtree). Subsumes --file.
+  static args = {
+    path: Args.string({
+      description: 'Test file or directory to target (directory = only fix failures under it)',
+      required: false,
+    }),
+  }
 
   static flags = {
     'dry-run': Flags.boolean({
@@ -66,7 +78,7 @@ export default class Fix extends Command {
   }
 
   async run(): Promise<void> {
-    const { flags } = await this.parse(Fix)
+    const { args, flags } = await this.parse(Fix)
 
     const config = await loadConfig()
     if (flags.model) applyModelOverride(config, flags.model)
@@ -74,6 +86,22 @@ export default class Fix extends Command {
 
     const env = await detectEnvironment(process.cwd(), config.testRunner)
     if (config.testCommand) env.testCommand = config.testCommand
+
+    // Resolve the optional positional path: a file routes to single-file mode (like --file),
+    // a directory scopes the run to that subtree (only failures under it are repaired).
+    let targetFile = flags.file
+    let scopeDir: string | undefined
+    if (args.path) {
+      const abs = resolve(process.cwd(), args.path)
+      let isDir = false
+      try {
+        isDir = (await stat(abs)).isDirectory()
+      } catch {
+        this.error(`Path not found: ${args.path}`)
+      }
+      if (isDir) scopeDir = abs
+      else targetFile = args.path
+    }
 
     this.log(chalk.bold('\nlacuna fix\n'))
     this.log(`${chalk.dim('Model:')}   ${chalk.cyan(config.model)}`)
@@ -88,7 +116,8 @@ export default class Fix extends Command {
     const debugPattern = debugLogPattern(config.debug)
     if (debugPattern) this.log(`${chalk.dim('Debug:')}   ${chalk.green('on')} ${chalk.dim(`→ ${debugPattern}`)}`)
     if (flags['dry-run']) this.log(chalk.yellow('  [dry-run — no files will be written]'))
-    if (flags.file) this.log(`${chalk.dim('Target:')}  ${flags.file}`)
+    if (scopeDir) this.log(`${chalk.dim('Scope:')}   ${args.path}`)
+    else if (targetFile) this.log(`${chalk.dim('Target:')}  ${targetFile}`)
 
     // E2E mode selects specs by running Playwright (runFixLoop checks for @playwright/test), so
     // it does NOT need a unit test runner — skip the guard that would otherwise bail here.
@@ -112,7 +141,8 @@ export default class Fix extends Command {
         cwd: process.cwd(),
         dryRun: flags['dry-run'],
         verbose: flags.verbose,
-        targetFile: flags.file,
+        targetFile,
+        scopeDir,
         workers: flags.workers,
         fresh: flags.fresh,
         regenerateOnFailure: flags['regenerate-on-failure'],
@@ -162,8 +192,7 @@ export default class Fix extends Command {
     }
 
     if (!flags['dry-run']) {
-      showStarNudge(result.filesFixed + result.victimsRegenerated)
-      showIssueNudge(stillFailing, 'fix')
+      showOutcomeNudge(result.filesFixed + result.victimsRegenerated, stillFailing, 'fix')
     }
 
     if (result.filesProcessed === 0) {

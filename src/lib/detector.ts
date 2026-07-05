@@ -144,7 +144,8 @@ export function multiFileTestCommand(env: DetectedEnvironment, files: string[]):
       const fileList = files.map(sq).join(' ')
       // --poolOptions.threads.singleThread=true: all files run in one worker thread (shared globals)
       // --no-isolate: all files share the same module registry (shared module singletons)
-      return `npx vitest run --poolOptions.threads.singleThread=true --no-isolate ${fileList}`
+      // --coverage.enabled=false: bisect runs don't need coverage and it only adds the tmp-dir race.
+      return `npx vitest run --poolOptions.threads.singleThread=true --no-isolate --coverage.enabled=false ${fileList}`
     }
     case 'jest':
       return `npx jest --runInBand ${files.map(jestPath).join(' ')}`
@@ -155,10 +156,59 @@ export function multiFileTestCommand(env: DetectedEnvironment, files: string[]):
   }
 }
 
+// Builds a coverage command scoped to a single directory so a scoped analyze/generate doesn't
+// instrument and run the whole repo (the 15-minute cost). Returns null for runners where we
+// can't reliably narrow both the executed tests AND the instrumented files — the caller then
+// falls back to the full coverageCommand and post-filters the report to the scope.
+export function scopedCoverageCommand(env: DetectedEnvironment, relDir: string): string | null {
+  const dir = relDir.replace(/\/+$/, '')
+  const q = sq(dir)
+  switch (env.testRunner) {
+    case 'vitest':
+      // positional narrows which test files run; --coverage.include narrows instrumentation.
+      return `npx vitest run ${q} --coverage --coverage.include=${sq(dir + '/**')}`
+    case 'jest':
+      return `npx jest --coverage --testPathPattern=${jestPath(dir)} --collectCoverageFrom=${sq(dir + '/**/*.{js,jsx,ts,tsx}')}`
+    default:
+      return null
+  }
+}
+
+// Coverage command that runs only the tests RELATED to one source file (import-graph walk:
+// every test file that transitively imports it), with instrumentation narrowed to that file.
+// Reproduces the file's per-suite coverage in seconds instead of the full-suite cost — used by
+// `generate @diff --file <src>`. Null for runners without related-test support → full command.
+export function relatedCoverageCommand(env: DetectedEnvironment, relFile: string): string | null {
+  switch (env.testRunner) {
+    case 'vitest':
+      return `npx vitest related ${sq(relFile)} --run --coverage --coverage.include=${sq(relFile)}`
+    case 'jest':
+      return `npx jest --findRelatedTests ${sq(relFile)} --coverage --collectCoverageFrom=${sq(relFile)}`
+    default:
+      return null
+  }
+}
+
+// Like scopedCoverageCommand but for a plain test run (no instrumentation) — used by
+// `lacuna fix <dir>` to only run the tests under a directory. Returns null for runners we
+// can't narrow by directory; the caller falls back to the full testCommand + post-filter.
+export function scopedTestCommand(env: DetectedEnvironment, relDir: string): string | null {
+  const dir = relDir.replace(/\/+$/, '')
+  switch (env.testRunner) {
+    case 'vitest': return `npx vitest run ${sq(dir)}`
+    case 'jest':   return `npx jest --testPathPattern=${jestPath(dir)}`
+    default:       return null
+  }
+}
+
 export function fileTestCommand(env: DetectedEnvironment, testFilePath: string): string {
   const q = sq(testFilePath)
   switch (env.testRunner) {
-    case 'vitest': return `npx vitest run ${q}`
+    // --coverage.enabled=false: per-file repair/verify runs never consume coverage, and when a
+    // project enables coverage by default, N parallel `vitest run <file>` workers race on the
+    // shared coverage tmp dir (ENOENT lstat '<reportsDir>/.tmp'). Disabling it avoids the race
+    // and skips needless instrumentation.
+    case 'vitest': return `npx vitest run ${q} --coverage.enabled=false`
     case 'jest':   return `npx jest --testPathPattern=${jestPath(testFilePath)}`
     case 'mocha':  return `npx mocha ${q}`
     case 'playwright': return playwrightRunCommand(testFilePath)

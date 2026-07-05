@@ -98,8 +98,6 @@ lacuna generate                              lacuna fix
 
 Two rules hold throughout: lacuna never leaves a half-written file behind, and it never removes passing tests. If it can't fully fix a file, it keeps the attempt with the most passing tests — and if nothing beat the starting point, it puts the original back.
 
-This is the unit/integration layer. For browser-level tests, [`--e2e`](#end-to-end-testing-playwright) follows the same loop but targets routes instead of source files and verifies with a real browser run.
-
 ---
 
 ## Commands
@@ -118,6 +116,7 @@ Runs the suite, collects coverage, and reports what's below threshold. Writes no
 
 ```bash
 lacuna analyze
+lacuna analyze @diff:origin/main    # patch coverage of the lines your branch changed
 lacuna analyze --threshold 90
 lacuna analyze --format json --output report.json
 lacuna analyze --format markdown
@@ -130,6 +129,7 @@ The main command: find gaps, write tests, run them, retry failures.
 ```bash
 lacuna generate
 lacuna generate --file src/utils/math.ts   # one file, skips the coverage run
+lacuna generate @diff:origin/main           # patch coverage: only the lines your branch changed
 lacuna generate --dry-run                   # preview, write nothing
 lacuna generate --verbose                   # live panel as the model writes
 lacuna generate --workers 4                  # process 4 files in parallel
@@ -139,6 +139,45 @@ lacuna generate --e2e                        # generate Playwright end-to-end sp
 ```
 
 If you ran `analyze` in the last 10 minutes, `generate` reuses that report instead of running the suite again (`--fresh` forces a new run). When retries are exhausted, lacuna keeps the best attempt **only if it adds passing tests** and points you to `lacuna fix` for the rest; otherwise it restores the original. If the model produces the same output twice, the loop stops early instead of wasting iterations.
+
+#### Patch coverage (`@diff`) — close a Codecov gap on a PR
+
+Codecov (and similar gates) judge **patch coverage**: the coverage of only the lines your PR *changed*, not the whole repo. A file can sit at 94% overall and still fail the gate because the four lines you just added aren't tested. `lacuna generate @diff` targets exactly that scope — the same lines Codecov flags — so a green lacuna run predicts a green patch check.
+
+```bash
+lacuna generate @diff                       # diff vs the repo's default branch (origin/HEAD → main/master)
+lacuna generate @diff:origin/main           # explicit base ref
+lacuna generate @diff -f src/lib/Service.ts # narrow to ONE changed file's uncovered lines
+lacuna analyze  @diff:origin/main           # read-only: report patch coverage + the gap, write nothing
+```
+
+**The workflow (fast + accurate):**
+
+```bash
+# 1. Produce a FULL coverage report once (or reuse the lcov your CI already uploaded to Codecov).
+npm run test:cov                       # writes coverage/lcov.info
+
+# 2. Generate tests for just the changed-and-uncovered lines. lacuna reuses the report from step 1
+#    instantly — no suite re-run — and writes tests scoped to the exact gap.
+lacuna generate @diff:origin/main
+
+# 3. Commit.
+git add -A && git commit -m "test: cover patch"
+```
+
+Why step 1 matters: patch coverage is only meaningful against the **same measurement Codecov used** — your whole suite. A line can be covered by a test in a *different* file (an integration or DI test), so lacuna must read a full-suite report to know what's genuinely uncovered. It therefore **reuses an existing `coverage/lcov.info` regardless of age** rather than running a narrower, misleading subset. If none exists it runs the full suite (accurate but slow) and warns you; `--fresh` forces a full re-run. The after-number is measured cheaply — just the new test's incremental coverage, unioned onto the report, no second full run.
+
+**In CI** — gate the PR on patch coverage without waiting on Codecov's round-trip:
+
+```yaml
+- run: npm run test:cov                        # your normal coverage step; leaves coverage/lcov.info
+- run: npx lacuna generate @diff:origin/main   # reads that lcov, covers the gap; exit 1 if still below threshold
+- run: git diff --exit-code || (git add -A && git commit -m "test: cover patch" && git push)
+```
+
+**How it decides what to target:** it diffs from the `git merge-base` with the base ref (exactly Codecov's patch semantics — only what your branch added since it forked), intersects those changed lines with the uncovered lines in the coverage report, and generates tests for just that intersection. The report gains a `Patch coverage` before/after line and the exit code gates on it (below threshold → `1`).
+
+**Edge cases:** a docs-only diff exits `0` ("nothing to cover"); an unresolvable base (e.g. a shallow CI clone) exits `2` with a `git fetch --unshallow` hint; a changed file whose tests never ran counts as fully uncovered. Note: lacuna currently parses line coverage (`DA`) but not branch coverage (`BRDA`), so a half-covered conditional Codecov shows as a yellow `n/m` branch isn't targeted yet — full line misses are.
 
 ### `lacuna fix`
 
@@ -376,6 +415,8 @@ A typical config:
 | `setupFile` | (none) | Your test setup file; its contents are shown to the model so it knows what's already available |
 | `ignore` | `[]` | Path substrings to skip, e.g. `"src/graphql/"` |
 | `maxTokens` | `16000` | Max output tokens per call. Lower for strict providers (Groq free tier ~8000); raise if large files are cut off |
+| `format` | `true` | Run your project's local `eslint --fix` + `prettier` on each generated/fixed test so it matches your repo style and clears lint. Best-effort; set `false` to disable |
+| `nodeEnvRouting` | `true` | When a generated test is DOM-free (services, utils, validators), add a `@vitest-environment node` / `@jest-environment node` docblock so it skips jsdom startup and runs much faster. Verified per file and reverted if it breaks the test; set `false` to disable |
 | `debug` | `false` | Log every prompt and response (see [Debugging](#debugging)) |
 
 ---
@@ -516,6 +557,20 @@ with:
   model: gpt-4o
   openai-api-key: ${{ secrets.OPENAI_API_KEY }}
 ```
+
+### Gating on Codecov patch coverage
+
+The workflow above covers the whole repo to a threshold. If your gate is a **Codecov patch check** (coverage of only the lines the PR changed), use `@diff` instead — it targets exactly those lines and is far cheaper because it reuses the coverage report your test step already produced. See [Patch coverage (`@diff`)](#patch-coverage-diff--close-a-codecov-gap-on-a-pr) for the full workflow. Minimal step, after your coverage step has written `coverage/lcov.info`:
+
+```yaml
+      - run: npm run test:cov                        # your coverage step → coverage/lcov.info
+      - run: npx lacuna generate @diff:origin/main   # cover the changed-and-uncovered lines
+      - run: |
+          git add -A
+          git diff --staged --quiet || (git commit -m "test: cover patch" && git push)
+```
+
+Fetch enough history for the merge-base first (`actions/checkout` with `fetch-depth: 0`, or `git fetch --unshallow`), otherwise `@diff` can't resolve the base ref and exits `2`.
 
 ---
 

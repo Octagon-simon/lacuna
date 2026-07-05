@@ -461,7 +461,10 @@ ${ruleCount + 3}. NEVER output vitest.config.ts, jest.config.js, or any framewor
 - Forgetting to await async functions
 - Real HTTP requests: NEVER let a real network call reach the internet. Every function that calls an API must be mocked before the test runs.
 - Error surface mismatch: before writing any error-path test, find the catch block. Does it set state, call a notification, or just log silently? Test only what is actually observable from outside.
-- Code drift — assert what the code ACTUALLY does: before writing any assertion, re-read the relevant section of the source. If it catches an error and returns null, assert null — not a rejection.`
+- Code drift — assert what the code ACTUALLY does: before writing any assertion, re-read the relevant section of the source. If it catches an error and returns null, assert null — not a rejection.
+- Respect the TYPE CONTRACT — never fabricate type-impossible inputs: do not pass a value that violates a parameter/prop's TypeScript type (e.g. \`null as any\` to a non-nullable prop, a string where a number is required) just to manufacture a failing or throwing case. A type-impossible input is NOT a real edge case — it can't happen through the type system, so asserting it crashes only locks a latent bug in as "expected". Test the DOCUMENTED contract instead: an OPTIONAL prop omitted (defaults applied), an empty array, a boundary value. If you find yourself reaching for \`as any\` to make a case compile, drop that case.
+- Don't lock in incidental QUIRKS as "expected": if the behavior looks unintended (clearing an input leaves stale state, an empty/invalid value is silently ignored so a previous value is reused), that's a likely BUG — do not write a test that asserts the quirk is correct just to turn green, and do not couple to internal implementation details (private state names, "this field wasn't updated"). Assert the DOCUMENTED, externally-observable contract. If you genuinely can't tell the intent, cover the clear cases and skip the ambiguous one rather than enshrining it.
+- Keep PURE-LOGIC tests DOM-free: when the file under test is a service, util, validator, formatter, reducer, or hook with no rendering, test it by importing the function and asserting on its return value / thrown error. Do NOT import \`render\`/\`screen\`/\`@testing-library/*\`, and do NOT touch \`document\`, \`window\`, \`localStorage\`, or other browser globals. A DOM-free test can run in the fast \`node\` environment instead of paying jsdom's startup cost. If the logic reads a browser global (e.g. \`window.localStorage\`), mock/inject it rather than reaching for the real one.`
 
   const jsCauses = isJSRunner ? buildJsCauses(mockApi) : ''
 
@@ -640,14 +643,19 @@ export function buildGeneratePrompt(args: {
   //     > 600 lines → skeleton with signatures only + note to rely on USED SYMBOL DEFINITIONS
   const FULL_SOURCE_LINE_LIMIT = 600
   const sourceLineCount = sourceCode.split('\n').length
-  const skeletonized = uncoveredFunctions.length > 0
+  // Coverage-driven skeleton when we have ANY target (named functions OR specific lines);
+  // otherwise the all-uncovered path (full source under the limit, signatures-only above it).
+  const hasCoverageTargets = uncoveredFunctions.length > 0 || uncoveredLines.length > 0
+  const skeletonized = hasCoverageTargets
     ? shouldUseSkeleton(sourceCode)
     : sourceLineCount > FULL_SOURCE_LINE_LIMIT
-  const displaySource = skeletonized ? buildSourceSkeleton(sourceCode, uncoveredFunctions) : sourceCode
-  const largeFileNote = skeletonized && uncoveredFunctions.length === 0
+  // Pass uncoveredLines so a target inside a class method (or an anonymously-named function)
+  // keeps that method expanded — name matching alone collapses the whole class to an empty shell.
+  const displaySource = skeletonized ? buildSourceSkeleton(sourceCode, uncoveredFunctions, uncoveredLines) : sourceCode
+  const largeFileNote = skeletonized && !hasCoverageTargets
     ? ` (${sourceLineCount}-line file — function bodies collapsed to signatures. Use the USED SYMBOL DEFINITIONS section and existing tests to infer which functions are already covered and what the implementations do.)`
     : skeletonized
-      ? ' (large file — bodies of already-covered functions collapsed; uncovered functions shown in full)'
+      ? ' (large file — bodies of already-covered functions collapsed; the code around the uncovered target lines is shown in full)'
       : ''
   parts.push(`\nSOURCE FILE: ${sourceFile}${largeFileNote}`)
   if (sourceImportPath) {
@@ -658,19 +666,27 @@ export function buildGeneratePrompt(args: {
   parts.push('```')
 
   if (existingTestCode) {
-    parts.push('\nEXISTING TEST FILE (preserve all existing tests, only add new ones):')
+    parts.push('\nEXISTING TEST FILE — reproduce it EXACTLY, then add any genuinely new cases INSIDE the existing describe() blocks:')
     parts.push('```')
     parts.push(existingTestCode)
     parts.push('```')
+    parts.push('EXTENDING RULES: (1) Add a new it()/test() inside the describe() it belongs to — do NOT open a SECOND describe() with a name that already exists in the file. (2) NEVER re-emit, copy, or duplicate a test (or a whole describe block) that is already present — an identical repeated block is not new coverage. (3) If there is no realistic, type-valid case left to add (e.g. a small pure function whose branches are already covered), add NOTHING and return the file unchanged rather than padding it with duplicates. Reaching the coverage threshold is not worth a single redundant test.')
   } else {
     parts.push('\nNo existing test file — create one from scratch.')
   }
 
   if (uncoveredFunctions.length > 0) {
-    parts.push(`\nUNCOVERED FUNCTIONS (must write tests for these): ${uncoveredFunctions.join(', ')}`)
+    parts.push(`\nUNCOVERED FUNCTIONS (write meaningful tests for these where possible): ${uncoveredFunctions.join(', ')}`)
   }
   if (uncoveredLines.length > 0) {
-    parts.push(`\nUNCOVERED LINES: ${uncoveredLines.slice(0, 30).join(', ')}${uncoveredLines.length > 30 ? '…' : ''}`)
+    parts.push(`\nUNCOVERED LINES (targets, NOT mandates): ${uncoveredLines.slice(0, 30).join(', ')}${uncoveredLines.length > 30 ? '…' : ''}`)
+  }
+  if (uncoveredFunctions.length > 0 || uncoveredLines.length > 0) {
+    // Coverage is a guide, not the goal. In an already-tested file the residual uncovered lines
+    // are usually defensive/error branches reachable only by unrealistic inputs — forcing them
+    // produces the exact bad tests we want to avoid (null as any, quirk assertions, inverted
+    // intent). Make explicit that leaving such a line uncovered beats a misleading test.
+    parts.push('COVERAGE IS A MEANS, NOT THE GOAL: only cover an uncovered line/function with a REALISTIC, type-valid scenario that reflects how the code is actually used. If a line is reachable only by a type-impossible input (`null as any`), an unrealistic/contrived setup, an assertion that contradicts the test\'s intent, or by locking in an incidental quirk — LEAVE IT UNCOVERED. A genuinely-skipped defensive branch is better than a test that enshrines a bug or misleads the next reader. Never add a test whose only purpose is to turn a red line green.')
   }
 
   const patchMode = existingTestLineCount !== undefined && existingTestLineCount > PATCH_MODE_LINE_THRESHOLD
@@ -736,6 +752,13 @@ export function buildFixPrompt(args: {
   const parts: string[] = []
 
   parts.push('Your job is to fix a failing test file. Do NOT rewrite it from scratch — preserve every existing test and only change what is necessary to make them pass.')
+  parts.push('')
+  parts.push('TEST INTEGRITY — fix the PREMISE, never invert the intent (read this first):')
+  parts.push("- A failing test almost always means the SETUP is wrong (mock/import/render, or the assertion targets the wrong value). Correct the setup so the test verifies what its TITLE says. Do NOT make it pass by flipping the assertion to match whatever the code currently does when that contradicts the test's stated intent — that hides real bugs instead of catching them.")
+  parts.push("- If, after reading the source, the test's premise is genuinely wrong and you MUST change WHAT is verified: (1) RENAME the it()/test() title to match the new assertion, and (2) check the SIBLING tests — if your change now duplicates an adjacent test, DELETE the redundant one rather than leaving two tests asserting the same thing.")
+  parts.push("- NEVER escape a failure by asserting a crash: do not switch a test to expect(...).toThrow() / .rejects when it originally expected normal behavior. Asserting a throw on a TYPE-IMPOSSIBLE input — one only reachable via `as any` (e.g. null passed to a non-nullable prop) — is not a valid fix: DROP that case, or replace it with the documented contract (e.g. the optional/undefined case that defaults correctly).")
+  parts.push("- Avoid adding `as any` to force a fix. If a value only compiles with `as any`, the scenario is probably invalid — fix the premise instead.")
+  parts.push("- Do NOT make a test pass by asserting an incidental QUIRK (internal state that didn't update, an empty/invalid value silently ignored so a stale value is reused). That couples the test to implementation details and locks a likely bug in as 'expected'. Assert the documented, externally-observable contract; if the case is genuinely ambiguous, removing it is better than enshrining the quirk.")
   parts.push('')
 
   if (projectMemory) { parts.push(projectMemory); parts.push('') }

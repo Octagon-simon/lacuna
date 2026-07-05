@@ -16,6 +16,15 @@ export function showStarNudge(testsWritten: number): void {
   console.log(chalk.dim('─'.repeat(60)))
 }
 
+// Show AT MOST ONE nudge per run — the star ("thanks!") and the issue ("file a bug") boxes
+// read as contradictory when printed together after a mixed run. A run where failures dominate
+// nudges for a bug report; otherwise it nudges (occasionally) for a star. The failure COUNT is
+// still printed by the command itself, so suppressing the issue box here hides nothing.
+export function showOutcomeNudge(succeeded: number, failed: number, context: 'generate' | 'fix'): void {
+  if (failed > succeeded) showIssueNudge(failed, context)
+  else showStarNudge(succeeded)
+}
+
 export function showIssueNudge(failedCount: number, context: 'generate' | 'fix'): void {
   if (isSilent() || failedCount === 0) return
   const verb = context === 'generate' ? "generate tests for" : "fix"
