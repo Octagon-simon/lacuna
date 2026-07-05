@@ -10,7 +10,7 @@ import { resolveDiffScope, countChangedLines, GitDiffError } from '../lib/git-di
 import { debugLogPattern } from '../agent/generator.js'
 import { reportTerminal, buildJsonReport, buildMarkdownReport, getExitCode } from '../lib/reporter.js'
 import type { ReportInput } from '../lib/reporter.js'
-import { showOutcomeNudge, showStarNudge } from '../lib/feedback.js'
+import { showOutcomeNudge } from '../lib/feedback.js'
 
 export default class Generate extends Command {
   static description = 'Run the full agent loop: analyze gaps, generate tests, verify they pass'
@@ -283,7 +283,9 @@ export default class Generate extends Command {
       }
     }
 
-    if (!flags['dry-run']) showStarNudge(result.specsGenerated)
+    // Show at most ONE outcome nudge (star OR issue), same as the unit path — never both, so a
+    // partial run (some specs generated, some failed) doesn't read as contradictory.
+    if (!flags['dry-run']) showOutcomeNudge(result.specsGenerated, result.specsFailed, 'generate')
     this.exit(result.specsFailed > 0 ? 1 : 0)
   }
 }
