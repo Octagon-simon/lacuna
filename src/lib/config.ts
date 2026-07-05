@@ -45,6 +45,10 @@ export const ConfigSchema = z.object({
     .describe('Environment variables injected into every test-runner invocation, e.g. { "NODE_CONFIG_DIR": "packages/server/config" }.'),
   debug: z.boolean().optional()
     .describe('Set true to log every raw model prompt + response. Each target file gets its own log (lacuna-debug.<file>.txt). Equivalent to LACUNA_DEBUG=1.'),
+  format: z.boolean().default(true)
+    .describe('Run the project\'s local eslint --fix and prettier on each generated/fixed test file before declaring success, so output matches your repo style and passes lint. Best-effort; set false to disable.'),
+  nodeEnvRouting: z.boolean().default(true)
+    .describe('For DOM-free generated tests (services, utils, validators) in a jsdom project, add a `@vitest-environment node` / `@jest-environment node` docblock so the file skips jsdom startup and runs much faster. Verified per-file (reverted if it breaks the test). Set false to disable.'),
 })
 
 export type LacunaConfig = z.infer<typeof ConfigSchema>

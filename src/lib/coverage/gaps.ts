@@ -13,18 +13,37 @@ export function extractGaps(report: CoverageReport, threshold: number): Coverage
     .filter((gap) => gap.uncoveredLines.length > 0 || gap.uncoveredFunctions.length > 0)
 }
 
+export interface FilterGapsOptions {
+  // When true, gaps for source files that ALREADY have a test file are kept (so the loop can
+  // improve an existing below-threshold test) instead of skipped. Used by scoped/`--improve`
+  // generate. Default (false) preserves the suite-wide "new files only" behavior.
+  includeExisting?: boolean
+}
+
 // Filters out gaps where the source file contains only types, interfaces, enums, or constants,
-// or where a test file already exists for the source file.
-export async function filterTestableGaps(gaps: CoverageGap[], userIgnore: string[] = []): Promise<CoverageGap[]> {
+// or — unless includeExisting is set — where a test file already exists for the source file.
+export async function filterTestableGaps(
+  gaps: CoverageGap[],
+  userIgnore: string[] = [],
+  opts: FilterGapsOptions = {},
+): Promise<CoverageGap[]> {
   const results: CoverageGap[] = []
   for (const gap of gaps) {
     if (userIgnore.some((p) => gap.filePath.includes(p))) continue
     if (shouldIgnore(gap.filePath, [])) continue
-    if (await testFileExists(gap.filePath)) continue
+    if (!opts.includeExisting && await testFileExists(gap.filePath)) continue
     const source = await readFile(gap.filePath, 'utf-8').catch(() => '')
     if (hasTestableCode(source)) results.push(gap)
   }
   return results
+}
+
+// True when absPath is absDir itself or a descendant of it. Used to restrict discovery to a
+// scope folder (`lacuna analyze/generate <dir>`).
+export function isWithinDir(absPath: string, absDir: string): boolean {
+  if (absPath === absDir) return true
+  const base = absDir.endsWith(sep) ? absDir : absDir + sep
+  return absPath.startsWith(base)
 }
 
 const SOURCE_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mts', '.cts'])
@@ -47,6 +66,12 @@ function hasTestableCode(source: string): boolean {
   if (/=>\s*\{/.test(stripped)) return true
   // class declaration or expression
   if (/\bclass\s+\w/.test(stripped)) return true
+  // exported arrow assigned to a const, EXPRESSION body included:
+  // `export const mapOptionsToString = (opts) => opts.map(...)` / `export const f = x => x`.
+  // These are testable units; matching only `=> {` above missed every expression-body helper,
+  // which (with index files) was a big reason scoped generate skipped real files. Keyed on
+  // `export … const … =>` so pure type files (`export type F = () => void`) are NOT matched.
+  if (/\bexport\s+(?:default\s+)?const\s+[\w$]+[^\n]*=>/.test(stripped)) return true
 
   return false
 }
@@ -92,7 +117,10 @@ const IGNORE_FILE_PATTERNS = [
   /\.types?\.[^.]+$/,            // *.type.ts / *.types.ts
   /\.constants?\.[^.]+$/,        // *.constant.ts / *.constants.ts
   /\.interface\.[^.]+$/,         // *.interface.ts
-  /\/index\.[^.]+$/,             // barrel re-export files
+  // NOTE: index files are intentionally NOT name-ignored. A pure barrel (`export * from …`)
+  // has no testable unit, so `hasTestableCode` already skips it; but many index files carry real
+  // logic (helpers, a component + its mappers), and blanket-ignoring them by name dropped those
+  // from scoped generate ("doesn't cover all files in the folder"). Let content decide, not name.
 ]
 
 function shouldIgnore(absPath: string, userIgnore: string[]): boolean {
@@ -173,13 +201,18 @@ export async function findUncoveredFiles(
   sourceDir: string | string[],
   cwd: string,
   userIgnore: string[] = [],
+  scopeDir?: string,
 ): Promise<CoverageGap[]> {
   // Normalize LCOV paths: they can be absolute or relative depending on the runner.
   // walkDir always returns absolute paths, so normalise here to avoid false misses.
   const coveredPaths = new Set(
     report.files.map((f) => (f.path.startsWith('/') ? f.path : join(cwd, f.path))),
   )
-  const dirs = (Array.isArray(sourceDir) ? sourceDir : [sourceDir]).map(d => join(cwd, d))
+  // When a scope dir is given, walk only that subtree — the cheap, suite-free part of a
+  // scoped analyze/generate (every file here is a real candidate, no runner needed).
+  const dirs = scopeDir
+    ? [scopeDir]
+    : (Array.isArray(sourceDir) ? sourceDir : [sourceDir]).map(d => join(cwd, d))
 
   const allSourceFiles = (await Promise.all(dirs.map(d => walkDir(d).catch(() => [] as string[])))).flat()
 
@@ -200,6 +233,104 @@ export async function findUncoveredFiles(
   return uncovered
 }
 
+// ─── Patch-coverage mode (`@diff`) helpers ──────────────────────────────────────
+
+function toAbs(path: string, cwd: string): string {
+  return path.startsWith('/') ? path : join(cwd, path)
+}
+
+// Keeps only gaps for files the diff touched and narrows each gap's target lines to the
+// intersection of "uncovered per the report" ∩ "changed per git". A file with a coverage
+// entry whose changed lines are all covered is dropped (its patch coverage is already 100%).
+// A file with NO coverage entry (untested new file) targets every changed line.
+export function narrowGapsToDiff(
+  gaps: CoverageGap[],
+  changed: Map<string, Set<number>>,
+  report: CoverageReport,
+  cwd: string,
+): CoverageGap[] {
+  const reportPaths = new Set(report.files.map((f) => toAbs(f.path, cwd)))
+  const narrowed: CoverageGap[] = []
+  for (const gap of gaps) {
+    const abs = toAbs(gap.filePath, cwd)
+    const changedLines = changed.get(abs)
+    if (!changedLines) continue
+    if (reportPaths.has(abs)) {
+      const lines = gap.uncoveredLines.filter((l) => changedLines.has(l))
+      if (lines.length === 0) continue
+      narrowed.push({ ...gap, uncoveredLines: lines })
+    } else {
+      narrowed.push({ ...gap, uncoveredLines: [...changedLines].sort((a, b) => a - b) })
+    }
+  }
+  return narrowed
+}
+
+// Changed files that appear NEITHER in the coverage report NOR in the gap set are still
+// patch-relevant: findUncoveredFiles skips any file that already has a test file, so a changed
+// file whose test never ran (failing suite, fresh checkout, no coverage entry) would otherwise
+// vanish from the diff scope and report a vacuous 100%. Returns whole-file gaps (empty
+// uncoveredLines — the diff narrowing turns that into "every changed line") for the testable
+// subset of those files.
+export async function missingChangedFileGaps(
+  changed: Map<string, Set<number>>,
+  report: CoverageReport,
+  existingGaps: CoverageGap[],
+  cwd: string,
+  userIgnore: string[] = [],
+): Promise<CoverageGap[]> {
+  const reportPaths = new Set(report.files.map((f) => toAbs(f.path, cwd)))
+  const gapPaths = new Set(existingGaps.map((g) => toAbs(g.filePath, cwd)))
+  const candidates: CoverageGap[] = []
+  for (const abs of changed.keys()) {
+    if (reportPaths.has(abs) || gapPaths.has(abs)) continue
+    candidates.push({ filePath: abs, uncoveredLines: [], uncoveredFunctions: [] })
+  }
+  return filterTestableGaps(candidates, userIgnore, { includeExisting: true })
+}
+
+export interface PatchCoverage {
+  covered: number
+  total: number
+  pct: number
+}
+
+// Codecov-style patch coverage: covered changed executable lines / total changed executable
+// lines. "Executable" = the line has a record in the coverage report (blank/comment/type
+// lines aren't instrumented, so they don't count — same as Codecov). Files absent from the
+// report contribute nothing UNLESS listed in assumeUncovered (changed testable files whose
+// tests never ran — all their changed lines count as uncovered). An empty denominator is
+// 100% (nothing executable changed).
+export function computePatchCoverage(
+  report: CoverageReport,
+  changed: Map<string, Set<number>>,
+  cwd: string,
+  assumeUncovered: Set<string> = new Set(),
+): PatchCoverage {
+  const hitsByPath = new Map<string, Map<number, number>>()
+  for (const f of report.files) {
+    hitsByPath.set(toAbs(f.path, cwd), new Map(f.lines.map((l) => [l.line, l.hit])))
+  }
+
+  let covered = 0
+  let total = 0
+  for (const [abs, lines] of changed) {
+    const hits = hitsByPath.get(abs)
+    if (hits) {
+      for (const line of lines) {
+        const hit = hits.get(line)
+        if (hit === undefined) continue // not executable per the instrumenter
+        total++
+        if (hit > 0) covered++
+      }
+    } else if (assumeUncovered.has(abs)) {
+      total += lines.size
+    }
+  }
+
+  return { covered, total, pct: total === 0 ? 100 : (covered / total) * 100 }
+}
+
 export function formatCoverageSummary(report: CoverageReport): string {
   const lineRate = (report.totalLineRate * 100).toFixed(1)
   const fnRate = (report.totalFunctionRate * 100).toFixed(1)
@@ -212,10 +343,16 @@ export async function findTestFiles(
   cwd: string,
   _env: { sourceDir?: string },
   config: { sourceDir: string | string[]; ignore: string[] },
+  scopeDir?: string,
 ): Promise<string[]> {
-  const sourceDirs = (Array.isArray(config.sourceDir) ? config.sourceDir : [config.sourceDir]).map(d => join(cwd, d))
-  // Also search the cwd root so tests in __tests__/ directories alongside source dirs are found.
-  const searchDirs = [...new Set([cwd, ...sourceDirs])]
+  // When scoped, only the scope subtree is searched (so "are there tests under this folder?"
+  // decides the FS-only-vs-coverage-run fork without touching the rest of the repo).
+  const sourceDirs = scopeDir
+    ? [scopeDir]
+    : (Array.isArray(config.sourceDir) ? config.sourceDir : [config.sourceDir]).map(d => join(cwd, d))
+  // Also search the cwd root so tests in __tests__/ directories alongside source dirs are found
+  // (only in the unscoped case — a scope dir searches just itself).
+  const searchDirs = scopeDir ? [scopeDir] : [...new Set([cwd, ...sourceDirs])]
   // Use walkDirForTests so __tests__/ directories are not skipped (walkDir excludes them
   // intentionally for source-file discovery, but we need to descend into them here).
   const all = (await Promise.all(searchDirs.map(d => walkDirForTests(d).catch(() => [] as string[])))).flat()

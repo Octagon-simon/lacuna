@@ -3,10 +3,12 @@ import { dirname, join } from 'path'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
-import { fileTestCommand } from '../lib/detector.js'
+import { fileTestCommand, scopedCoverageCommand, relatedCoverageCommand } from '../lib/detector.js'
 import { runCommand } from '../lib/runner.js'
-import { loadCoverage, coverageAgeSeconds, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles } from '../lib/coverage/index.js'
-import type { CoverageGap, CoverageReport } from '../lib/coverage/types.js'
+import { loadCoverage, coverageAgeSeconds, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps } from '../lib/coverage/index.js'
+import { resolveDiffScope } from '../lib/git-diff.js'
+import type { DiffScope } from '../lib/git-diff.js'
+import type { CoverageGap, CoverageReport, FileCoverage } from '../lib/coverage/types.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
@@ -14,9 +16,11 @@ import { buildFileContext } from './context.js'
 import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
-import { typeCheckFile } from '../lib/typecheck.js'
+import { typeCheckFile, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js'
+import { formatFile } from '../lib/format.js'
+import { routeTestToNodeEnv } from '../lib/env-route.js'
 import { detectWeakAsyncWait } from './prompts/index.js'
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, dedupeImports, dedupeTestBlocks, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -27,6 +31,16 @@ export interface LoopOptions {
   dryRun: boolean
   verbose: boolean
   targetFile?: string
+  // Absolute path to a directory the run is scoped to (`lacuna generate <dir>`). Restricts
+  // discovery + the coverage run to that subtree and implies improve-existing behavior.
+  scopeDir?: string
+  // Improve existing below-threshold tests (not just create tests for untested files).
+  // Implied by scopeDir; also settable repo-wide via `lacuna generate --improve`.
+  improve?: boolean
+  // Patch-coverage mode (`lacuna generate @diff[:<ref>]`): target only the lines this branch
+  // changed vs the base ref. '' = resolve the default base (origin/HEAD → main/master → HEAD~1);
+  // undefined = off. Distinct from scopeDir — this scopes by diff, not by directory.
+  diffRef?: string
   workers?: number
   fresh?: boolean
   log: (msg: string) => void
@@ -38,6 +52,11 @@ export interface LoopResult {
   coverageBefore: number
   coverageAfter: number
   hasCoverage: boolean   // false in single-file mode (no suite run, no coverage data)
+  // Patch-coverage mode only: covered changed executable lines / total changed executable
+  // lines (Codecov semantics), before and after generation. Undefined outside @diff runs.
+  patchCoverageBefore?: number
+  patchCoverageAfter?: number
+  diffBase?: string      // resolved base ref the diff was taken against (e.g. origin/main)
   errors: string[]
 }
 
@@ -312,6 +331,9 @@ export async function processGap(
     }
 
     testCode = deduplicateViMocks(testCode)
+    testCode = typeImportOriginalCalls(testCode)
+    testCode = dedupeImports(testCode)
+    testCode = dedupeTestBlocks(testCode)
 
     // Catch empty test files before writing — no point running a file with no tests
     if (!hasTestFunctions(testCode)) {
@@ -367,7 +389,9 @@ export async function processGap(
         }
       }
       const typeErrors = await typeCheckFile(context.suggestedTestFile, cwd, env)
-      if (typeErrors) {
+      // Inconclusive (tsc timed out/crashed) is not an actionable type error — the tests pass,
+      // which is generate's contract, so don't burn a retry feeding the model a non-error.
+      if (typeErrors && typeErrors !== TYPECHECK_INCONCLUSIVE) {
         if (attempt < config.maxIterations) {
           lastError = `Tests passed but TypeScript type errors were found in the generated file:\n${typeErrors}\n\nFix ALL type errors. Do not use 'as any' or '@ts-ignore'.`
           if (!onStatus) log(chalk.yellow(`  Tests pass — fixing type errors (retrying)...`))
@@ -380,6 +404,15 @@ export async function processGap(
         if (!onStatus) log(chalk.yellow(`  ⚠ Type errors remain — tests pass. Run \`lacuna fix --file ${relTest}\` to clean up types.`))
       } else {
         if (!onStatus) log(chalk.green(`  Tests passed.`))
+      }
+      // Format the accepted file with the repo's own eslint/prettier so it matches local style
+      // and clears the lint gate (best-effort, behavior-preserving — no re-run needed).
+      if (!dryRun) {
+        await formatFile(context.suggestedTestFile, cwd, { enabled: config.format, env })
+        // A DOM-free test pays the jsdom startup tax for nothing — route it to the node
+        // environment via a docblock (verified per-file, reverted if it breaks the test).
+        const routed = await routeTestToNodeEnv(context.suggestedTestFile, cwd, { enabled: config.nodeEnvRouting, env })
+        if (routed && !onStatus) log(chalk.dim(`  ↳ DOM-free — routed to the node environment (skips jsdom startup).`))
       }
       onStatus?.({ phase: 'passed', file: shortPath })
       return { success: true, testCode }
@@ -530,12 +563,14 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   // Skip the coverage suite entirely. Build a synthetic gap that treats the whole
   // file as uncovered — the AI reads the source and writes comprehensive tests.
   // Uses fileTestCommand (not the full suite) to verify the generated tests pass.
+  // With @diff, --file instead NARROWS the diff scope to that file (handled below) —
+  // the fast path is skipped because diff mode needs the coverage report.
   if (options.targetFile) {
     const abs = options.targetFile.startsWith('/')
       ? options.targetFile
       : join(cwd, options.targetFile)
 
-    // Fail fast if the user passed a test file instead of a source file.
+    // Fail fast if the user passed a test file instead of a source file (both modes).
     const isTestPath = /\.(test|spec)\.[jt]sx?$/.test(abs)
       || abs.includes('__tests__/')
       || /\/test_[^/]+\.[jt]sx?$/.test(abs)
@@ -548,45 +583,118 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       )
     }
 
-    const gap: CoverageGap = {
-      filePath: abs,
-      uncoveredLines: [],
-      uncoveredFunctions: [],
-    }
+    if (options.diffRef === undefined) {
+      const gap: CoverageGap = {
+        filePath: abs,
+        uncoveredLines: [],
+        uncoveredFunctions: [],
+      }
 
-    const memory = new ProjectMemory()
-    await memory.initialize(cwd, env, config)
+      const memory = new ProjectMemory()
+      await memory.initialize(cwd, env, config)
 
-    const generator = new TestGenerator({ config, env })
-    const result = await processGap(gap, options, generator, true, undefined, memory.toPromptSection())
+      const generator = new TestGenerator({ config, env })
+      const result = await processGap(gap, options, generator, true, undefined, memory.toPromptSection())
 
-    return {
-      filesProcessed: 1,
-      testsWritten: result.success ? 1 : 0,
-      coverageBefore: 0,
-      coverageAfter: 0,
-      hasCoverage: false,
-      errors: result.error ? [result.error] : [],
+      return {
+        filesProcessed: 1,
+        testsWritten: result.success ? 1 : 0,
+        coverageBefore: 0,
+        coverageAfter: 0,
+        hasCoverage: false,
+        errors: result.error ? [result.error] : [],
+      }
     }
   }
 
   // ─── Full suite path ──────────────────────────────────────────────────────────
 
-  const existingTests = await findTestFiles(cwd, {}, config)
+  // Scope/improve setup. `scopeDir` (absolute) restricts discovery + the coverage run to a
+  // subtree; it also implies improve-existing (raise every file under the dir to threshold,
+  // creating OR extending tests). `--improve` enables the same create+improve repo-wide.
+  const scopeDir = options.scopeDir
+  const scopeRel = scopeDir ? scopeDir.replace(cwd + '/', '').replace(/\/+$/, '') : undefined
+
+  // Diff (patch-coverage) scope: resolve base + changed lines up front so an unresolvable
+  // base fails fast (before a long coverage run) and a docs-only diff exits cleanly without
+  // running the suite at all.
+  const diffMode = options.diffRef !== undefined
+  let diffScope: DiffScope | null = null
+  if (diffMode) {
+    diffScope = await resolveDiffScope(cwd, options.diffRef || undefined)
+    // `--file` + @diff = the intersection: only that file's changed lines are targets
+    // (and patch coverage is measured over just those lines).
+    if (options.targetFile) {
+      const absTarget = options.targetFile.startsWith('/') ? options.targetFile : join(cwd, options.targetFile)
+      const kept = diffScope.changed.get(absTarget)
+      diffScope = { ...diffScope, changed: kept ? new Map([[absTarget, kept]]) : new Map() }
+    }
+    if (diffScope.changed.size === 0) {
+      const where = options.targetFile ? `in ${options.targetFile}` : 'in the diff'
+      log(chalk.green(`\nNo changed source lines ${where} vs ${diffScope.baseRef} — nothing to cover.`))
+      return {
+        filesProcessed: 0, testsWritten: 0, coverageBefore: 0, coverageAfter: 0,
+        hasCoverage: false, patchCoverageBefore: 100, patchCoverageAfter: 100,
+        diffBase: diffScope.baseRef, errors: [],
+      }
+    }
+  }
+
+  const improveExisting = options.improve === true || !!scopeDir || diffMode
+  // Verify each file with its own file-scoped command (like single-file mode) whenever we're
+  // improving — so we never run the whole suite per file and the keep-best-vs-baseline branch
+  // applies to existing tests. Parallel mode already verifies per-file.
+  const perFileVerify = improveExisting || parallel
+  // Pick the coverage command. Scoped (vitest/jest) keeps a dir-scoped run cheap; null → full
+  // command + report post-filter. **Patch mode uses the FULL command, never a narrowed one**:
+  // patch coverage must match what Codecov measured, and Codecov's number comes from the whole
+  // CI suite. A narrowed run (`vitest related` / one dir) executes only a SUBSET of the tests
+  // that cover the changed file — any line covered solely by a test outside that subset (an
+  // integration/DI test that reaches the method indirectly) looks uncovered, so lacuna would
+  // over-target lines Codecov shows green. The cheap path in patch mode is REUSING an existing
+  // full report (below), not running a smaller one.
+  const scopedCmd = (scopeRel && !diffMode) ? scopedCoverageCommand(env, scopeRel) : null
+  const coverageCommand = scopedCmd ?? env.coverageCommand
+  // The changed target file (relative), for the cheap diff-mode AFTER measurement only.
+  const relTargetFile = diffMode && options.targetFile
+    ? (options.targetFile.startsWith('/') ? options.targetFile.replace(cwd + '/', '') : options.targetFile)
+    : undefined
+
+  const existingTests = await findTestFiles(cwd, {}, config, scopeDir)
   let hasTests = existingTests.length > 0
 
   let report: CoverageReport = { files: [], totalLineRate: 0, totalFunctionRate: 0 }
   if (!hasTests) {
-    log(chalk.dim('  No test files yet — scanning source files for coverage gaps.'))
+    const where = scopeRel ? ` under ${scopeRel}` : ''
+    log(chalk.dim(`  No test files yet${where} — scanning source files for coverage gaps.`))
   } else {
-    const ageSeconds = await coverageAgeSeconds(config, cwd)
-    const useCached = !options.fresh && ageSeconds !== null && ageSeconds < COVERAGE_CACHE_TTL_S
+    // Scoped runs always run fresh: the time-cache holds a whole-repo report whose freshness
+    // says nothing about this scope, and a scoped run rewrites lcov with scope-only data.
+    const ageSeconds = scopeDir ? null : await coverageAgeSeconds(config, cwd)
+    // Patch mode INTERPRETS an existing coverage measurement (ideally the one CI uploaded to
+    // Codecov), so any on-disk full report is reused regardless of age — only `--fresh` forces
+    // a re-run. This is the fast path: point lacuna at the report your `test:cov`/CI produced
+    // and it reads it instantly instead of re-running the suite. Non-diff runs keep the 10-min TTL.
+    const useCached = !options.fresh && ageSeconds !== null && (diffMode || ageSeconds < COVERAGE_CACHE_TTL_S)
 
     if (useCached) {
-      log(chalk.dim(`  Using cached coverage report (${Math.round(ageSeconds)}s old). Pass --fresh to re-run the suite.`))
+      const freshness = ageSeconds < 90 ? `${Math.round(ageSeconds)}s old`
+        : ageSeconds < 5400 ? `${Math.round(ageSeconds / 60)}m old`
+        : `${Math.round(ageSeconds / 3600)}h old`
+      const hint = diffMode
+        ? `  Reusing existing coverage report (${freshness}). This must be a FULL-suite report (your test:cov / CI) to match Codecov. Pass --fresh to re-run.`
+        : `  Using cached coverage report (${freshness}). Pass --fresh to re-run the suite.`
+      log(chalk.dim(hint))
     } else {
-      const spinner = startCoverageSpinner(chalk.dim('  Running test suite to collect coverage...'), env.testRunner)
-      const coverageResult = await runCommand(env.coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine)
+      if (diffMode) {
+        log(chalk.yellow(`  No coverage report on disk — running the FULL suite to match Codecov's measurement (this can be slow).`))
+        log(chalk.dim(`  Tip: run your coverage script once (e.g. npm run test:cov) or reuse the CI lcov, then re-run — lacuna will read it instantly.`))
+      }
+      const label = scopeRel
+        ? `  Running tests under ${scopeRel} to collect coverage...`
+        : '  Running test suite to collect coverage...'
+      const spinner = startCoverageSpinner(chalk.dim(label), env.testRunner)
+      const coverageResult = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine)
       spinner.stop()
 
       if (coverageResult.timedOut) {
@@ -628,26 +736,74 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
 
   const coverageBefore = report.totalLineRate * 100
 
-  const gaps = await filterTestableGaps(extractGaps(report, config.threshold), config.ignore)
-  const untouchedFiles = await findUncoveredFiles(report, config.sourceDir, cwd, config.ignore)
+  // includeExisting keeps below-threshold files that ALREADY have a test, so the loop extends
+  // them instead of skipping — the create+improve behavior of a scoped/`--improve` run.
+  // Diff mode ignores the per-file threshold entirely (101 keeps every file with any uncovered
+  // line): a file at 94% overall can still have uncovered CHANGED lines — that's the exact
+  // patch-coverage case this mode exists for.
+  const gaps = await filterTestableGaps(
+    extractGaps(report, diffMode ? 101 : config.threshold),
+    config.ignore,
+    { includeExisting: improveExisting },
+  )
+  const untouchedFiles = await findUncoveredFiles(report, config.sourceDir, cwd, config.ignore, scopeDir)
   const existingPaths = new Set(gaps.map((g) => g.filePath))
   for (const g of untouchedFiles) {
     if (!existingPaths.has(g.filePath)) gaps.push(g)
   }
 
-  if (gaps.length === 0) {
-    if (coverageBefore < config.threshold) {
+  // Diff mode: keep only gaps in changed files, each narrowed to its changed-and-uncovered
+  // lines. Patch coverage is measured over the same changed-line set; changed testable files
+  // with no coverage entry count as fully uncovered (the untested-new-file case). A changed
+  // file with an existing-but-unexecuted test file is in neither the report nor the gap set —
+  // pull it in explicitly so its changed lines aren't silently counted as covered.
+  let diffGaps = gaps
+  let patchCoverageBefore: number | undefined
+  if (diffScope) {
+    gaps.push(...await missingChangedFileGaps(diffScope.changed, report, gaps, cwd, config.ignore))
+    diffGaps = narrowGapsToDiff(gaps, diffScope.changed, report, cwd)
+    patchCoverageBefore = computePatchCoverage(
+      report, diffScope.changed, cwd, filesOutsideReport(diffGaps, report, cwd),
+    ).pct
+  }
+
+  // Restrict to the scope subtree. extractGaps paths come from lcov (absolute OR relative), so
+  // normalize before the prefix test; untouched files are already absolute and scope-walked.
+  const scopedGaps = scopeDir
+    ? gaps.filter((g) => isWithinDir(g.filePath.startsWith('/') ? g.filePath : join(cwd, g.filePath), scopeDir))
+    : diffGaps
+
+  if (scopedGaps.length === 0) {
+    if (diffScope) {
+      const pct = patchCoverageBefore ?? 100
+      log(chalk.green(`\nAll testable changed lines vs ${diffScope.baseRef} are already covered — nothing to generate.`))
+      log(chalk.dim(`  Patch coverage: ${pct.toFixed(1)}%`))
+      return {
+        filesProcessed: 0, testsWritten: 0, coverageBefore, coverageAfter: coverageBefore,
+        hasCoverage: true, patchCoverageBefore: pct, patchCoverageAfter: pct,
+        diffBase: diffScope.baseRef, errors: [],
+      }
+    }
+    const where = scopeRel ? ` under ${scopeRel}` : ''
+    if (coverageBefore < config.threshold && !improveExisting) {
       log(chalk.yellow(`\n⚠ Coverage is ${coverageBefore.toFixed(1)}% — below the ${config.threshold}% threshold.`))
       log(chalk.dim('  Every source file already has a test file, so there is nothing new to generate.'))
       log(chalk.dim('  Run `lacuna fix` to repair the failing tests and raise coverage.'))
     } else {
-      log(chalk.green(`\nAll files already meet the ${config.threshold}% threshold.`))
+      log(chalk.green(`\nAll files${where} already meet the ${config.threshold}% threshold.`))
     }
     return { filesProcessed: 0, testsWritten: 0, coverageBefore, coverageAfter: coverageBefore, hasCoverage: true, errors: [] }
   }
 
-  log(chalk.bold(`\nFound ${gaps.length} file(s) below ${config.threshold}% threshold.`))
-  log(chalk.dim(`Coverage before: ${coverageBefore.toFixed(1)}%`))
+  if (diffScope) {
+    const targetLines = scopedGaps.reduce((n, g) => n + g.uncoveredLines.length, 0)
+    log(chalk.bold(`\nFound ${scopedGaps.length} changed file(s) vs ${diffScope.baseRef} with uncovered changed lines (${targetLines} target line(s)).`))
+    log(chalk.dim(`Patch coverage before: ${(patchCoverageBefore ?? 0).toFixed(1)}%`))
+  } else {
+    const scopeNote = scopeRel ? ` under ${scopeRel}` : ''
+    log(chalk.bold(`\nFound ${scopedGaps.length} file(s)${scopeNote} below ${config.threshold}% threshold.`))
+    log(chalk.dim(`Coverage before: ${coverageBefore.toFixed(1)}%`))
+  }
   if (parallel) {
     if (options.verbose) log(chalk.dim(`  (--verbose is not shown in parallel mode — use --workers 1 to see the live code panel)`))
     log(chalk.dim(`\nWorkers: ${workerCount}\n`))
@@ -663,13 +819,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   let errors: string[]
 
   if (parallel) {
-    ;({ filesProcessed, testsWritten, errors } = await runWorkerPool(gaps, options, workerCount, memorySnapshot))
-
-    if (!options.dryRun && testsWritten > 0) {
-      const finalSpinner = startCoverageSpinner(chalk.dim('\n  Running full suite for final coverage measurement...'), env.testRunner)
-      await runCommand(env.coverageCommand, cwd, config.coverageTimeout * 1000, finalSpinner.onLine)
-      finalSpinner.stop()
-    }
+    ;({ filesProcessed, testsWritten, errors } = await runWorkerPool(scopedGaps, options, workerCount, memorySnapshot))
   } else {
     filesProcessed = 0
     testsWritten = 0
@@ -691,10 +841,10 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     })
     const nextTip = createTipRotator(tips)
 
-    for (const gap of gaps) {
+    for (const gap of scopedGaps) {
       const tip = nextTip()
       if (tip) log(formatTip(tip))
-      const result = await processGap(gap, options, generator, false, undefined, memory.toPromptSection())
+      const result = await processGap(gap, options, generator, perFileVerify, undefined, memory.toPromptSection())
       filesProcessed++
       if (result.success) {
         testsWritten++
@@ -706,9 +856,93 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     }
   }
 
+  // Final coverage measurement. The per-file runs that verified each generated test executed
+  // WITHOUT coverage instrumentation — true for every parallel-worker run AND for scoped/improve
+  // sequential runs (both use the file-scoped command). So coverage on disk is stale; re-run once
+  // (scoped command when scoped) to get a real after-%. Classic unscoped sequential generate
+  // already verified via the full suite and is left untouched (no extra pass for everyone).
+  // DIFF MODE skips this: we do NOT re-run the whole suite for the after-number — see below.
+  if (!options.dryRun && testsWritten > 0 && (parallel || perFileVerify) && !diffMode) {
+    const measureLabel = scopeRel
+      ? `\n  Measuring coverage under ${scopeRel}...`
+      : '\n  Running full suite for final coverage measurement...'
+    const finalSpinner = startCoverageSpinner(chalk.dim(measureLabel), env.testRunner)
+    await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, finalSpinner.onLine)
+    finalSpinner.stop()
+  }
+
   // Only measure coverage after if at least one test was written — otherwise the failing
-  // generated files execute source code and report misleading 100% coverage.
+  // generated files execute source code and report misleading 100% coverage. (Diff mode keeps
+  // the reused before-report on disk — the full re-run was skipped — so this reads that; the
+  // overall % isn't the diff-mode gate anyway, patch coverage is.)
   const coverageAfter = (options.dryRun || testsWritten === 0) ? coverageBefore : await getCoverageRate(config, cwd)
 
-  return { filesProcessed, testsWritten, coverageBefore, coverageAfter, hasCoverage: true, errors }
+  // Diff mode after-number, computed CHEAPLY: the accurate before-report already holds every
+  // other test's coverage, so we only need the NEW test's incremental coverage of the changed
+  // files. Run a narrow related/scoped pass (seconds), then UNION its hits with the before-report
+  // — a line is covered-after if it was covered before OR the new test now covers it. (A narrow
+  // run is safe as a union addend even though it was unsafe as a before REPLACEMENT.)
+  let patchCoverageAfter = patchCoverageBefore
+  if (diffScope && !options.dryRun && testsWritten > 0) {
+    try {
+      const afterCmd = relTargetFile
+        ? (relatedCoverageCommand(env, relTargetFile) ?? env.coverageCommand)
+        : env.coverageCommand
+      const spin = startCoverageSpinner(chalk.dim(relTargetFile
+        ? `\n  Measuring new coverage of ${relTargetFile}...`
+        : '\n  Measuring new patch coverage...'), env.testRunner)
+      await runCommand(afterCmd, cwd, config.coverageTimeout * 1000, spin.onLine)
+      spin.stop()
+      const incremental = await loadCoverage(config, cwd)
+      const merged = mergeReportHits(report, incremental, cwd)
+      patchCoverageAfter = computePatchCoverage(
+        merged, diffScope.changed, cwd, filesOutsideReport(scopedGaps, merged, cwd),
+      ).pct
+    } catch { /* keep the before value */ }
+  }
+
+  // In improve mode we deliberately do NOT chase the threshold with contrived tests (see the
+  // "COVERAGE IS A MEANS, NOT THE GOAL" prompt rule). So landing below the threshold is an
+  // expected, healthy outcome — surface it as intentional so the reporter's red "FAIL" line
+  // isn't read as a defect. (Diff mode gates on patch coverage instead — skip the note.)
+  if (!options.dryRun && testsWritten > 0 && improveExisting && !diffMode && coverageAfter < config.threshold) {
+    log(chalk.dim(`\n  Note: coverage is ${coverageAfter.toFixed(1)}% (under the ${config.threshold}% threshold). The remaining uncovered lines are defensive/edge branches left uncovered by design — a contrived test there (impossible inputs, quirk assertions) would be worse than the gap. This is expected, not a failure.`))
+  }
+
+  return {
+    filesProcessed, testsWritten, coverageBefore, coverageAfter, hasCoverage: true,
+    ...(diffScope ? { patchCoverageBefore, patchCoverageAfter, diffBase: diffScope.baseRef } : {}),
+    errors,
+  }
+}
+
+// Unions two coverage reports at the line level: a line is covered in the result if it was
+// covered in EITHER input (hit = max of the two). Used for the diff-mode after-number so the
+// accurate full before-report and the cheap incremental new-test run combine correctly. Only
+// line hits matter for patch coverage; functions are carried from `base` unchanged.
+function mergeReportHits(base: CoverageReport, incr: CoverageReport, cwd: string): CoverageReport {
+  const abs = (p: string) => (p.startsWith('/') ? p : join(cwd, p))
+  const byPath = new Map<string, FileCoverage>()
+  for (const f of base.files) byPath.set(abs(f.path), { ...f, lines: f.lines.map((l) => ({ ...l })) })
+  for (const f of incr.files) {
+    const key = abs(f.path)
+    const existing = byPath.get(key)
+    if (!existing) { byPath.set(key, { ...f, lines: f.lines.map((l) => ({ ...l })) }); continue }
+    const hitByLine = new Map<number, number>(existing.lines.map((l) => [l.line, l.hit]))
+    for (const l of f.lines) hitByLine.set(l.line, Math.max(hitByLine.get(l.line) ?? 0, l.hit))
+    existing.lines = [...hitByLine].map(([line, hit]) => ({ line, hit }))
+  }
+  return { files: [...byPath.values()], totalLineRate: base.totalLineRate, totalFunctionRate: base.totalFunctionRate }
+}
+
+// Absolute paths of gap files that have NO entry in the coverage report — their changed
+// lines are assumed fully uncovered for patch-coverage purposes (untested-new-file case).
+function filesOutsideReport(gaps: CoverageGap[], report: CoverageReport, cwd: string): Set<string> {
+  const reportPaths = new Set(report.files.map((f) => (f.path.startsWith('/') ? f.path : join(cwd, f.path))))
+  const outside = new Set<string>()
+  for (const g of gaps) {
+    const abs = g.filePath.startsWith('/') ? g.filePath : join(cwd, g.filePath)
+    if (!reportPaths.has(abs)) outside.add(abs)
+  }
+  return outside
 }

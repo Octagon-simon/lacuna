@@ -53,7 +53,9 @@ export class WorkerDisplay {
 
     this.winchHandler = () => {
       if (this.lastRenderedText) {
-        const newCols = Math.max(60, process.stdout.columns ?? 80)
+        // Row math must use the REAL terminal width (clamping to 60 under-counts wrapped rows
+        // on a narrow terminal and leaves the cursor mid-block → corrupted redraw).
+        const newCols = Math.max(1, process.stdout.columns || 80)
         this.rendered = this.countVisualLines(this.lastRenderedText, newCols)
       }
       this.render()
@@ -100,7 +102,10 @@ export class WorkerDisplay {
       process.stdout.write(`\x1B[${this.rendered}A\x1B[0J`)
     }
 
-    const cols = Math.max(60, process.stdout.columns ?? 80)
+    // `cols` (min 60) governs how aggressively file paths are truncated; `realCols` is the
+    // actual width and must drive the wrap/row count (see countVisualLines call below).
+    const realCols = Math.max(1, process.stdout.columns || 80)
+    const cols = Math.max(60, realCols)
     const lines: string[] = ['']
 
     for (let i = 0; i < this.states.length; i++) {
@@ -137,7 +142,7 @@ export class WorkerDisplay {
     const out = lines.join('\n')
     process.stdout.write(out)
     this.lastRenderedText = out
-    this.rendered = this.countVisualLines(out, cols)
+    this.rendered = this.countVisualLines(out, realCols)
   }
 
   private countVisualLines(text: string, cols: number): number {

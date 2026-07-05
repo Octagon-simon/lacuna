@@ -7,6 +7,26 @@ import { runCommand } from './runner.js'
 // family (TS7005/7006/7019/7031/7034/7053/…) is covered without enumerating codes.
 const IMPLICIT_ANY_RE = /implicitly has (?:an? |type )?'any(?:\[\])?'/i
 
+// A full-project `tsc` is CPU- and memory-heavy (it loads the entire program). Running one per
+// parallel fix worker (e.g. `fix --types -w 5`) thrashes the machine: every tsc blows past its
+// timeout and gets killed, which previously looked like "no errors" → false "passed". Running
+// them concurrently is also never FASTER (tsc is CPU-bound) and risks OOM. So serialize every
+// tsc invocation through a one-at-a-time lock: workers still parallelize model generation and
+// only queue for the type-check itself.
+let tscLock: Promise<void> = Promise.resolve()
+function withTscLock<T>(fn: () => Promise<T>): Promise<T> {
+  const run = tscLock.then(fn, fn)
+  // Keep the chain alive regardless of fn's outcome; never reject the lock itself.
+  tscLock = run.then(() => {}, () => {})
+  return run
+}
+
+// tsc completed iff it either exited 0 (clean) or printed at least one `error TSxxxx`. A run that
+// did NEITHER (empty output + non-zero exit) was killed by the timeout or crashed/OOM'd — we must
+// NOT treat that as "clean", or a timed-out verification silently reports a still-broken file as
+// fixed. Sentinel return makes callers keep the file as still-erroring instead of declaring it green.
+export const TYPECHECK_INCONCLUSIVE = 'TypeScript check did not complete (timed out or crashed before emitting diagnostics) — could not verify.'
+
 async function pathExists(p: string): Promise<boolean> {
   try { await access(p); return true } catch { return false }
 }
@@ -97,8 +117,14 @@ export async function typeCheckFile(
   // not the root — otherwise the file's @/ path aliases and jsx settings don't resolve and
   // tsc reports false TS2307/TS17004 errors for a file that is actually clean.
   const nearest = (await findNearestTsconfig(absTestPath, cwd)) ?? join(cwd, 'tsconfig.json')
-  const result = await runCommand(buildTscCommand(nearest, cwd), cwd, 60_000)
+  // Serialized + generous timeout: under parallel workers the old 60s limit + concurrent tscs
+  // caused kills that masqueraded as "clean". One-at-a-time, a full tsc finishes well inside 180s.
+  const result = await withTscLock(() => runCommand(buildTscCommand(nearest, cwd), cwd, 180_000))
   if (result.success) return null
+
+  // tsc neither exited 0 nor emitted any diagnostics → it was killed/crashed, not "clean".
+  const combined = result.stdout + '\n' + result.stderr
+  if (!/error TS\d+/.test(combined)) return TYPECHECK_INCONCLUSIVE
 
   // Match by path relative to cwd (how tsc prints diagnostics), NOT basename — many
   // projects have dozens of identically-named files (route.test.ts, index.test.ts, page.test.tsx)
@@ -149,7 +175,14 @@ export async function findTestFilesWithTypeErrors(
 
   const withErrors: string[] = []
   for (const [tsconfig, files] of byConfig) {
-    const result = await runCommand(buildTscCommand(tsconfig, cwd), cwd, 180_000)
+    // Always the FULL governing-project tsc — same basis as typeCheckFile (the per-file repair
+    // verifier). They MUST agree: a restricted-`include` tsc reports errors the real build
+    // doesn't (it drops non-.d.ts ambient context — setup files with `declare global`, module
+    // augmentation), so selection would flag files that verification then sees as clean → the
+    // run "fixes" 4 files but the next run re-flags the same 6 forever. Scope is honored
+    // upstream: `testFiles` already contains only the in-scope files (discoverTestFiles(scopeDir)),
+    // and the path filter below keeps selection within that set.
+    const result = await withTscLock(() => runCommand(buildTscCommand(tsconfig, cwd), cwd, 180_000))
     if (result.success) continue
 
     const errorLines = (result.stdout + '\n' + result.stderr)
