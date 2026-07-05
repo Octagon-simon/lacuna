@@ -1,1 +1,0 @@
-{"version":3,"file":"coverage-spinner.d.ts","sourceRoot":"","sources":["../../src/lib/coverage-spinner.ts"],"names":[],"mappings":"AAkEA,MAAM,WAAW,eAAe;IAC9B,MAAM,EAAE,CAAC,IAAI,EAAE,MAAM,KAAK,IAAI,CAAA;IAC9B,IAAI,EAAE,MAAM,IAAI,CAAA;CACjB;AAED,wBAAgB,oBAAoB,CAAC,KAAK,EAAE,MAAM,EAAE,MAAM,SAAY,GAAG,eAAe,CA2EvF"}
