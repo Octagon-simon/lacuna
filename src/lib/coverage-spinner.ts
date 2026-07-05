@@ -14,6 +14,31 @@ function stripAnsi(s: string): string {
   return s.replace(ANSI_RE, '').trim()
 }
 
+// Visible column width of a line (ANSI codes don't occupy columns). Not trimmed — leading
+// spaces count toward width and therefore toward how many terminal rows the line wraps to.
+function visibleWidth(s: string): number {
+  return s.replace(ANSI_RE, '').length
+}
+
+// How many physical terminal rows a single line (no embedded '\n') occupies at the given
+// width. A line longer than the terminal wraps onto multiple rows; the cursor-up count must
+// account for that or earlier wrapped rows are never cleared (the label re-prints every tick).
+function physicalRows(line: string, cols: number): number {
+  return Math.max(1, Math.ceil(visibleWidth(line) / cols))
+}
+
+// Physical rows the cursor sits BELOW the top of a just-written block. Splits on real '\n'
+// first — a label may itself contain newlines (e.g. a leading blank line for spacing), which
+// a per-logical-line count would miss, leaking a stray row every tick.
+function blockRows(out: string, cols: number): number {
+  const segments = out.split('\n')
+  let rows = 0
+  // The block is written without forcing a trailing newline beyond the final empty segment,
+  // so every segment except the last sits above the cursor's resting row.
+  for (let i = 0; i < segments.length - 1; i++) rows += physicalRows(segments[i], cols)
+  return rows
+}
+
 function parseFileLine(line: string, runner: string): FileEntry | null {
   const clean = stripAnsi(line)
 
@@ -69,7 +94,11 @@ export function startCoverageSpinner(label: string, runner = 'unknown'): Coverag
 
     const secs = Math.floor((Date.now() - start) / 1000)
     const frame = chalk.cyan(FRAMES[tick % FRAMES.length])
-    const cols = Math.max(60, process.stdout.columns ?? 80)
+    // `cols` (min 60) governs how aggressively file paths are truncated; `realCols` is the
+    // ACTUAL terminal width and must drive the wrap/row math — using the clamped value would
+    // under-count rows on a terminal narrower than 60 and re-introduce the un-cleared lines.
+    const realCols = Math.max(1, process.stdout.columns || 80)
+    const cols = Math.max(60, realCols)
     const lines: string[] = []
 
     lines.push(`${label}  ${frame}  ${chalk.dim(secs + 's')}`)
@@ -89,7 +118,9 @@ export function startCoverageSpinner(label: string, runner = 'unknown'): Coverag
     lines.push('')
     const out = lines.join('\n')
     process.stdout.write(out)
-    rendered = (out.match(/\n/g) ?? []).length
+    // Count PHYSICAL rows of the actual written text (wrap-aware AND newline-safe), not the
+    // logical line array — a label with an embedded '\n' would otherwise be under-counted.
+    rendered = blockRows(out, realCols)
   }
 
   const timer = setInterval(() => { tick++; render() }, 100)

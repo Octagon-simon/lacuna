@@ -4,7 +4,9 @@ import { access, stat } from 'fs/promises'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
-import { fileTestCommand, multiFileTestCommand } from '../lib/detector.js'
+import { fileTestCommand, multiFileTestCommand, scopedTestCommand } from '../lib/detector.js'
+import { isWithinDir } from '../lib/coverage/index.js'
+import { formatFile } from '../lib/format.js'
 import { runCommand } from '../lib/runner.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
@@ -15,8 +17,8 @@ import { processGap } from './loop.js'
 import type { CoverageGap } from '../lib/coverage/types.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
-import { typeCheckFile, findTestFilesWithTypeErrors } from '../lib/typecheck.js'
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
+import { typeCheckFile, findTestFilesWithTypeErrors, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, parseFailCount, buildStructureBrokenMessage, buildRegressionMessage, buildUnhandledErrorMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, dedupeImports, dedupeTestBlocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -27,6 +29,9 @@ export interface FixOptions {
   dryRun: boolean
   verbose: boolean
   targetFile?: string
+  // Absolute path to a directory the run is scoped to (`lacuna fix <dir>`). Only failing/erroring
+  // test files under this subtree are selected, and the discovery run is scoped to it too.
+  scopeDir?: string
   workers?: number
   fresh?: boolean
   regenerateOnFailure?: boolean
@@ -254,6 +259,13 @@ async function fixFile(
     // `lacuna fix --types` are dead ends. Default full-suite mode keeps skipping so
     // pollution-victim accounting is untouched.
     typeErrorsAtStart = (options.targetFile || options.types) ? await typeCheckFile(absTestPath, cwd, env) : null
+    if (typeErrorsAtStart === TYPECHECK_INCONCLUSIVE) {
+      // Couldn't verify the starting state (tsc timed out/crashed). Don't skip it as "passing"
+      // (that's the false-green bug) and don't feed the sentinel to the model as the error to fix.
+      if (!onStatus) log(chalk.red(`  ⚠ Could not type-check ${shortPath} (tsc did not complete) — leaving as unresolved.`))
+      onStatus?.({ phase: 'failed', file: shortPath })
+      return { success: false, typeOnly: true, error: TYPECHECK_INCONCLUSIVE }
+    }
     if (!typeErrorsAtStart) {
       if (!onStatus) log(chalk.dim('  Already passing — skipping.'))
       onStatus?.({ phase: 'passed', file: shortPath })
@@ -498,6 +510,9 @@ async function fixFile(
     }
 
     testFileContent = deduplicateViMocks(testFileContent)
+    testFileContent = typeImportOriginalCalls(testFileContent)
+    testFileContent = dedupeImports(testFileContent)
+    testFileContent = dedupeTestBlocks(testFileContent)
 
     // Catch empty test files before writing
     if (!hasTestFunctions(testFileContent)) {
@@ -534,6 +549,15 @@ async function fixFile(
         continue
       }
       const typeErrors = await typeCheckFile(absTestPath, cwd, env)
+      if (typeErrors === TYPECHECK_INCONCLUSIVE) {
+        // tsc couldn't actually verify (timeout/crash). Do NOT declare the file fixed on an
+        // unverified check — that's the "says passed but type errors remain" bug. Stop cleanly
+        // and report it as unresolved; retrying would only re-feed the model a non-error.
+        if (!onStatus) log(chalk.red(`  ⚠ Could not verify types (tsc did not complete) — leaving as unresolved.`))
+        await writeFile(absTestPath, bestCode, 'utf-8').catch(() => {})
+        onStatus?.({ phase: 'failed', file: shortPath })
+        return { success: false, typeOnly: firstRun.success, baselinePassCount: bestPassCount, error: TYPECHECK_INCONCLUSIVE }
+      }
       if (typeErrors && typeErrorsAtStart !== null) {
         // Type-cleanup mode: the file's tests already passed at start (generate→fix handoff or
         // --types), so type errors ARE the goal — keep retrying to clear them.
@@ -559,6 +583,7 @@ async function fixFile(
     const rawExtracted = extractTestFailure(rawRunOutput)
     const structureBroken = isZeroTestsOutput(rawRunOutput)
     const currentPassCount = structureBroken ? 0 : parsePassCount(rawRunOutput)
+    const currentFailCount = structureBroken ? 0 : parseFailCount(rawRunOutput)
     // enrichNoTestsError adds guidance for genuinely missing test functions;
     // in the structure-broken path the issue is always a broken import, so use
     // rawExtracted there so the actual module error isn't buried in boilerplate.
@@ -577,6 +602,12 @@ async function fixFile(
     } else if (currentPassCount < baselinePassCount) {
       errorOutput = buildRegressionMessage(initialErrorOutput, extracted, baselinePassCount, currentPassCount)
       if (!onStatus) log(chalk.red(`  Fix caused regression: ${baselinePassCount} → ${currentPassCount} passing (attempt ${attempt}/${config.maxIterations})`))
+    } else if (currentFailCount === 0 && currentPassCount > 0) {
+      // Every collected test PASSES, yet the run failed — vitest flagged an unhandled error
+      // (an unhandled promise rejection or a suite-level error outside any test). Without this
+      // branch the model just sees "still failing" with no failing assertion and flails. Name it.
+      errorOutput = buildUnhandledErrorMessage(extracted, currentPassCount)
+      if (!onStatus) log(chalk.red(`  All ${currentPassCount} tests pass but the run failed on unhandled errors (attempt ${attempt}/${config.maxIterations})`))
     } else {
       errorOutput = extracted
       if (!onStatus) log(chalk.red(`  Still failing (attempt ${attempt}/${config.maxIterations})`))
@@ -617,7 +648,7 @@ function buildTestFileRegex(pattern: string): RegExp {
   return new RegExp(regexStr + '$')
 }
 
-async function discoverTestFiles(cwd: string, env: { testFilePattern: string }): Promise<string[]> {
+async function discoverTestFiles(cwd: string, env: { testFilePattern: string }, scopeDir?: string): Promise<string[]> {
   const testRe = buildTestFileRegex(env.testFilePattern)
   const files: string[] = []
   const skipDirs = new Set(['node_modules', 'dist', '.git', 'coverage', '.nyc_output', '.lacuna'])
@@ -633,7 +664,7 @@ async function discoverTestFiles(cwd: string, env: { testFilePattern: string }):
     }
   }
 
-  await walk(cwd)
+  await walk(scopeDir ?? cwd)
   return files.sort()
 }
 
@@ -910,7 +941,7 @@ async function runFixWorkers(
         filesProcessed++
         if (result.success) {
           if (result.skipped) { filesAlreadyPassing++; victimFiles.push(absFile) }
-          else filesFixed++
+          else { filesFixed++; if (!options.dryRun) await formatFile(absFile, options.cwd, { enabled: options.config.format, env: options.env }) }
         } else if (options.regenerateOnFailure && !options.types && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
           // Regenerate from scratch only for mostly-broken files (few passing tests) — that's
           // where a fresh take rescues stuck tests. A file with a substantial passing suite is
@@ -923,6 +954,7 @@ async function runFixWorkers(
           const regenResult = await regenerateFile(absFile, workerOptions, onStatus, projectMemory, result.baselinePassCount ?? 0)
           if (regenResult.success) {
             filesFixed++
+            if (!options.dryRun) await formatFile(absFile, options.cwd, { enabled: options.config.format, env: options.env })
           } else {
             stillFailingFiles.push(file)
             if (regenResult.error) errors.push(regenResult.error)
@@ -946,6 +978,11 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
   const workerCount = Math.max(1, Math.min(options.workers ?? 1, 10))
   const parallel = workerCount > 1
 
+  // Scope (`lacuna fix <dir>`): restrict selection + the discovery run to a subtree.
+  const scopeDir = options.scopeDir
+  const scopeRel = scopeDir ? scopeDir.replace(cwd + '/', '').replace(/\/+$/, '') : undefined
+  const inScope = (f: string) => !scopeDir || isWithinDir(f.startsWith('/') ? f : join(cwd, f), scopeDir)
+
   let failingFiles: string[]
 
   if (options.types && !options.targetFile) {
@@ -956,8 +993,13 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       log(chalk.yellow('\n  --types only applies to TypeScript projects — nothing to do.'))
       return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
     }
-    const spinner = startCoverageSpinner(chalk.dim('  Type-checking project to find test files with type errors...'), env.testRunner)
-    const allTestFiles = await discoverTestFiles(cwd, env)
+    // tsc always checks the whole governing project (no way to partially type-check correctly),
+    // but we only select + fix test files under the scope. Label reflects that honestly.
+    const tcLabel = scopeRel
+      ? `  Type-checking project to find type errors under ${scopeRel}...`
+      : '  Type-checking project to find test files with type errors...'
+    const spinner = startCoverageSpinner(chalk.dim(tcLabel), env.testRunner)
+    const allTestFiles = await discoverTestFiles(cwd, env, scopeDir)
     failingFiles = await findTestFilesWithTypeErrors(allTestFiles, cwd, env)
     spinner.stop()
 
@@ -988,16 +1030,20 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
 
     failingFiles = [absTarget]
   } else {
-    // Full-suite mode: check cache before running the suite
-    const cache = options.fresh ? null : await loadFixCache(cwd)
+    // Full-suite mode: check cache before running the suite. Scoped runs bypass the cache
+    // (it holds whole-suite failures) and run only the tests under the scope when the runner
+    // supports it (vitest/jest); otherwise the full suite runs and results are post-filtered.
+    const cache = (options.fresh || scopeDir) ? null : await loadFixCache(cwd)
     const useCached = cache !== null && cache.ageSeconds < FIX_CACHE_TTL_S
 
     if (useCached) {
       log(chalk.dim(`  Resuming from last run (${Math.round(cache!.ageSeconds)}s ago, ${cache!.files.length} file(s) still failing). Pass --fresh to re-scan the full suite.`))
       failingFiles = cache!.files
     } else {
-      const spinner = startCoverageSpinner(chalk.dim('  Running test suite to find failures...'), env.testRunner)
-      const suiteResult = await runCommand(env.testCommand, cwd, config.coverageTimeout * 1000, spinner.onLine)
+      const runCmd = (scopeRel && scopedTestCommand(env, scopeRel)) || env.testCommand
+      const label = scopeRel ? `  Running tests under ${scopeRel} to find failures...` : '  Running test suite to find failures...'
+      const spinner = startCoverageSpinner(chalk.dim(label), env.testRunner)
+      const suiteResult = await runCommand(runCmd, cwd, config.coverageTimeout * 1000, spinner.onLine)
       spinner.stop()
 
       if (suiteResult.timedOut) {
@@ -1008,19 +1054,21 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       }
 
       if (suiteResult.success) {
-        log(chalk.green('\n  All tests are passing — nothing to fix.'))
+        const where = scopeRel ? ` under ${scopeRel}` : ''
+        log(chalk.green(`\n  All tests${where} are passing — nothing to fix.`))
         return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
       }
 
       failingFiles = parseFailingTestFiles(suiteResult.stdout + suiteResult.stderr, env.testRunner)
       failingFiles = failingFiles.filter((f) => {
         const abs = f.startsWith('/') ? f : join(cwd, f)
-        return abs.startsWith(cwd) && !abs.includes('node_modules')
+        return abs.startsWith(cwd) && !abs.includes('node_modules') && inScope(f)
       })
 
       if (failingFiles.length === 0) {
-        log(chalk.yellow('\n  Could not identify any failing test files from the output.'))
-        log(chalk.dim(`  Try running ${env.testCommand} directly to inspect the output.`))
+        const where = scopeRel ? ` under ${scopeRel}` : ''
+        log(chalk.yellow(`\n  Could not identify any failing test files${where} from the output.`))
+        log(chalk.dim(`  Try running ${runCmd} directly to inspect the output.`))
         const lastLines = (suiteResult.stdout + suiteResult.stderr)
           .split('\n')
           .filter((l) => l.trim())
@@ -1030,11 +1078,14 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
         return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] }
       }
 
-      await saveFixCache(cwd, failingFiles)
+      // Don't persist a scoped failure list as the whole-suite cache (an unscoped fix would
+      // then resume from a partial set). Only full-suite runs populate the cache.
+      if (!scopeDir) await saveFixCache(cwd, failingFiles)
     }
   }
 
-  log(chalk.bold(`\n  Found ${failingFiles.length} ${options.types ? 'test file(s) with type errors' : 'failing test file(s)'}.`))
+  const scopeNote = scopeRel ? ` under ${scopeRel}` : ''
+  log(chalk.bold(`\n  Found ${failingFiles.length}${scopeNote} ${options.types ? 'test file(s) with type errors' : 'failing test file(s)'}.`))
   if (parallel) {
     if (options.verbose) log(chalk.dim(`  (--verbose is not shown in parallel mode — use --workers 1 to see the live code panel)`))
     log(chalk.dim(`\n  Workers: ${workerCount}\n`))
@@ -1081,7 +1132,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       filesProcessed++
       if (result.success) {
         if (result.skipped) { filesAlreadyPassing++; victimFiles.push(absFile) }
-        else filesFixed++
+        else { filesFixed++; if (!options.dryRun) await formatFile(absFile, cwd, { enabled: config.format, env }) }
       } else if (options.regenerateOnFailure && !options.types && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
         // Regenerate only for mostly-broken files (few passing tests) — see runFixWorkers.
         // A substantial passing suite is left restored by fixFile, never nuked + rebuilt.
@@ -1089,6 +1140,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
         const regenResult = await regenerateFile(absFile, options, undefined, memory.toPromptSection(), result.baselinePassCount ?? 0)
         if (regenResult.success) {
           filesFixed++
+          if (!options.dryRun) await formatFile(absFile, cwd, { enabled: config.format, env })
         } else {
           stillFailingFiles.push(file)
           if (regenResult.error) errors.push(regenResult.error)
@@ -1106,7 +1158,9 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
   // does a clean suite scan to confirm.
   // Skip in --types mode: it selects by type errors, not the suite-failure axis the
   // cache represents, so it must not overwrite the failing-files cache.
-  if (!options.targetFile && !options.types) {
+  // Skip when scoped: stillFailingFiles is only the scope's subset — persisting it (or clearing
+  // it on scope-success) would corrupt the whole-suite cache an unscoped fix relies on.
+  if (!options.targetFile && !options.types && !options.scopeDir) {
     if (stillFailingFiles.length > 0) await saveFixCache(cwd, stillFailingFiles)
     else await clearFixCache(cwd)
   }
