@@ -7,6 +7,9 @@ import { detectVue, buildVueGuidance } from './vue.js'
 import { buildJsCauses } from './runners/js-common.js'
 import { buildVitestCauses } from './runners/vitest.js'
 import { buildTsRule } from './runners/typescript.js'
+import { buildHookMockHint, buildCallbackOutcomeHint } from '../../lib/hook-mock-hints.js'
+import { buildRenderVocabSection } from '../../lib/render-vocab.js'
+import { buildServiceMockHint } from '../../lib/service-mock-hints.js'
 
 // Existing test files longer than this switch to surgical patch mode (<code_patch>) instead
 // of full-file rewrites — rewriting a large file risks hitting the output token limit mid-file.
@@ -665,6 +668,23 @@ export function buildGeneratePrompt(args: {
   parts.push(displaySource)
   parts.push('```')
 
+  // Ground assertions in the component's REAL rendered strings (from full source), so generated
+  // tests target actual labels/testIDs rather than inventing a plausible UI.
+  const genRenderVocab = buildRenderVocabSection(args.sourceCode)
+  if (genRenderVocab) parts.push(`\n${genRenderVocab}`)
+
+  // Prevention at generation time: mock hooks with their COMPLETE field shape and resolve async
+  // service mocks up front (errorOutput=null ⇒ always emit). No test file exists yet, so both fall
+  // back to listing every destructured hook / naming-convention service.
+  const genHookMock = buildHookMockHint(args.sourceCode, existingTestCode ?? null, null)
+  if (genHookMock) parts.push(`\n${genHookMock}`)
+
+  const genServiceMock = buildServiceMockHint(args.sourceCode, existingTestCode ?? null, null)
+  if (genServiceMock) parts.push(`\n${genServiceMock}`)
+
+  const genCallbackOutcome = buildCallbackOutcomeHint(args.sourceCode, existingTestCode ?? null)
+  if (genCallbackOutcome) parts.push(`\n${genCallbackOutcome}`)
+
   if (existingTestCode) {
     parts.push('\nEXISTING TEST FILE — reproduce it EXACTLY, then add any genuinely new cases INSIDE the existing describe() blocks:')
     parts.push('```')
@@ -850,6 +870,11 @@ export function buildFixPrompt(args: {
     parts.push('```')
     parts.push(displaySource)
     parts.push('```')
+
+    // Grounds getBy* assertions in the component's REAL rendered strings — extracted from the
+    // full (uncompressed) source, so it holds even when displaySource above is skeletonized.
+    const renderVocab = buildRenderVocabSection(args.sourceCode)
+    if (renderVocab) parts.push(`\n${renderVocab}`)
   }
 
   parts.push(`\nFAILING TEST FILE: ${testFile}`)
@@ -879,6 +904,18 @@ export function buildFixPrompt(args: {
 
   const tsErrorWarning = detectTypeScriptErrors(errorOutput)
   if (tsErrorWarning) parts.push(`\n⚠️  ${tsErrorWarning}`)
+
+  // Uses the RAW (uncompressed) source so every hook destructure is visible, and is pushed as
+  // its own part — never folded into the 3000-char errorOutput slice above, where a long
+  // multi-test failure dump would truncate it away. Preserved across retries via history[0].
+  const hookMockWarning = buildHookMockHint(args.sourceCode, testCode, errorOutput)
+  if (hookMockWarning) parts.push(`\n${hookMockWarning}`)
+
+  const serviceMockWarning = buildServiceMockHint(args.sourceCode, testCode, errorOutput)
+  if (serviceMockWarning) parts.push(`\n${serviceMockWarning}`)
+
+  const callbackOutcome = buildCallbackOutcomeHint(args.sourceCode, testCode)
+  if (callbackOutcome) parts.push(`\n${callbackOutcome}`)
 
   const testHasAxiosMock = /vi\.mock\(['"]axios['"]\)/.test(testCode)
   const sourceHasCustomInstance = sourceCode != null && /axios\.create\s*\(/.test(sourceCode)
