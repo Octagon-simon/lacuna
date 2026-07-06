@@ -1,0 +1,870 @@
+import { writeFile, mkdir, readFile, unlink } from 'fs/promises';
+import { dirname, join } from 'path';
+import chalk from 'chalk';
+import { fileTestCommand, scopedCoverageCommand, relatedCoverageCommand } from '../lib/detector.js';
+import { runCommand } from '../lib/runner.js';
+import { loadCoverage, coverageAgeSeconds, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps } from '../lib/coverage/index.js';
+import { resolveDiffScope } from '../lib/git-diff.js';
+import { WorkerDisplay } from '../lib/worker-display.js';
+import { startCoverageSpinner } from '../lib/coverage-spinner.js';
+import { buildFileContext } from './context.js';
+import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js';
+import { ProjectMemory } from './project-memory.js';
+import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js';
+import { typeCheckFile, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js';
+import { formatFile } from '../lib/format.js';
+import { routeTestToNodeEnv } from '../lib/env-route.js';
+import { detectWeakAsyncWait } from './prompts/index.js';
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, dedupeImports, dedupeTestBlocks, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js';
+import { extractTestFailure } from '../lib/extract-error.js';
+import { StreamingFileViewer } from '../lib/streaming-viewer.js';
+async function getCoverageRate(config, cwd) {
+    try {
+        const report = await loadCoverage(config, cwd);
+        return report.totalLineRate * 100;
+    }
+    catch {
+        return 0;
+    }
+}
+export async function processGap(gap, options, generator, parallel, onStatus, projectMemory, overrideTestFile) {
+    const { config, env, cwd, dryRun, verbose, log } = options;
+    const shortPath = gap.filePath.replace(cwd + '/', '');
+    if (!onStatus) {
+        log(chalk.bold(`\n  Processing: ${chalk.cyan(shortPath)}`));
+        if (gap.uncoveredFunctions.length > 0) {
+            log(chalk.dim(`  Uncovered functions: ${gap.uncoveredFunctions.join(', ')}`));
+        }
+    }
+    let context;
+    try {
+        context = await buildFileContext(gap.filePath.replace(cwd + '/', ''), cwd, env, config);
+    }
+    catch {
+        const msg = `Could not read source file: ${gap.filePath}`;
+        if (!onStatus)
+            log(chalk.red(`  ${msg}`));
+        onStatus?.({ phase: 'failed', file: shortPath });
+        return { success: false, error: msg };
+    }
+    // When called from regenerateFile the original test was deleted so inferTestFilePath
+    // mirrors the source path (including any extra segments like lib/) instead of using
+    // the real test location. The caller passes the original path to pin the write target.
+    if (overrideTestFile) {
+        context.suggestedTestFile = overrideTestFile;
+        context.existingTestCode = null;
+        context.existingTestFile = null;
+    }
+    if (!onStatus) {
+        log(chalk.dim(`  ${context.existingTestFile ? 'Updating' : 'Creating'}: ${context.suggestedTestFile.replace(cwd + '/', '')}`));
+    }
+    // parallel: run only this test file so workers don't race on the full suite
+    const testCmd = parallel
+        ? fileTestCommand(env, context.suggestedTestFile)
+        : env.testCommand;
+    // Capture pre-existing test file so we can restore on failure
+    let originalTestContent = null;
+    if (!dryRun) {
+        try {
+            originalTestContent = await readFile(context.suggestedTestFile, 'utf-8');
+        }
+        catch { /* new file */ }
+    }
+    let generatedCode = null;
+    let lastError = null;
+    // One-shot: a green-but-racy "weak wait" test is invisible to the run-loop, so we nudge the
+    // model to strengthen it once. If it still trips after the nudge we accept the file rather than
+    // burn every iteration on a heuristic that might be a false positive.
+    let weakWaitNudged = false;
+    let firstError = null; // error from attempt 1, kept as anchor for regressions
+    let firstPassCount = 0; // passing tests on attempt 1
+    let stallRetries = 0;
+    const MAX_STALL_RETRIES = 2;
+    let consecutivePatchFailures = 0;
+    // Best collecting attempt seen so far — used on failure to keep a net-improving partial
+    // result (which `lacuna fix` can finish) instead of discarding work. Only attempts that
+    // actually collected tests qualify, so a fence-broken / 0-test file is never kept.
+    let bestCode = null;
+    let bestPassCount = -1;
+    // Running base for patch-mode application. Starts as the original test file and is updated
+    // to the written content after each attempt, so a retry that patches a test ADDED by an
+    // earlier attempt anchors against the current file — not the frozen original (which would
+    // fail with "anchor not found").
+    let patchBase = context.existingTestCode;
+    for (let attempt = 1; attempt <= config.maxIterations; attempt++) {
+        if (!onStatus) {
+            if (attempt > 1) {
+                // Word the header by the actual reason for this retry. After a type-check
+                // failure the tests already PASS — calling it "fixing failures" is misleading.
+                const fixingTypes = lastError?.startsWith('Tests passed but TypeScript type errors');
+                const what = fixingTypes ? 'fixing type errors (tests pass)' : 'fixing failures';
+                log(chalk.yellow(`\n  Retry ${attempt}/${config.maxIterations} — ${what}...`));
+            }
+        }
+        // Show waiting phase before the model call; transition to generating/retrying on first token
+        onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() });
+        const currentAttempt = attempt;
+        generator.setFirstTokenCallback(() => {
+            onStatus?.({
+                phase: currentAttempt === 1 ? 'generating' : 'retrying',
+                file: shortPath,
+                ...(currentAttempt > 1 ? { attempt: currentAttempt, max: config.maxIterations } : {}),
+            });
+        });
+        if (!onStatus)
+            log(chalk.dim(`\n  ⌛ Waiting for model response...`));
+        let viewer;
+        if (verbose && !onStatus) {
+            viewer = new StreamingFileViewer(shortPath);
+            generator.setTokenCallback(t => viewer.append(t));
+            viewer.start();
+        }
+        try {
+            generatedCode = attempt === 1
+                ? await generator.generate(context, gap, projectMemory)
+                : await generator.retry(lastError ?? '');
+        }
+        catch (err) {
+            viewer?.stop();
+            generator.setTokenCallback(undefined);
+            generator.setFirstTokenCallback(undefined);
+            if (err instanceof ModelStallError) {
+                if (stallRetries < MAX_STALL_RETRIES) {
+                    stallRetries++;
+                    if (!onStatus)
+                        log(chalk.yellow(`\n  ⌛ Model stalled — reconnecting (${stallRetries}/${MAX_STALL_RETRIES})...`));
+                    onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() });
+                    await new Promise(r => setTimeout(r, 3000));
+                    attempt--; // don't consume an AI iteration for a connection stall
+                    continue;
+                }
+            }
+            if (err instanceof TruncatedOutputError) {
+                lastError = TRUNCATION_RETRY_MESSAGE;
+                if (!onStatus)
+                    log(chalk.yellow(`\n  Output truncated — retrying with shorter output request...`));
+                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                continue;
+            }
+            if (err instanceof OscillationError) {
+                if (attempt < config.maxIterations) {
+                    if (!onStatus)
+                        log(chalk.yellow(`\n  ⚠ Agent loop detected — retrying with different strategy...`));
+                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                    generator.resetOscillationState();
+                    lastError = OSCILLATION_ESCAPE_MESSAGE;
+                    continue;
+                }
+                if (!onStatus)
+                    log(chalk.red(`\n  ⚠ Agent loop detected — output identical to a previous attempt. Stopping early.`));
+                onStatus?.({ phase: 'failed', file: shortPath });
+                await restoreTestFile(context.suggestedTestFile, originalTestContent);
+                return { success: false, error: err.message };
+            }
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!onStatus)
+                log(chalk.red(`\n  API error: ${msg}`));
+            onStatus?.({ phase: 'failed', file: shortPath });
+            return { success: false, error: msg };
+        }
+        viewer?.stop();
+        generator.setTokenCallback(undefined);
+        generator.setFirstTokenCallback(undefined);
+        if (dryRun) {
+            if (!onStatus) {
+                log(chalk.yellow('\n  [dry-run] Would write:'));
+                log(chalk.dim(generatedCode.split('\n').slice(0, 10).map((l) => `    ${l}`).join('\n')));
+                if (generatedCode.split('\n').length > 10)
+                    log(chalk.dim('    …'));
+            }
+            onStatus?.({ phase: 'passed', file: shortPath });
+            return { success: true, testCode: generatedCode };
+        }
+        // Patch mode: model returned surgical edits — apply them to get the complete file
+        if (generator.isPatch && patchBase) {
+            const patchResult = tryApplyPatchWithDiag(patchBase, generatedCode);
+            if (patchResult.ok) {
+                generatedCode = patchResult.result;
+                consecutivePatchFailures = 0;
+            }
+            else {
+                consecutivePatchFailures++;
+                if (consecutivePatchFailures >= 2) {
+                    // Escape hatch: after 2 failed patches the model can't anchor correctly.
+                    // Force a full-file rewrite on the next attempt so it bypasses patch matching entirely.
+                    lastError =
+                        `PATCH ANCHORS FAILED ${consecutivePatchFailures} TIMES — SWITCH TO FULL REWRITE MODE.\n` +
+                            `Your patch is not matching the file. On this attempt you MUST use <code_output> (NOT <code_patch>) and output the COMPLETE test file.\n` +
+                            `Include every existing test verbatim and add the new ones you need.\n` +
+                            `Do NOT use <code_patch> this time.`;
+                }
+                else {
+                    // Give the model the exact anchor text that failed so it can correct it
+                    const failedOp = patchResult.failedOp;
+                    const anchorBlock = failedOp
+                        ? `\nFailed operation: ${failedOp.type}\nAnchor that was NOT found in the file:\n"""\n${failedOp.anchor.slice(0, 600)}\n"""`
+                        : '';
+                    lastError =
+                        `PATCH APPLICATION FAILED: an anchor string in your patch was not found in the test file.${anchorBlock}\n\n` +
+                            `The anchor must be character-for-character identical to the text in the EXISTING TEST FILE shown in the original prompt.\n` +
+                            `Checklist:\n` +
+                            `  • REPLACE_TEST / DELETE_TEST anchor = exact it/test name string (without quotes)\n` +
+                            `  • ADD_AFTER_DESCRIBE anchor = exact describe() name string\n` +
+                            `  • REPLACE anchor = entire text block copied verbatim from the test file\n` +
+                            `Re-read the test file in the original prompt, locate the exact text, and rewrite your patch.`;
+                }
+                if (!onStatus)
+                    log(chalk.yellow(`  Patch anchors not found — retrying...`));
+                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                continue;
+            }
+        }
+        else if (!generator.isPatch) {
+            // Model switched to (or stayed in) full-file mode — reset patch failure counter
+            consecutivePatchFailures = 0;
+        }
+        // Strip thinking/prose that leaked before the first real code line.
+        // Happens under retry pressure when the model bleeds reasoning into <code_output>.
+        const { code: cleanCode, stripped: bleedText } = stripLeadingProse(generatedCode);
+        if (bleedText !== null) {
+            if (!onStatus)
+                log(chalk.yellow(`  ⚠ Thinking bleed detected — stripped: "${bleedText.slice(0, 80)}…"`));
+            generatedCode = cleanCode;
+        }
+        const MOCKS_SEPARATOR = '// ---MOCKS_FILE---';
+        const MOCKS_PATCH_SEPARATOR = '// ---MOCKS_PATCH---';
+        let testCode = generatedCode;
+        if (generatedCode.includes(MOCKS_PATCH_SEPARATOR) && config.mocksFile) {
+            // Surgical patch mode: model only emits the changed sections
+            const [newTestCode, patchContent] = generatedCode.split(MOCKS_PATCH_SEPARATOR);
+            testCode = newTestCode.trim();
+            if (patchContent?.trim()) {
+                const absoluteMocksFile = join(cwd, config.mocksFile);
+                let existing = '';
+                try {
+                    existing = await readFile(absoluteMocksFile, 'utf-8');
+                }
+                catch { /* new file — patch can't apply */ }
+                if (existing) {
+                    const applied = tryApplyMocksPatch(existing, patchContent.trim());
+                    if (applied) {
+                        if (applied.failedOps.length > 0) {
+                            const anchors = applied.failedOps.map(op => `"${op.oldText.slice(0, 60).replace(/\n/g, '↵')}"`).join(', ');
+                            lastError = `MOCKS PATCH FAILED: the following REPLACE anchor(s) were not found in the mock file:\n${anchors}\nAnchors must be copied character-for-character from the SHARED MOCK FILE shown above. Re-read it and rewrite your ---MOCKS_PATCH--- block.`;
+                            if (!onStatus)
+                                log(chalk.yellow(`  ⚠ Mock patch anchors not found — retrying...`));
+                            onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                            continue;
+                        }
+                        await writeFile(absoluteMocksFile, applied.result, 'utf-8');
+                        if (!onStatus)
+                            log(chalk.dim(`  Patched mocks file: ${config.mocksFile}`));
+                    }
+                }
+            }
+        }
+        else if (generatedCode.includes(MOCKS_SEPARATOR) && config.mocksFile) {
+            // Full-rewrite mode (new mock file or explicit full replacement)
+            const [newTestCode, newMocksCode] = generatedCode.split(MOCKS_SEPARATOR);
+            testCode = newTestCode.trim();
+            if (newMocksCode?.trim()) {
+                const { code: safeMocks, stripped } = sanitizeMocksContent(newMocksCode.trim());
+                if (stripped && !onStatus)
+                    log(chalk.yellow(`  ⚠ Mocks file contained test blocks — stripped before writing`));
+                if (safeMocks) {
+                    const absoluteMocksFile = join(cwd, config.mocksFile);
+                    await mkdir(dirname(absoluteMocksFile), { recursive: true });
+                    let existing = '';
+                    try {
+                        existing = await readFile(absoluteMocksFile, 'utf-8');
+                    }
+                    catch { /* new file */ }
+                    const merged = existing ? mergeMocksContent(existing, safeMocks) : safeMocks;
+                    await writeFile(absoluteMocksFile, merged, 'utf-8');
+                    if (!onStatus)
+                        log(chalk.dim(`  Updated mocks file: ${config.mocksFile}`));
+                }
+            }
+        }
+        testCode = deduplicateViMocks(testCode);
+        testCode = typeImportOriginalCalls(testCode);
+        testCode = ensureMockedImports(testCode);
+        testCode = dedupeImports(testCode);
+        testCode = dedupeTestBlocks(testCode);
+        // Catch empty test files before writing — no point running a file with no tests
+        if (!hasTestFunctions(testCode)) {
+            lastError =
+                'ERROR: The code you wrote contains NO test functions (no it() or test() calls).\n' +
+                    'Do not write a file with only imports, types, describe() blocks, or helper functions.\n' +
+                    'Every test file must contain at least one: it(\'description\', () => { expect(...).toBe(...) })\n' +
+                    'Rewrite the file and include real test cases.';
+            if (!onStatus)
+                log(chalk.yellow(`  Generated file has no tests — retrying...`));
+            onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+            continue;
+        }
+        onStatus?.({ phase: 'writing', file: shortPath });
+        await mkdir(dirname(context.suggestedTestFile), { recursive: true });
+        await writeFile(context.suggestedTestFile, testCode, 'utf-8');
+        // Next patch-mode retry anchors against what's actually on disk now (including tests this
+        // attempt added/changed), not the frozen original.
+        patchBase = testCode;
+        if (!onStatus)
+            log(chalk.dim(`  Written. Running tests...`));
+        onStatus?.({ phase: 'running', file: shortPath });
+        const runResult = await runCommand(testCmd, cwd);
+        if (runResult.success) {
+            // Reject placeholder test bodies — `{ // body }` passes vitest (no assertions)
+            // but produces zero coverage value. Force a retry with an explicit error.
+            if (hasPlaceholderBodies(testCode)) {
+                lastError =
+                    'ERROR: One or more test bodies contain placeholder comments (e.g. `// body`, `// TODO`) with no real assertions.\n' +
+                        'Every test must have complete, working expectations:\n' +
+                        '  it(\'description\', async () => {\n' +
+                        '    const result = await subject.doThing(...);\n' +
+                        '    expect(result).toEqual(expectedValue);\n' +
+                        '  })\n' +
+                        'Replace every `// body` placeholder with real arrange-act-assert code.';
+                if (!onStatus)
+                    log(chalk.yellow(`  Placeholder test bodies detected — retrying...`));
+                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                continue;
+            }
+            // Tests pass — but a "weak wait" (assert state right after a call-only waitFor) passes
+            // locally and fails in slow CI. The run-loop can't see it (it's green), so scan statically
+            // and nudge once. One-shot to bound the cost of a false positive.
+            if (!weakWaitNudged && attempt < config.maxIterations) {
+                const weakWait = detectWeakAsyncWait(testCode);
+                if (weakWait) {
+                    weakWaitNudged = true;
+                    lastError = weakWait;
+                    if (!onStatus)
+                        log(chalk.yellow(`  Tests pass but an async wait looks racy — strengthening it (retrying)...`));
+                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                    continue;
+                }
+            }
+            const typeErrors = await typeCheckFile(context.suggestedTestFile, cwd, env);
+            // Inconclusive (tsc timed out/crashed) is not an actionable type error — the tests pass,
+            // which is generate's contract, so don't burn a retry feeding the model a non-error.
+            if (typeErrors && typeErrors !== TYPECHECK_INCONCLUSIVE) {
+                if (attempt < config.maxIterations) {
+                    lastError = `Tests passed but TypeScript type errors were found in the generated file:\n${typeErrors}\n\nFix ALL type errors. Do not use 'as any' or '@ts-ignore'.`;
+                    if (!onStatus)
+                        log(chalk.yellow(`  Tests pass — fixing type errors (retrying)...`));
+                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                    continue;
+                }
+                // Last attempt — tests pass even though type errors remain.
+                // Report as passed rather than discarding a working test file.
+                const relTest = context.suggestedTestFile.replace(cwd + '/', '');
+                if (!onStatus)
+                    log(chalk.yellow(`  ⚠ Type errors remain — tests pass. Run \`lacuna fix --file ${relTest}\` to clean up types.`));
+            }
+            else {
+                if (!onStatus)
+                    log(chalk.green(`  Tests passed.`));
+            }
+            // Format the accepted file with the repo's own eslint/prettier so it matches local style
+            // and clears the lint gate (best-effort, behavior-preserving — no re-run needed).
+            if (!dryRun) {
+                await formatFile(context.suggestedTestFile, cwd, { enabled: config.format, env });
+                // A DOM-free test pays the jsdom startup tax for nothing — route it to the node
+                // environment via a docblock (verified per-file, reverted if it breaks the test).
+                const routed = await routeTestToNodeEnv(context.suggestedTestFile, cwd, { enabled: config.nodeEnvRouting, env });
+                if (routed && !onStatus)
+                    log(chalk.dim(`  ↳ DOM-free — routed to the node environment (skips jsdom startup).`));
+            }
+            onStatus?.({ phase: 'passed', file: shortPath });
+            return { success: true, testCode };
+        }
+        const rawRunOutput = runResult.stdout + '\n' + runResult.stderr;
+        const rawExtracted = extractTestFailure(rawRunOutput);
+        const extracted = enrichNoTestsError(rawExtracted, rawRunOutput);
+        const passCount = parsePassCount(rawRunOutput);
+        if (!isZeroTestsOutput(rawRunOutput) && passCount > bestPassCount) {
+            bestPassCount = passCount;
+            bestCode = testCode;
+        }
+        if (attempt === 1) {
+            firstError = extracted;
+            firstPassCount = passCount;
+            lastError = extracted;
+            if (!onStatus)
+                log(chalk.red(`  Tests failed (attempt ${attempt}/${config.maxIterations})`));
+        }
+        else if (isZeroTestsOutput(rawRunOutput)) {
+            lastError = buildStructureBrokenMessage(firstError, rawExtracted);
+            if (!onStatus)
+                log(chalk.red(`  Fix broke file structure — 0 tests collected (attempt ${attempt}/${config.maxIterations})`));
+        }
+        else if (passCount < firstPassCount) {
+            lastError = buildRegressionMessage(firstError, extracted, firstPassCount, passCount);
+            if (!onStatus)
+                log(chalk.red(`  Fix caused regression: ${firstPassCount} → ${passCount} passing (attempt ${attempt}/${config.maxIterations})`));
+        }
+        else {
+            lastError = extracted;
+            if (!onStatus)
+                log(chalk.red(`  Tests failed (attempt ${attempt}/${config.maxIterations})`));
+        }
+        if (!onStatus && verbose)
+            log(chalk.dim(lastError.split('\n').slice(0, 20).join('\n')));
+    }
+    onStatus?.({ phase: 'failed', file: shortPath });
+    const rel = context.suggestedTestFile.replace(cwd + '/', '');
+    const keepHint = () => {
+        if (!onStatus)
+            log(chalk.yellow(`\n  Kept ${bestPassCount} passing test(s) at ${rel} — run ${chalk.cyan(`lacuna fix --file ${rel}`)} to repair the remaining failures`));
+    };
+    if (originalTestContent === null) {
+        // New file — keep the best collecting attempt so `lacuna fix` can repair it.
+        if (bestCode !== null) {
+            await writeFile(context.suggestedTestFile, bestCode, 'utf-8');
+            keepHint();
+        }
+        else if (!onStatus)
+            log(chalk.yellow(`\n  Last attempt kept at ${rel} — run ${chalk.cyan(`lacuna fix --file ${rel}`)} to repair it`));
+    }
+    else if (parallel && bestCode !== null) {
+        // Existing file with a clean, collecting attempt. Keep it ONLY if it adds net-new passing
+        // tests vs the original — otherwise the generated tests broke the suite or added no value,
+        // so restore the original. parallel ⇒ testCmd is file-scoped, so parsePassCount reflects
+        // this file and the comparison is sound. Measure the baseline lazily (only here on failure).
+        await writeFile(context.suggestedTestFile, originalTestContent, 'utf-8');
+        const baseRun = await runCommand(testCmd, cwd);
+        const baselinePassCount = parsePassCount(baseRun.stdout + '\n' + baseRun.stderr);
+        if (bestPassCount > baselinePassCount) {
+            await writeFile(context.suggestedTestFile, bestCode, 'utf-8');
+            keepHint();
+        }
+        else if (!onStatus) {
+            log(chalk.dim(`\n  Generated tests didn't improve on the existing file (${baselinePassCount} passing) — restored the original.`));
+        }
+    }
+    else {
+        // Existing file under a full-suite run (per-file pass count not measurable) or no clean
+        // attempt — restore the original so the workspace stays coherent.
+        await restoreTestFile(context.suggestedTestFile, originalTestContent);
+    }
+    return {
+        success: false,
+        error: `Tests still failing after ${config.maxIterations} attempts. Last error:\n${lastError?.slice(0, 1500)}`,
+    };
+}
+async function restoreTestFile(testPath, original) {
+    try {
+        if (original !== null) {
+            await writeFile(testPath, original, 'utf-8');
+        }
+        else {
+            await unlink(testPath);
+        }
+    }
+    catch { /* best-effort */ }
+}
+async function runWorkerPool(gaps, options, workerCount, projectMemory) {
+    const tips = getActiveTips({
+        workers: workerCount,
+        targetFile: options.targetFile,
+        verbose: options.verbose,
+        dryRun: options.dryRun,
+        fresh: options.fresh,
+        model: options.config.model,
+        threshold: options.config.threshold,
+        mocksFile: options.config.mocksFile,
+        ignore: options.config.ignore,
+        command: 'generate',
+    });
+    const display = new WorkerDisplay(workerCount, gaps.length, tips);
+    const queue = [...gaps];
+    let filesProcessed = 0;
+    let testsWritten = 0;
+    const errors = [];
+    display.start();
+    const workers = Array.from({ length: workerCount }, async (_, wi) => {
+        const generator = new TestGenerator({
+            config: options.config,
+            env: options.env,
+            // suppress token streaming in parallel mode — display is the UI
+        });
+        while (true) {
+            const gap = queue.shift();
+            if (!gap)
+                break;
+            const onStatus = (state) => display.update(wi, state);
+            const result = await processGap(gap, { ...options, log: () => { }, verbose: false }, generator, true, onStatus, projectMemory);
+            filesProcessed++;
+            if (result.success)
+                testsWritten++;
+            else if (result.error)
+                errors.push(result.error);
+        }
+    });
+    await Promise.all(workers);
+    display.finish();
+    return { filesProcessed, testsWritten, errors };
+}
+// Coverage report is considered fresh for 10 minutes — lets `analyze` then `generate` share one run.
+const COVERAGE_CACHE_TTL_S = 600;
+export async function runAgentLoop(options) {
+    const { config, env, cwd, log } = options;
+    const workerCount = Math.max(1, Math.min(options.workers ?? 1, 10));
+    const parallel = workerCount > 1;
+    // ─── Single-file fast path ────────────────────────────────────────────────────
+    // Skip the coverage suite entirely. Build a synthetic gap that treats the whole
+    // file as uncovered — the AI reads the source and writes comprehensive tests.
+    // Uses fileTestCommand (not the full suite) to verify the generated tests pass.
+    // With @diff, --file instead NARROWS the diff scope to that file (handled below) —
+    // the fast path is skipped because diff mode needs the coverage report.
+    if (options.targetFile) {
+        const abs = options.targetFile.startsWith('/')
+            ? options.targetFile
+            : join(cwd, options.targetFile);
+        // Fail fast if the user passed a test file instead of a source file (both modes).
+        const isTestPath = /\.(test|spec)\.[jt]sx?$/.test(abs)
+            || abs.includes('__tests__/')
+            || /\/test_[^/]+\.[jt]sx?$/.test(abs)
+            || abs.endsWith('_test.go');
+        if (isTestPath) {
+            throw new Error(`"${options.targetFile}" looks like a test file, not a source file.\n` +
+                `Pass the source file you want tests generated for.\n` +
+                `Example: lacuna generate --file ${options.targetFile.replace(/__tests__\//, '').replace(/\.(test|spec)(\.[jt]sx?)$/, '$2')}`);
+        }
+        if (options.diffRef === undefined) {
+            const gap = {
+                filePath: abs,
+                uncoveredLines: [],
+                uncoveredFunctions: [],
+            };
+            const memory = new ProjectMemory();
+            await memory.initialize(cwd, env, config);
+            const generator = new TestGenerator({ config, env });
+            const result = await processGap(gap, options, generator, true, undefined, memory.toPromptSection());
+            return {
+                filesProcessed: 1,
+                testsWritten: result.success ? 1 : 0,
+                coverageBefore: 0,
+                coverageAfter: 0,
+                hasCoverage: false,
+                errors: result.error ? [result.error] : [],
+            };
+        }
+    }
+    // ─── Full suite path ──────────────────────────────────────────────────────────
+    // Scope/improve setup. `scopeDir` (absolute) restricts discovery + the coverage run to a
+    // subtree; it also implies improve-existing (raise every file under the dir to threshold,
+    // creating OR extending tests). `--improve` enables the same create+improve repo-wide.
+    const scopeDir = options.scopeDir;
+    const scopeRel = scopeDir ? scopeDir.replace(cwd + '/', '').replace(/\/+$/, '') : undefined;
+    // Diff (patch-coverage) scope: resolve base + changed lines up front so an unresolvable
+    // base fails fast (before a long coverage run) and a docs-only diff exits cleanly without
+    // running the suite at all.
+    const diffMode = options.diffRef !== undefined;
+    let diffScope = null;
+    if (diffMode) {
+        diffScope = await resolveDiffScope(cwd, options.diffRef || undefined);
+        // `--file` + @diff = the intersection: only that file's changed lines are targets
+        // (and patch coverage is measured over just those lines).
+        if (options.targetFile) {
+            const absTarget = options.targetFile.startsWith('/') ? options.targetFile : join(cwd, options.targetFile);
+            const kept = diffScope.changed.get(absTarget);
+            diffScope = { ...diffScope, changed: kept ? new Map([[absTarget, kept]]) : new Map() };
+        }
+        if (diffScope.changed.size === 0) {
+            const where = options.targetFile ? `in ${options.targetFile}` : 'in the diff';
+            log(chalk.green(`\nNo changed source lines ${where} vs ${diffScope.baseRef} — nothing to cover.`));
+            return {
+                filesProcessed: 0, testsWritten: 0, coverageBefore: 0, coverageAfter: 0,
+                hasCoverage: false, patchCoverageBefore: 100, patchCoverageAfter: 100,
+                diffBase: diffScope.baseRef, errors: [],
+            };
+        }
+    }
+    const improveExisting = options.improve === true || !!scopeDir || diffMode;
+    // Verify each file with its own file-scoped command (like single-file mode) whenever we're
+    // improving — so we never run the whole suite per file and the keep-best-vs-baseline branch
+    // applies to existing tests. Parallel mode already verifies per-file.
+    const perFileVerify = improveExisting || parallel;
+    // Pick the coverage command. Scoped (vitest/jest) keeps a dir-scoped run cheap; null → full
+    // command + report post-filter. **Patch mode uses the FULL command, never a narrowed one**:
+    // patch coverage must match what Codecov measured, and Codecov's number comes from the whole
+    // CI suite. A narrowed run (`vitest related` / one dir) executes only a SUBSET of the tests
+    // that cover the changed file — any line covered solely by a test outside that subset (an
+    // integration/DI test that reaches the method indirectly) looks uncovered, so lacuna would
+    // over-target lines Codecov shows green. The cheap path in patch mode is REUSING an existing
+    // full report (below), not running a smaller one.
+    const scopedCmd = (scopeRel && !diffMode) ? scopedCoverageCommand(env, scopeRel) : null;
+    const coverageCommand = scopedCmd ?? env.coverageCommand;
+    // The changed target file (relative), for the cheap diff-mode AFTER measurement only.
+    const relTargetFile = diffMode && options.targetFile
+        ? (options.targetFile.startsWith('/') ? options.targetFile.replace(cwd + '/', '') : options.targetFile)
+        : undefined;
+    const existingTests = await findTestFiles(cwd, {}, config, scopeDir);
+    let hasTests = existingTests.length > 0;
+    let report = { files: [], totalLineRate: 0, totalFunctionRate: 0 };
+    if (!hasTests) {
+        const where = scopeRel ? ` under ${scopeRel}` : '';
+        log(chalk.dim(`  No test files yet${where} — scanning source files for coverage gaps.`));
+    }
+    else {
+        // Scoped runs always run fresh: the time-cache holds a whole-repo report whose freshness
+        // says nothing about this scope, and a scoped run rewrites lcov with scope-only data.
+        const ageSeconds = scopeDir ? null : await coverageAgeSeconds(config, cwd);
+        // Patch mode INTERPRETS an existing coverage measurement (ideally the one CI uploaded to
+        // Codecov), so any on-disk full report is reused regardless of age — only `--fresh` forces
+        // a re-run. This is the fast path: point lacuna at the report your `test:cov`/CI produced
+        // and it reads it instantly instead of re-running the suite. Non-diff runs keep the 10-min TTL.
+        const useCached = !options.fresh && ageSeconds !== null && (diffMode || ageSeconds < COVERAGE_CACHE_TTL_S);
+        if (useCached) {
+            const freshness = ageSeconds < 90 ? `${Math.round(ageSeconds)}s old`
+                : ageSeconds < 5400 ? `${Math.round(ageSeconds / 60)}m old`
+                    : `${Math.round(ageSeconds / 3600)}h old`;
+            const hint = diffMode
+                ? `  Reusing existing coverage report (${freshness}). This must be a FULL-suite report (your test:cov / CI) to match Codecov. Pass --fresh to re-run.`
+                : `  Using cached coverage report (${freshness}). Pass --fresh to re-run the suite.`;
+            log(chalk.dim(hint));
+        }
+        else {
+            if (diffMode) {
+                log(chalk.yellow(`  No coverage report on disk — running the FULL suite to match Codecov's measurement (this can be slow).`));
+                log(chalk.dim(`  Tip: run your coverage script once (e.g. npm run test:cov) or reuse the CI lcov, then re-run — lacuna will read it instantly.`));
+            }
+            const label = scopeRel
+                ? `  Running tests under ${scopeRel} to collect coverage...`
+                : '  Running test suite to collect coverage...';
+            const spinner = startCoverageSpinner(chalk.dim(label), env.testRunner);
+            const coverageResult = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine);
+            spinner.stop();
+            if (coverageResult.timedOut) {
+                throw new Error(`Test suite timed out after ${config.coverageTimeout}s.\n\n` +
+                    `This usually means a test has an open handle (unclosed server, timer, or connection).\n` +
+                    `Try running: ${env.testCommand} --reporter=verbose\n` +
+                    `Or increase the timeout in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`);
+            }
+            const coverageOutput = coverageResult.stdout + coverageResult.stderr;
+            if (/Tests:\s+0 total/i.test(coverageOutput)) {
+                throw new Error(`Your test suites are failing before any tests run.\n\n` +
+                    `This usually means a missing environment variable, broken import, or setup file error.\n` +
+                    `Run: ${env.testCommand} 2>&1 | head -80\nto see the actual error.`);
+            }
+            // When ALL tests are failing (0 passed), the lcov data is unreliable —
+            // failing tests still execute source lines, inflating coverage to 50–100%.
+            // Fall back to source-file scanning so gaps are found correctly.
+            // The user should run `lacuna fix` to repair failing tests afterward.
+            if (parsePassCount(coverageOutput) === 0) {
+                hasTests = false;
+            }
+        }
+        if (hasTests) {
+            try {
+                report = await loadCoverage(config, cwd);
+            }
+            catch {
+                throw new Error(`Could not read coverage report from ./${config.coverageDir}/`);
+            }
+        }
+    }
+    const coverageBefore = report.totalLineRate * 100;
+    // includeExisting keeps below-threshold files that ALREADY have a test, so the loop extends
+    // them instead of skipping — the create+improve behavior of a scoped/`--improve` run.
+    // Diff mode ignores the per-file threshold entirely (101 keeps every file with any uncovered
+    // line): a file at 94% overall can still have uncovered CHANGED lines — that's the exact
+    // patch-coverage case this mode exists for.
+    const gaps = await filterTestableGaps(extractGaps(report, diffMode ? 101 : config.threshold), config.ignore, { includeExisting: improveExisting });
+    const untouchedFiles = await findUncoveredFiles(report, config.sourceDir, cwd, config.ignore, scopeDir);
+    const existingPaths = new Set(gaps.map((g) => g.filePath));
+    for (const g of untouchedFiles) {
+        if (!existingPaths.has(g.filePath))
+            gaps.push(g);
+    }
+    // Diff mode: keep only gaps in changed files, each narrowed to its changed-and-uncovered
+    // lines. Patch coverage is measured over the same changed-line set; changed testable files
+    // with no coverage entry count as fully uncovered (the untested-new-file case). A changed
+    // file with an existing-but-unexecuted test file is in neither the report nor the gap set —
+    // pull it in explicitly so its changed lines aren't silently counted as covered.
+    let diffGaps = gaps;
+    let patchCoverageBefore;
+    if (diffScope) {
+        gaps.push(...await missingChangedFileGaps(diffScope.changed, report, gaps, cwd, config.ignore));
+        diffGaps = narrowGapsToDiff(gaps, diffScope.changed, report, cwd);
+        patchCoverageBefore = computePatchCoverage(report, diffScope.changed, cwd, filesOutsideReport(diffGaps, report, cwd)).pct;
+    }
+    // Restrict to the scope subtree. extractGaps paths come from lcov (absolute OR relative), so
+    // normalize before the prefix test; untouched files are already absolute and scope-walked.
+    const scopedGaps = scopeDir
+        ? gaps.filter((g) => isWithinDir(g.filePath.startsWith('/') ? g.filePath : join(cwd, g.filePath), scopeDir))
+        : diffGaps;
+    if (scopedGaps.length === 0) {
+        if (diffScope) {
+            const pct = patchCoverageBefore ?? 100;
+            log(chalk.green(`\nAll testable changed lines vs ${diffScope.baseRef} are already covered — nothing to generate.`));
+            log(chalk.dim(`  Patch coverage: ${pct.toFixed(1)}%`));
+            return {
+                filesProcessed: 0, testsWritten: 0, coverageBefore, coverageAfter: coverageBefore,
+                hasCoverage: true, patchCoverageBefore: pct, patchCoverageAfter: pct,
+                diffBase: diffScope.baseRef, errors: [],
+            };
+        }
+        const where = scopeRel ? ` under ${scopeRel}` : '';
+        if (coverageBefore < config.threshold && !improveExisting) {
+            log(chalk.yellow(`\n⚠ Coverage is ${coverageBefore.toFixed(1)}% — below the ${config.threshold}% threshold.`));
+            log(chalk.dim('  Every source file already has a test file, so there is nothing new to generate.'));
+            log(chalk.dim('  Run `lacuna fix` to repair the failing tests and raise coverage.'));
+        }
+        else {
+            log(chalk.green(`\nAll files${where} already meet the ${config.threshold}% threshold.`));
+        }
+        return { filesProcessed: 0, testsWritten: 0, coverageBefore, coverageAfter: coverageBefore, hasCoverage: true, errors: [] };
+    }
+    if (diffScope) {
+        const targetLines = scopedGaps.reduce((n, g) => n + g.uncoveredLines.length, 0);
+        log(chalk.bold(`\nFound ${scopedGaps.length} changed file(s) vs ${diffScope.baseRef} with uncovered changed lines (${targetLines} target line(s)).`));
+        log(chalk.dim(`Patch coverage before: ${(patchCoverageBefore ?? 0).toFixed(1)}%`));
+    }
+    else {
+        const scopeNote = scopeRel ? ` under ${scopeRel}` : '';
+        log(chalk.bold(`\nFound ${scopedGaps.length} file(s)${scopeNote} below ${config.threshold}% threshold.`));
+        log(chalk.dim(`Coverage before: ${coverageBefore.toFixed(1)}%`));
+    }
+    if (parallel) {
+        if (options.verbose)
+            log(chalk.dim(`  (--verbose is not shown in parallel mode — use --workers 1 to see the live code panel)`));
+        log(chalk.dim(`\nWorkers: ${workerCount}\n`));
+    }
+    // Build project memory once — shared snapshot for all files in this run
+    const memory = new ProjectMemory();
+    await memory.initialize(cwd, env, config);
+    const memorySnapshot = memory.toPromptSection();
+    let filesProcessed;
+    let testsWritten;
+    let errors;
+    if (parallel) {
+        ;
+        ({ filesProcessed, testsWritten, errors } = await runWorkerPool(scopedGaps, options, workerCount, memorySnapshot));
+    }
+    else {
+        filesProcessed = 0;
+        testsWritten = 0;
+        errors = [];
+        const generator = new TestGenerator({ config, env });
+        const tips = getActiveTips({
+            workers: 1,
+            targetFile: options.targetFile,
+            verbose: options.verbose,
+            dryRun: options.dryRun,
+            fresh: options.fresh,
+            model: config.model,
+            threshold: config.threshold,
+            mocksFile: config.mocksFile,
+            ignore: config.ignore,
+            command: 'generate',
+        });
+        const nextTip = createTipRotator(tips);
+        for (const gap of scopedGaps) {
+            const tip = nextTip();
+            if (tip)
+                log(formatTip(tip));
+            const result = await processGap(gap, options, generator, perFileVerify, undefined, memory.toPromptSection());
+            filesProcessed++;
+            if (result.success) {
+                testsWritten++;
+                // Update memory so subsequent files learn from patterns in this one
+                if (result.testCode) {
+                    memory.recordSuccess(gap.filePath.replace(cwd + '/', ''), result.testCode);
+                }
+            }
+            else if (result.error)
+                errors.push(result.error);
+        }
+    }
+    // Final coverage measurement. The per-file runs that verified each generated test executed
+    // WITHOUT coverage instrumentation — true for every parallel-worker run AND for scoped/improve
+    // sequential runs (both use the file-scoped command). So coverage on disk is stale; re-run once
+    // (scoped command when scoped) to get a real after-%. Classic unscoped sequential generate
+    // already verified via the full suite and is left untouched (no extra pass for everyone).
+    // DIFF MODE skips this: we do NOT re-run the whole suite for the after-number — see below.
+    if (!options.dryRun && testsWritten > 0 && (parallel || perFileVerify) && !diffMode) {
+        const measureLabel = scopeRel
+            ? `\n  Measuring coverage under ${scopeRel}...`
+            : '\n  Running full suite for final coverage measurement...';
+        const finalSpinner = startCoverageSpinner(chalk.dim(measureLabel), env.testRunner);
+        await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, finalSpinner.onLine);
+        finalSpinner.stop();
+    }
+    // Only measure coverage after if at least one test was written — otherwise the failing
+    // generated files execute source code and report misleading 100% coverage. (Diff mode keeps
+    // the reused before-report on disk — the full re-run was skipped — so this reads that; the
+    // overall % isn't the diff-mode gate anyway, patch coverage is.)
+    const coverageAfter = (options.dryRun || testsWritten === 0) ? coverageBefore : await getCoverageRate(config, cwd);
+    // Diff mode after-number, computed CHEAPLY: the accurate before-report already holds every
+    // other test's coverage, so we only need the NEW test's incremental coverage of the changed
+    // files. Run a narrow related/scoped pass (seconds), then UNION its hits with the before-report
+    // — a line is covered-after if it was covered before OR the new test now covers it. (A narrow
+    // run is safe as a union addend even though it was unsafe as a before REPLACEMENT.)
+    let patchCoverageAfter = patchCoverageBefore;
+    if (diffScope && !options.dryRun && testsWritten > 0) {
+        try {
+            const afterCmd = relTargetFile
+                ? (relatedCoverageCommand(env, relTargetFile) ?? env.coverageCommand)
+                : env.coverageCommand;
+            const spin = startCoverageSpinner(chalk.dim(relTargetFile
+                ? `\n  Measuring new coverage of ${relTargetFile}...`
+                : '\n  Measuring new patch coverage...'), env.testRunner);
+            await runCommand(afterCmd, cwd, config.coverageTimeout * 1000, spin.onLine);
+            spin.stop();
+            const incremental = await loadCoverage(config, cwd);
+            const merged = mergeReportHits(report, incremental, cwd);
+            patchCoverageAfter = computePatchCoverage(merged, diffScope.changed, cwd, filesOutsideReport(scopedGaps, merged, cwd)).pct;
+        }
+        catch { /* keep the before value */ }
+    }
+    // In improve mode we deliberately do NOT chase the threshold with contrived tests (see the
+    // "COVERAGE IS A MEANS, NOT THE GOAL" prompt rule). So landing below the threshold is an
+    // expected, healthy outcome — surface it as intentional so the reporter's red "FAIL" line
+    // isn't read as a defect. (Diff mode gates on patch coverage instead — skip the note.)
+    if (!options.dryRun && testsWritten > 0 && improveExisting && !diffMode && coverageAfter < config.threshold) {
+        log(chalk.dim(`\n  Note: coverage is ${coverageAfter.toFixed(1)}% (under the ${config.threshold}% threshold). The remaining uncovered lines are defensive/edge branches left uncovered by design — a contrived test there (impossible inputs, quirk assertions) would be worse than the gap. This is expected, not a failure.`));
+    }
+    return {
+        filesProcessed, testsWritten, coverageBefore, coverageAfter, hasCoverage: true,
+        ...(diffScope ? { patchCoverageBefore, patchCoverageAfter, diffBase: diffScope.baseRef } : {}),
+        errors,
+    };
+}
+// Unions two coverage reports at the line level: a line is covered in the result if it was
+// covered in EITHER input (hit = max of the two). Used for the diff-mode after-number so the
+// accurate full before-report and the cheap incremental new-test run combine correctly. Only
+// line hits matter for patch coverage; functions are carried from `base` unchanged.
+function mergeReportHits(base, incr, cwd) {
+    const abs = (p) => (p.startsWith('/') ? p : join(cwd, p));
+    const byPath = new Map();
+    for (const f of base.files)
+        byPath.set(abs(f.path), { ...f, lines: f.lines.map((l) => ({ ...l })) });
+    for (const f of incr.files) {
+        const key = abs(f.path);
+        const existing = byPath.get(key);
+        if (!existing) {
+            byPath.set(key, { ...f, lines: f.lines.map((l) => ({ ...l })) });
+            continue;
+        }
+        const hitByLine = new Map(existing.lines.map((l) => [l.line, l.hit]));
+        for (const l of f.lines)
+            hitByLine.set(l.line, Math.max(hitByLine.get(l.line) ?? 0, l.hit));
+        existing.lines = [...hitByLine].map(([line, hit]) => ({ line, hit }));
+    }
+    return { files: [...byPath.values()], totalLineRate: base.totalLineRate, totalFunctionRate: base.totalFunctionRate };
+}
+// Absolute paths of gap files that have NO entry in the coverage report — their changed
+// lines are assumed fully uncovered for patch-coverage purposes (untested-new-file case).
+function filesOutsideReport(gaps, report, cwd) {
+    const reportPaths = new Set(report.files.map((f) => (f.path.startsWith('/') ? f.path : join(cwd, f.path))));
+    const outside = new Set();
+    for (const g of gaps) {
+        const abs = g.filePath.startsWith('/') ? g.filePath : join(cwd, g.filePath);
+        if (!reportPaths.has(abs))
+            outside.add(abs);
+    }
+    return outside;
+}
+//# sourceMappingURL=loop.js.map

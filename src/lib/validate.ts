@@ -353,6 +353,119 @@ export function dedupeImports(code: string): string {
   return out.join('\n')
 }
 
+// Top-level keys of the object literal whose opening `{` is at `objOpen`. String/comment/template
+// aware; returns identifiers used as keys at depth 1 (`useApp:`, `'useApp':`), skipping nested
+// object keys (`WalletService: { getBanks: … }` yields `WalletService`, not `getBanks`).
+function objectLiteralTopKeys(code: string, objOpen: number): string[] {
+  const end = scanToMatchingBrace(code, objOpen)
+  if (end < 0) return []
+  const keys: string[] = []
+  let depth = 0
+  let atPropStart = false
+  for (let i = objOpen; i <= end; i++) {
+    const ch = code[i]
+    if (ch === '/' && code[i + 1] === '/') { i += 2; while (i <= end && code[i] !== '\n') i++; continue }
+    if (ch === '/' && code[i + 1] === '*') { i += 2; while (i <= end && !(code[i] === '*' && code[i + 1] === '/')) i++; i++; continue }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const q = ch; i++
+      while (i <= end) { if (code[i] === '\\') { i += 2; continue } if (code[i] === q) break; i++ }
+      continue
+    }
+    if (ch === '{') { depth++; if (depth === 1) atPropStart = true; continue }
+    if (ch === '}') { depth--; continue }
+    if (ch === '(' || ch === '[') { depth++; continue }
+    if (ch === ')' || ch === ']') { depth--; continue }
+    if (depth === 1 && ch === ',') { atPropStart = true; continue }
+    if (depth === 1 && atPropStart) {
+      const m = code.slice(i, end + 1).match(/^\s*(?:([A-Za-z_$][\w$]*)|['"]([A-Za-z_$][\w$]*)['"])\s*:/)
+      if (m) { keys.push(m[1] ?? m[2]); atPropStart = false }
+      else if (!/\s/.test(ch)) atPropStart = false   // spread / shorthand / method — not a plain key
+    }
+  }
+  return [...new Set(keys)]
+}
+
+// Blank out string/template/comment CONTENT (preserving length & newlines) so a name appearing
+// only inside a literal — `getByText('Wallet')` — isn't counted as an identifier use.
+function blankStringsAndComments(code: string): string {
+  let out = ''
+  let i = 0
+  while (i < code.length) {
+    const ch = code[i]
+    if (ch === '/' && code[i + 1] === '/') { while (i < code.length && code[i] !== '\n') { out += ' '; i++ } continue }
+    if (ch === '/' && code[i + 1] === '*') { out += '  '; i += 2; while (i < code.length && !(code[i] === '*' && code[i + 1] === '/')) { out += code[i] === '\n' ? '\n' : ' '; i++ } out += '  '; i += 2; continue }
+    if (ch === '"' || ch === "'" || ch === '`') {
+      const q = ch; out += ' '; i++
+      while (i < code.length) { if (code[i] === '\\') { out += '  '; i += 2; continue } if (code[i] === q) { out += ' '; i++; break } out += code[i] === '\n' ? '\n' : ' '; i++ }
+      continue
+    }
+    out += ch; i++
+  }
+  return out
+}
+
+// When a test mocks a module with a factory — `jest.mock('@/context/AppContext', () => ({ useApp:
+// jest.fn() }))` — and then references an export by BARE name to configure it — `(useApp as
+// jest.Mock).mockReturnValue(...)` — that name MUST be imported from the module. jest/vitest hoist
+// the mock, so `import { useApp } from '@/context/AppContext'` binds to the mock fn. Models
+// sometimes emit the mock but forget the import, so `useApp` is undefined and EVERY test throws
+// `ReferenceError: useApp is not defined`. This scans factory mocks and injects the missing import
+// for any exported name that's used outside the factory and isn't already imported or locally
+// declared. Deterministic and safe — it only ever ADDS a binding the mock already guarantees.
+export function ensureMockedImports(code: string): string {
+  const mockCallRe = /\b(?:jest|vi)\.mock\s*\(\s*(['"])([^'"]+)\1\s*,\s*(?:async\s*)?\([^)]*\)\s*=>/g
+  const mocks: { path: string; names: string[]; objOpen: number; objEnd: number }[] = []
+  for (let m = mockCallRe.exec(code); m; m = mockCallRe.exec(code)) {
+    // Locate the factory's returned object `{`: either `=> ({ … })` or `=> { return { … } }`.
+    let k = mockCallRe.lastIndex
+    while (k < code.length && /\s/.test(code[k])) k++
+    let objOpen = -1
+    if (code[k] === '(') { k++; while (k < code.length && /\s/.test(code[k])) k++; if (code[k] === '{') objOpen = k }
+    else if (code[k] === '{') { const r = code.indexOf('return', k); if (r >= 0) { let j = r + 6; while (j < code.length && /\s/.test(code[j])) j++; if (code[j] === '{') objOpen = j } }
+    if (objOpen < 0) continue
+    const objEnd = scanToMatchingBrace(code, objOpen)
+    if (objEnd < 0) continue
+    mocks.push({ path: m[2], names: objectLiteralTopKeys(code, objOpen), objOpen, objEnd })
+  }
+  if (mocks.length === 0) return code
+
+  // Mask factory object bodies so their keys aren't mistaken for "uses", and blank string/comment
+  // content so a name that only appears as asserted TEXT (`getByText('Wallet')`) isn't either.
+  let masked = code
+  for (const mk of mocks) masked = masked.slice(0, mk.objOpen) + ' '.repeat(mk.objEnd - mk.objOpen + 1) + masked.slice(mk.objEnd + 1)
+  masked = blankStringsAndComments(masked)
+
+  const lines = code.split('\n')
+  const bound = new Set<string>()   // names already imported (so a duplicate import isn't added)
+  for (const stmt of iterImportStatements(lines)) {
+    const p = parseImportStatement(stmt.text)
+    if (p) { for (const n of p.names) bound.add(n); if (p.def) bound.add(p.def) }
+  }
+
+  const need = new Map<string, Set<string>>()
+  for (const mk of mocks) {
+    for (const name of mk.names) {
+      if (bound.has(name)) continue
+      if (new RegExp(`\\b(?:const|let|var|function|class)\\s+${name}\\b`).test(masked)) continue  // locally declared
+      if (!new RegExp(`\\b${name}\\b`).test(masked)) continue                                      // never used outside factory
+      const s = need.get(mk.path) ?? new Set<string>()
+      s.add(name)
+      need.set(mk.path, s)
+    }
+  }
+  if (need.size === 0) return code
+
+  let outLines = code.split('\n')
+  for (const [path, namesSet] of need) {
+    const stmt = `import { ${[...namesSet].join(', ')} } from '${path}';`
+    if (!mergeNamedImportIntoExisting(outLines, stmt)) {
+      const at = lastImportStatementEndIdx(outLines)
+      outLines.splice(at + 1, 0, stmt)
+    }
+  }
+  return outLines.join('\n')
+}
+
 // Merges duplicate vi.mock() calls for the same module path into one.
 // The model sometimes emits two vi.mock('lucide-react', ...) blocks when a component
 // imports many icons — the second overrides the first, silently dropping exports.
