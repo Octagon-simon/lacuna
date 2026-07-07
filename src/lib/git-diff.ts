@@ -1,5 +1,6 @@
 import { join } from 'path'
 import { runCommand } from './runner.js'
+import { isWithinDir } from './coverage/gaps.js'
 
 // Diff scope for patch-coverage mode (`lacuna generate @diff[:<ref>]`): which lines this
 // branch added/modified relative to the merge-base with the base ref. Matches Codecov's
@@ -134,6 +135,17 @@ export function parseUnifiedDiff(diffOutput: string, cwd: string): Map<string, S
     if (lines.size === 0) changed.delete(path)   // file had only deletion hunks
   }
   return changed
+}
+
+// Narrows a diff scope to only the changed files that live under `absDir` — the
+// `@diff <dir>` case (patch coverage of just the changed lines inside a folder). The
+// base ref / merge-base are untouched; only the changed-line map is filtered.
+export function scopeDiffToDir(scope: DiffScope, absDir: string): DiffScope {
+  const changed = new Map<string, Set<number>>()
+  for (const [path, lines] of scope.changed) {
+    if (isWithinDir(path, absDir)) changed.set(path, lines)
+  }
+  return { ...scope, changed }
 }
 
 // Total changed-line count across all files — used for the CLI header.

@@ -1,5 +1,6 @@
 import { join } from 'path';
 import { runCommand } from './runner.js';
+import { isWithinDir } from './coverage/gaps.js';
 // Only source files can carry patch coverage — everything else (docs, configs, lockfiles)
 // is skipped at parse time. Testability (types-only files etc.) is filtered downstream by
 // the same gap pipeline the rest of lacuna uses.
@@ -108,6 +109,17 @@ export function parseUnifiedDiff(diffOutput, cwd) {
             changed.delete(path); // file had only deletion hunks
     }
     return changed;
+}
+// Narrows a diff scope to only the changed files that live under `absDir` — the
+// `@diff <dir>` case (patch coverage of just the changed lines inside a folder). The
+// base ref / merge-base are untouched; only the changed-line map is filtered.
+export function scopeDiffToDir(scope, absDir) {
+    const changed = new Map();
+    for (const [path, lines] of scope.changed) {
+        if (isWithinDir(path, absDir))
+            changed.set(path, lines);
+    }
+    return { ...scope, changed };
 }
 // Total changed-line count across all files — used for the CLI header.
 export function countChangedLines(changed) {
