@@ -7,6 +7,7 @@ export function buildTsRule(mockApi) {
    - For ${mockApi}.fn(), either let TypeScript infer the type from context or type it explicitly: ${mockApi}.fn<Parameters<typeof fn>, ReturnType<typeof fn>>().
    - Use ReturnType<>, Parameters<>, and other utility types to derive mock types from real function signatures.
    - When accessing optional properties, handle null/undefined correctly.
-   - Array types: always use T[] syntax, never Array<T> — @typescript-eslint/array-type will flag the generic form. For inline object arrays use \`{ field: type }[]\` not \`Array<{ field: type }>\`.`;
+   - Array types: always use T[] syntax, never Array<T> — @typescript-eslint/array-type will flag the generic form. For inline object arrays use \`{ field: type }[]\` not \`Array<{ field: type }>\`.
+   - NEVER use the bare \`Function\` type — @typescript-eslint/no-unsafe-function-type flags it. Write an explicit signature instead: for a callback prop/param use \`(arg: Arg) => Ret\` (or \`() => void\`); for a generic callable whose shape is unknown use \`(...args: unknown[]) => unknown\`. This applies to mock prop annotations, cast targets, and any local type alias — e.g. \`({ onClick }: { onClick: () => void })\`, not \`({ onClick }: { onClick: Function })\`.`;
 }
 //# sourceMappingURL=typescript.js.map

@@ -285,6 +285,55 @@ export function typeImportOriginalCalls(code) {
     }
     return out + code.slice(last);
 }
+// The bare `Function` type trips @typescript-eslint/no-unsafe-function-type. That rule is NOT
+// auto-fixable (eslint can't infer the intended signature) and it's an ESLint error, not a tsc
+// error — so it survives BOTH the type-check retry loop and formatFile's `eslint --fix`, and ends
+// up in the accepted file. This replaces `Function`, in TYPE positions only, with the parenthesized
+// general callable `((...args: unknown[]) => unknown)` — the parens keep the arrow-type valid in
+// EVERY type position (annotation, union, array, cast, generic arg). Value uses of the global
+// (`instanceof Function`, `toBeInstanceOf(Function)`, `new Function`, `Function.prototype`,
+// `typeof Function`) are left untouched. Deterministic and behavior-preserving (types erase at
+// runtime). CONSERVATIVE: on any ambiguity it SKIPS — a leftover lint warning is better than a
+// broken file. Scans string/comment-masked code so a `Function` inside text can't match.
+export function replaceUnsafeFunctionType(code) {
+    if (!/\bFunction\b/.test(code))
+        return code;
+    const masked = blankStringsAndComments(code);
+    const CALLABLE = '((...args: unknown[]) => unknown)';
+    const re = /\bFunction\b/g;
+    let out = '';
+    let last = 0;
+    for (let m = re.exec(masked); m; m = re.exec(masked)) {
+        const start = m.index;
+        const end = start + 'Function'.length;
+        const before = masked.slice(Math.max(0, start - 32), start);
+        const after = masked.slice(end);
+        const prevCh = (before.match(/(\S)\s*$/) || ['', ''])[1];
+        const nextCh = (after.match(/^\s*(\S)/) || ['', ''])[1];
+        const prevWord = (before.match(/([A-Za-z0-9_$]+)\s*$/) || ['', ''])[1];
+        // Value positions — never a type, always skip.
+        if (prevCh === '.' || nextCh === '.' || nextCh === '(')
+            continue;
+        if (prevWord === 'new' || prevWord === 'instanceof' || prevWord === 'typeof')
+            continue;
+        // Strong type-position signals (default is skip on anything else).
+        const isCast = /\bas\s*$/.test(before);
+        // Param/property/return annotation: `name: Function`, `name?: Function`, `): Function`.
+        const isAnnotation = /[({;,]\s*[A-Za-z0-9_$]+\??\s*:\s*$/.test(before) ||
+            /\b(?:let|const|var|readonly|public|private|protected)\s+[A-Za-z0-9_$]+\??\s*:\s*$/.test(before) ||
+            /^\s*(?:readonly\s+)?[A-Za-z0-9_$]+\??\s*:\s*$/.test(before) ||
+            /\)\s*:\s*$/.test(before);
+        const isUnion = prevCh === '|' || prevCh === '&' || nextCh === '|' || nextCh === '&';
+        const isArray = /^\s*\[\]/.test(after);
+        // Generic argument: `Record<string, Function>`, `Map<Function, X>`.
+        const isGeneric = (prevCh === '<' || prevCh === ',') && (nextCh === '>' || nextCh === ',');
+        if (isCast || isAnnotation || isUnion || isArray || isGeneric) {
+            out += code.slice(last, start) + CALLABLE;
+            last = end;
+        }
+    }
+    return out + code.slice(last);
+}
 // Collapses duplicate named imports from the SAME module into one statement, and de-dupes
 // repeated specifiers within a single import. The model sometimes emits two
 // `import { A } from '../index'` + `import { A, b } from '../index'` lines — not a TS error
@@ -758,6 +807,37 @@ export function buildUnhandledErrorMessage(currentError, passCount) {
         `${RULE_DIVIDER}\n` +
         `${currentError}\n` +
         `${RULE_DIVIDER}`);
+}
+// A very specific, high-signal failure: the stack bottoms out in `process.exit`
+// inside PRODUCTION code (a fail-loud health check in an async factory/singleton
+// — getInstance/connect/init), invoked from the test, NOT on an `expect` line.
+// This is almost always an unawaited async factory whose rejection leaked, and/or
+// a dependency mocked as a plain object when the source CALLS it (so the call
+// throws and drives the catch → process.exit path). The generic "unhandled
+// rejection" advice (await the error state) misdiagnoses it, so name it precisely.
+// Returns a guidance block to append, or '' when the signature is absent.
+export function processExitLeakGuidance(output) {
+    // `process.exit unexpectedly called with "1"` is vitest's banner for this exact
+    // case. Match it (and the bare `process.exit(` in a stack) as the trigger.
+    if (!/process\.exit unexpectedly called/i.test(output) && !/\bprocess\.exit\(/.test(output))
+        return '';
+    return (`PROCESS.EXIT LEAK — the stack bottoms out in \`process.exit\` inside PRODUCTION code (a fail-loud ` +
+        `health check in an async factory/singleton such as getInstance/connect/init), reached from the ` +
+        `test and NOT from an \`expect(...)\` line. Do NOT touch the production code — that exit is ` +
+        `intentional. The test is at fault, in one or both of these ways:\n` +
+        `  1) UNAWAITED ASYNC FACTORY — the method is \`async\` (returns a Promise), but the test calls it ` +
+        `without \`await\`, so its rejection escapes the test body as an unhandled rejection. Fix: \`await\` ` +
+        `every call site (e.g. \`const client = await Factory.getInstance(cfg)\`), or for the failure case ` +
+        `\`await expect(Factory.getInstance(cfg)).rejects.toThrow(...)\`. A returned Promise is never an ` +
+        `instance of the class — assert against the awaited value.\n` +
+        `  2) NON-CALLABLE / NON-RESOLVING MOCK — the source CALLS the mocked dependency (e.g. a health ` +
+        `check runs \`sql\\\`SELECT 1\\\`\`), but the mock is a plain object, so calling it throws and trips ` +
+        `the catch → process.exit path. Mock the dependency's REAL shape: many library values are "a ` +
+        `function that ALSO has methods" (postgres.js \`sql\`, axios instances, express apps). Make it ` +
+        `callable AND resolve the happy path:\n` +
+        `       const sql = Object.assign(vi.fn().mockResolvedValue([{ '?column?': 1 }]), { end: vi.fn().mockResolvedValue(undefined) })\n` +
+        `     A plain \`{ end }\` object is NOT callable and drives the failure branch. When code has a ` +
+        `\`catch { process.exit/throw }\` health check, the happy-path mock MUST resolve.`);
 }
 // ---------------------------------------------------------------------------
 // Patch-mode support

@@ -14,12 +14,14 @@ export declare function sanitizeMocksContent(raw: string): {
     stripped: boolean;
 };
 export declare function typeImportOriginalCalls(code: string): string;
+export declare function replaceUnsafeFunctionType(code: string): string;
 export declare function dedupeImports(code: string): string;
 export declare function ensureMockedImports(code: string): string;
 export declare function deduplicateViMocks(code: string): string;
 export declare function buildStructureBrokenMessage(initialError: string, currentError: string): string;
 export declare function buildRegressionMessage(initialError: string, currentError: string, baselinePass: number, currentPass: number): string;
 export declare function buildUnhandledErrorMessage(currentError: string, passCount: number): string;
+export declare function processExitLeakGuidance(output: string): string;
 export type PatchOpType = 'REPLACE_TEST' | 'DELETE_TEST' | 'ADD_AFTER_DESCRIBE' | 'ADD_IMPORT' | 'ADD_AFTER_IMPORTS' | 'REPLACE';
 export interface PatchOperation {
     type: PatchOpType;

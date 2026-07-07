@@ -4,6 +4,7 @@ export default class Generate extends Command {
     static examples: string[];
     static args: {
         path: import("@oclif/core/interfaces").Arg<string | undefined, Record<string, unknown>>;
+        scope: import("@oclif/core/interfaces").Arg<string | undefined, Record<string, unknown>>;
     };
     static flags: {
         'dry-run': import("@oclif/core/interfaces").BooleanFlag<boolean>;

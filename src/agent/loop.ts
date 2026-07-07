@@ -1,12 +1,12 @@
 import { writeFile, mkdir, readFile, unlink } from 'fs/promises'
-import { dirname, join } from 'path'
+import { dirname, join, isAbsolute, relative } from 'path'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import { fileTestCommand, scopedCoverageCommand, relatedCoverageCommand } from '../lib/detector.js'
 import { runCommand } from '../lib/runner.js'
 import { loadCoverage, coverageAgeSeconds, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps } from '../lib/coverage/index.js'
-import { resolveDiffScope } from '../lib/git-diff.js'
+import { resolveDiffScope, scopeDiffToDir } from '../lib/git-diff.js'
 import type { DiffScope } from '../lib/git-diff.js'
 import type { CoverageGap, CoverageReport, FileCoverage } from '../lib/coverage/types.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
@@ -20,7 +20,7 @@ import { typeCheckFile, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js'
 import { formatFile } from '../lib/format.js'
 import { routeTestToNodeEnv } from '../lib/env-route.js'
 import { detectWeakAsyncWait } from './prompts/index.js'
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, dedupeImports, dedupeTestBlocks, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, processExitLeakGuidance, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, dedupeImports, dedupeTestBlocks, replaceUnsafeFunctionType, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 
@@ -335,6 +335,7 @@ export async function processGap(
     testCode = ensureMockedImports(testCode)
     testCode = dedupeImports(testCode)
     testCode = dedupeTestBlocks(testCode)
+    testCode = replaceUnsafeFunctionType(testCode)
 
     // Catch empty test files before writing — no point running a file with no tests
     if (!hasTestFunctions(testCode)) {
@@ -421,7 +422,10 @@ export async function processGap(
 
     const rawRunOutput = runResult.stdout + '\n' + runResult.stderr
     const rawExtracted = extractTestFailure(rawRunOutput)
-    const extracted = enrichNoTestsError(rawExtracted, rawRunOutput)
+    const leakGuidance = processExitLeakGuidance(rawRunOutput)
+    const extracted = leakGuidance
+      ? `${leakGuidance}\n\n${enrichNoTestsError(rawExtracted, rawRunOutput)}`
+      : enrichNoTestsError(rawExtracted, rawRunOutput)
     const passCount = parsePassCount(rawRunOutput)
 
     if (!isZeroTestsOutput(rawRunOutput) && passCount > bestPassCount) {
@@ -493,6 +497,13 @@ async function restoreTestFile(testPath: string, original: string | null): Promi
   } catch { /* best-effort */ }
 }
 
+// Prefix a per-file error with the source file it belongs to, so the summary
+// names which target failed instead of leaving a bare stack/patch error.
+function tagFileError(filePath: string, cwd: string, error: string): string {
+  const rel = isAbsolute(filePath) ? relative(cwd, filePath) : filePath
+  return `${rel}\n${error}`
+}
+
 async function runWorkerPool(
   gaps: CoverageGap[],
   options: LoopOptions,
@@ -542,7 +553,7 @@ async function runWorkerPool(
 
       filesProcessed++
       if (result.success) testsWritten++
-      else if (result.error) errors.push(result.error)
+      else if (result.error) errors.push(tagFileError(gap.filePath, options.cwd, result.error))
     }
   })
 
@@ -630,8 +641,11 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       const kept = diffScope.changed.get(absTarget)
       diffScope = { ...diffScope, changed: kept ? new Map([[absTarget, kept]]) : new Map() }
     }
+    // `<dir>` + @diff = the intersection: only the changed lines inside the directory are
+    // targets (and patch coverage is measured over just those lines).
+    if (scopeDir) diffScope = scopeDiffToDir(diffScope, scopeDir)
     if (diffScope.changed.size === 0) {
-      const where = options.targetFile ? `in ${options.targetFile}` : 'in the diff'
+      const where = options.targetFile ? `in ${options.targetFile}` : scopeRel ? `under ${scopeRel}` : 'in the diff'
       log(chalk.green(`\nNo changed source lines ${where} vs ${diffScope.baseRef} — nothing to cover.`))
       return {
         filesProcessed: 0, testsWritten: 0, coverageBefore: 0, coverageAfter: 0,
@@ -670,8 +684,10 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
     log(chalk.dim(`  No test files yet${where} — scanning source files for coverage gaps.`))
   } else {
     // Scoped runs always run fresh: the time-cache holds a whole-repo report whose freshness
-    // says nothing about this scope, and a scoped run rewrites lcov with scope-only data.
-    const ageSeconds = scopeDir ? null : await coverageAgeSeconds(config, cwd)
+    // says nothing about this scope, and a scoped run rewrites lcov with scope-only data. Diff
+    // mode is the exception even when scoped to a dir — it reuses the FULL report (below), so a
+    // `@diff <dir>` run still reads the CI/test:cov report instantly instead of re-running.
+    const ageSeconds = (scopeDir && !diffMode) ? null : await coverageAgeSeconds(config, cwd)
     // Patch mode INTERPRETS an existing coverage measurement (ideally the one CI uploaded to
     // Codecov), so any on-disk full report is reused regardless of age — only `--fresh` forces
     // a re-run. This is the fast path: point lacuna at the report your `test:cov`/CI produced
@@ -691,7 +707,9 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         log(chalk.yellow(`  No coverage report on disk — running the FULL suite to match Codecov's measurement (this can be slow).`))
         log(chalk.dim(`  Tip: run your coverage script once (e.g. npm run test:cov) or reuse the CI lcov, then re-run — lacuna will read it instantly.`))
       }
-      const label = scopeRel
+      // Diff mode runs the FULL suite even when scoped to a dir (coverageCommand is unscoped),
+      // so don't imply a narrowed run in the label.
+      const label = (scopeRel && !diffMode)
         ? `  Running tests under ${scopeRel} to collect coverage...`
         : '  Running test suite to collect coverage...'
       const spinner = startCoverageSpinner(chalk.dim(label), env.testRunner)
@@ -770,9 +788,13 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
 
   // Restrict to the scope subtree. extractGaps paths come from lcov (absolute OR relative), so
   // normalize before the prefix test; untouched files are already absolute and scope-walked.
-  const scopedGaps = scopeDir
-    ? gaps.filter((g) => isWithinDir(g.filePath.startsWith('/') ? g.filePath : join(cwd, g.filePath), scopeDir))
-    : diffGaps
+  // Diff mode wins when both are set: diffScope.changed was already filtered to scopeDir, so
+  // diffGaps is the directory-scoped, diff-narrowed set.
+  const scopedGaps = diffScope
+    ? diffGaps
+    : scopeDir
+      ? gaps.filter((g) => isWithinDir(g.filePath.startsWith('/') ? g.filePath : join(cwd, g.filePath), scopeDir))
+      : gaps
 
   if (scopedGaps.length === 0) {
     if (diffScope) {
@@ -853,7 +875,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         if (result.testCode) {
           memory.recordSuccess(gap.filePath.replace(cwd + '/', ''), result.testCode)
         }
-      } else if (result.error) errors.push(result.error)
+      } else if (result.error) errors.push(tagFileError(gap.filePath, cwd, result.error))
     }
   }
 

@@ -1,5 +1,5 @@
 import { readFile, writeFile, mkdir, unlink, readdir } from 'fs/promises';
-import { join, dirname, basename, extname, isAbsolute } from 'path';
+import { join, dirname, basename, extname, isAbsolute, relative } from 'path';
 import { access, stat } from 'fs/promises';
 import chalk from 'chalk';
 import { fileTestCommand, multiFileTestCommand, scopedTestCommand } from '../lib/detector.js';
@@ -14,7 +14,7 @@ import { processGap } from './loop.js';
 import { ProjectMemory } from './project-memory.js';
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js';
 import { typeCheckFile, findTestFilesWithTypeErrors, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js';
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, parseFailCount, buildStructureBrokenMessage, buildRegressionMessage, buildUnhandledErrorMessage, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, dedupeImports, dedupeTestBlocks, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js';
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, parseFailCount, buildStructureBrokenMessage, buildRegressionMessage, buildUnhandledErrorMessage, processExitLeakGuidance, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, dedupeImports, dedupeTestBlocks, replaceUnsafeFunctionType, tryApplyPatch, tryApplyMocksPatch } from '../lib/validate.js';
 import { extractTestFailure } from '../lib/extract-error.js';
 import { StreamingFileViewer } from '../lib/streaming-viewer.js';
 // ─── Failing-files cache ──────────────────────────────────────────────────────
@@ -487,6 +487,7 @@ async function fixFile(testFilePath, options, generator, onStatus, projectMemory
         testFileContent = ensureMockedImports(testFileContent);
         testFileContent = dedupeImports(testFileContent);
         testFileContent = dedupeTestBlocks(testFileContent);
+        testFileContent = replaceUnsafeFunctionType(testFileContent);
         // Catch empty test files before writing
         if (!hasTestFunctions(testFileContent)) {
             errorOutput =
@@ -562,7 +563,10 @@ async function fixFile(testFilePath, options, generator, onStatus, projectMemory
         // enrichNoTestsError adds guidance for genuinely missing test functions;
         // in the structure-broken path the issue is always a broken import, so use
         // rawExtracted there so the actual module error isn't buried in boilerplate.
-        const extracted = enrichNoTestsError(rawExtracted, rawRunOutput);
+        const leakGuidance = processExitLeakGuidance(rawRunOutput);
+        const extracted = leakGuidance
+            ? `${leakGuidance}\n\n${enrichNoTestsError(rawExtracted, rawRunOutput)}`
+            : enrichNoTestsError(rawExtracted, rawRunOutput);
         // Track the high-water mark — the attempt with the most passing tests so far.
         // Only collecting runs qualify (structureBroken === 0 tests is never "best").
         if (!structureBroken && currentPassCount > bestPassCount) {
@@ -834,6 +838,12 @@ async function regenerateFile(testFilePath, options, onStatus, projectMemory, ba
         await writeFile(absTestFile, originalContent, 'utf-8').catch(() => { });
     return { success: result.success, error: result.error };
 }
+// Prefix a per-file error with its test file path so the summary names which
+// file failed — the underlying error (e.g. a patch-anchor mismatch) often doesn't.
+function tagError(file, cwd, error) {
+    const rel = isAbsolute(file) ? relative(cwd, file) : file;
+    return `${rel}\n${error}`;
+}
 // ─── Worker pool ──────────────────────────────────────────────────────────────
 async function runFixWorkers(testFiles, options, workerCount, projectMemory) {
     const queue = [...testFiles];
@@ -896,13 +906,13 @@ async function runFixWorkers(testFiles, options, workerCount, projectMemory) {
                 else {
                     stillFailingFiles.push(file);
                     if (regenResult.error)
-                        errors.push(regenResult.error);
+                        errors.push(tagError(file, options.cwd, regenResult.error));
                 }
             }
             else {
                 stillFailingFiles.push(file);
                 if (result.error)
-                    errors.push(result.error);
+                    errors.push(tagError(file, options.cwd, result.error));
             }
         }
     }));
@@ -1082,13 +1092,13 @@ export async function runFixLoop(options) {
                 else {
                     stillFailingFiles.push(file);
                     if (regenResult.error)
-                        errors.push(regenResult.error);
+                        errors.push(tagError(file, cwd, regenResult.error));
                 }
             }
             else {
                 stillFailingFiles.push(file);
                 if (result.error)
-                    errors.push(result.error);
+                    errors.push(tagError(file, cwd, result.error));
             }
         }
     }

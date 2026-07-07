@@ -122,9 +122,10 @@ export function reportTerminal(input: ReportInput): void {
       console.log(chalk.red(`\n  ${r.errors.length} file(s) could not be fixed:`))
       for (const err of r.errors) {
         const lines = err.split('\n').filter(Boolean).slice(0, 8)
-        for (const line of lines) {
-          console.log(chalk.dim(`    ${line}`))
-        }
+        lines.forEach((line, i) => {
+          // First line is the tagged file path — surface it as a bold header.
+          console.log(i === 0 ? chalk.yellow(`    ${line}`) : chalk.dim(`    ${line}`))
+        })
         console.log('')
       }
     }
