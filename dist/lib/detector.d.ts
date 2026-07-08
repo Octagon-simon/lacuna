@@ -8,6 +8,7 @@ export interface DetectedEnvironment {
     testCommand: string;
 }
 export declare function envForRunner(runner: string): DetectedEnvironment;
+export declare function sq(path: string): string;
 export declare function multiFileTestCommand(env: DetectedEnvironment, files: string[]): string;
 export declare function scopedCoverageCommand(env: DetectedEnvironment, relDir: string): string | null;
 export declare function relatedCoverageCommand(env: DetectedEnvironment, relFile: string): string | null;

@@ -20,5 +20,6 @@ export async function coverageAgeSeconds(config, cwd = process.cwd()) {
         return null;
     }
 }
-export { extractGaps, filterTestableGaps, findUncoveredFiles, formatCoverageSummary, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps } from './gaps.js';
+export { parseLcov } from './lcov.js';
+export { extractGaps, filterTestableGaps, findUncoveredFiles, formatCoverageSummary, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps, alignReportToChanged } from './gaps.js';
 //# sourceMappingURL=index.js.map

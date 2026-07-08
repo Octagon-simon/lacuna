@@ -1,13 +1,15 @@
-import { writeFile, mkdir, readFile, unlink } from 'fs/promises';
+import { writeFile, mkdir, readFile, unlink, mkdtemp, rm } from 'fs/promises';
+import { tmpdir } from 'os';
 import { dirname, join, isAbsolute, relative } from 'path';
 import chalk from 'chalk';
-import { fileTestCommand, scopedCoverageCommand, relatedCoverageCommand } from '../lib/detector.js';
+import { scopedCoverageCommand, relatedCoverageCommand } from '../lib/detector.js';
+import { resolveFileTestRun, resolveIncrementalCoverageRun } from '../lib/test-run.js';
 import { runCommand } from '../lib/runner.js';
-import { loadCoverage, coverageAgeSeconds, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps } from '../lib/coverage/index.js';
+import { loadCoverage, parseLcov, coverageAgeSeconds, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps, alignReportToChanged } from '../lib/coverage/index.js';
 import { resolveDiffScope, scopeDiffToDir } from '../lib/git-diff.js';
 import { WorkerDisplay } from '../lib/worker-display.js';
 import { startCoverageSpinner } from '../lib/coverage-spinner.js';
-import { buildFileContext } from './context.js';
+import { buildFileContext, findExistingTestFile } from './context.js';
 import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js';
 import { ProjectMemory } from './project-memory.js';
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js';
@@ -58,10 +60,11 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
     if (!onStatus) {
         log(chalk.dim(`  ${context.existingTestFile ? 'Updating' : 'Creating'}: ${context.suggestedTestFile.replace(cwd + '/', '')}`));
     }
-    // parallel: run only this test file so workers don't race on the full suite
-    const testCmd = parallel
-        ? fileTestCommand(env, context.suggestedTestFile)
-        : env.testCommand;
+    // parallel: run only this test file so workers don't race on the full suite. Resolve it under
+    // the file's OWN package config (monorepo setupFiles/cleanup/env), not bare from the repo root.
+    const testRun = parallel
+        ? await resolveFileTestRun(env, context.suggestedTestFile, cwd)
+        : { command: env.testCommand, cwd };
     // Capture pre-existing test file so we can restore on failure
     let originalTestContent = null;
     if (!dryRun) {
@@ -86,6 +89,11 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
     // actually collected tests qualify, so a fence-broken / 0-test file is never kept.
     let bestCode = null;
     let bestPassCount = -1;
+    // The most recent attempt whose TESTS PASSED but left TypeScript type errors (which is why the
+    // loop kept going). generate's contract is green tests, so this file is a keeper — if the loop
+    // then oscillates or exhausts retries on the type-only repair, we keep THIS instead of deleting
+    // a passing test the user could finish with `lacuna fix --file`.
+    let acceptedPassingCode = null;
     // Running base for patch-mode application. Starts as the original test file and is updated
     // to the written content after each attempt, so a retry that patches a test ADDED by an
     // earlier attempt anchors against the current file — not the frozen original (which would
@@ -157,9 +165,23 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
                 }
                 if (!onStatus)
                     log(chalk.red(`\n  ⚠ Agent loop detected — output identical to a previous attempt. Stopping early.`));
-                onStatus?.({ phase: 'failed', file: shortPath });
-                await restoreTestFile(context.suggestedTestFile, originalTestContent);
-                return { success: false, error: err.message };
+                // If a prior attempt already reached GREEN tests (only type errors kept it looping), keep
+                // that passing file — deleting a test the user can `lacuna fix --file` to clean up is
+                // strictly worse. Mirrors the natural last-attempt "type errors remain" acceptance.
+                if (acceptedPassingCode !== null) {
+                    await writeFile(context.suggestedTestFile, acceptedPassingCode, 'utf-8');
+                    if (!dryRun)
+                        await formatFile(context.suggestedTestFile, cwd, { enabled: config.format, env });
+                    const relTest = context.suggestedTestFile.replace(cwd + '/', '');
+                    if (!onStatus)
+                        log(chalk.yellow(`  ⚠ Type errors remain — tests pass. Kept the file; run ${chalk.cyan(`lacuna fix --file ${relTest}`)} to clean up types.`));
+                    onStatus?.({ phase: 'passed', file: shortPath });
+                    return { success: true, testCode: acceptedPassingCode };
+                }
+                // No green attempt — fall through to the keep-best finalization, which preserves a new
+                // file's best partial for `lacuna fix` instead of deleting it.
+                lastError = err.message;
+                break;
             }
             const msg = err instanceof Error ? err.message : String(err);
             if (!onStatus)
@@ -313,7 +335,7 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
         if (!onStatus)
             log(chalk.dim(`  Written. Running tests...`));
         onStatus?.({ phase: 'running', file: shortPath });
-        const runResult = await runCommand(testCmd, cwd);
+        const runResult = await runCommand(testRun.command, testRun.cwd);
         if (runResult.success) {
             // Reject placeholder test bodies — `{ // body }` passes vitest (no assertions)
             // but produces zero coverage value. Force a retry with an explicit error.
@@ -350,6 +372,9 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
             // which is generate's contract, so don't burn a retry feeding the model a non-error.
             if (typeErrors && typeErrors !== TYPECHECK_INCONCLUSIVE) {
                 if (attempt < config.maxIterations) {
+                    // Green tests, only type errors remain — remember this file so an oscillation/exhaustion
+                    // on the type repair keeps it rather than discarding a passing test.
+                    acceptedPassingCode = testCode;
                     lastError = `Tests passed but TypeScript type errors were found in the generated file:\n${typeErrors}\n\nFix ALL type errors. Do not use 'as any' or '@ts-ignore'.`;
                     if (!onStatus)
                         log(chalk.yellow(`  Tests pass — fixing type errors (retrying)...`));
@@ -436,7 +461,7 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
         // so restore the original. parallel ⇒ testCmd is file-scoped, so parsePassCount reflects
         // this file and the comparison is sound. Measure the baseline lazily (only here on failure).
         await writeFile(context.suggestedTestFile, originalTestContent, 'utf-8');
-        const baseRun = await runCommand(testCmd, cwd);
+        const baseRun = await runCommand(testRun.command, testRun.cwd);
         const baselinePassCount = parsePassCount(baseRun.stdout + '\n' + baseRun.stderr);
         if (bestPassCount > baselinePassCount) {
             await writeFile(context.suggestedTestFile, bestCode, 'utf-8');
@@ -666,6 +691,25 @@ export async function runAgentLoop(options) {
                     `This usually means a missing environment variable, broken import, or setup file error.\n` +
                     `Run: ${env.testCommand} 2>&1 | head -80\nto see the actual error.`);
             }
+            // A fresh full-suite run that executed ZERO passing tests measured nothing. In @diff mode
+            // that yields a PHANTOM "patch coverage before: 0%" — the changed lines look uncovered only
+            // because the suite never ran them. Classic monorepo trap: `npx vitest run --coverage` from
+            // the repo ROOT skips a package's prerequisites (a build step, or the config/env its
+            // globalSetup needs), so it finishes in seconds with an empty report (v8: 0/0) or
+            // "No test files found" — and still exits 0. Don't silently generate against a bogus
+            // baseline; stop and point the user at reusing their real (CI/test:cov) coverage.
+            if (diffMode && hasTests && parsePassCount(coverageOutput) === 0) {
+                const setupErr = /Unhandled Error|Configuration property .*? is not defined|globalSetup\b|No test files found|Cannot find (?:module|package)/i.exec(coverageOutput);
+                throw new Error(`The full-suite coverage run executed 0 tests — there is no coverage to measure the diff against.\n` +
+                    (setupErr ? `The suite aborted before running: "${setupErr[0]}".\n` : '') +
+                    `\nIn a monorepo, \`${coverageCommand}\` from the repo root often skips a package's\n` +
+                    `prerequisites (a build step, or the config/env its globalSetup needs) and finishes fast\n` +
+                    `with an empty report — so every changed line looks uncovered (a phantom 0%).\n\n` +
+                    `Fix: reuse the coverage your CI or coverage script already produces — lacuna reads an\n` +
+                    `existing full lcov instantly:\n` +
+                    `  1. run your real coverage command once (it sets each package up correctly), then\n` +
+                    `  2. re-run this WITHOUT --fresh so lacuna reuses that report.`);
+            }
             // When ALL tests are failing (0 passed), the lcov data is unreliable —
             // failing tests still execute source lines, inflating coverage to 50–100%.
             // Fall back to source-file scanning so gaps are found correctly.
@@ -826,20 +870,53 @@ export async function runAgentLoop(options) {
     // run is safe as a union addend even though it was unsafe as a before REPLACEMENT.)
     let patchCoverageAfter = patchCoverageBefore;
     if (diffScope && !options.dryRun && testsWritten > 0) {
+        let tmpCovDir = null;
         try {
-            const afterCmd = relTargetFile
-                ? (relatedCoverageCommand(env, relTargetFile) ?? env.coverageCommand)
-                : env.coverageCommand;
+            // Single changed target (`generate --file <src> @diff`): measure the NEW test's coverage by
+            // running THAT test file under its own package, instrumenting only the changed source, with
+            // the lcov forced into a temp dir we own. This actually executes the test (package setup/env)
+            // and lands coverage where we read it — unlike `vitest related` from root, which balloons to
+            // the whole suite and writes to the package's custom reportsDirectory. Falls back to the old
+            // related/full run when we can't scope it (unsupported runner or the test file isn't found).
+            const absTest = relTargetFile ? await findExistingTestFile(relTargetFile, cwd, config.sourceDir) : null;
+            let covRun = null;
+            if (absTest && relTargetFile) {
+                tmpCovDir = await mkdtemp(join(tmpdir(), 'lacuna-cov-'));
+                covRun = await resolveIncrementalCoverageRun(env, absTest, join(cwd, relTargetFile), cwd, tmpCovDir);
+                if (!covRun) {
+                    await rm(tmpCovDir, { recursive: true, force: true }).catch(() => { });
+                    tmpCovDir = null;
+                }
+            }
             const spin = startCoverageSpinner(chalk.dim(relTargetFile
                 ? `\n  Measuring new coverage of ${relTargetFile}...`
                 : '\n  Measuring new patch coverage...'), env.testRunner);
-            await runCommand(afterCmd, cwd, config.coverageTimeout * 1000, spin.onLine);
-            spin.stop();
-            const incremental = await loadCoverage(config, cwd);
-            const merged = mergeReportHits(report, incremental, cwd);
+            let incremental;
+            if (covRun && tmpCovDir) {
+                await runCommand(covRun.command, covRun.cwd, config.coverageTimeout * 1000, spin.onLine);
+                spin.stop();
+                incremental = await parseLcov(tmpCovDir, '');
+            }
+            else {
+                const afterCmd = relTargetFile
+                    ? (relatedCoverageCommand(env, relTargetFile) ?? env.coverageCommand)
+                    : env.coverageCommand;
+                await runCommand(afterCmd, cwd, config.coverageTimeout * 1000, spin.onLine);
+                spin.stop();
+                incremental = await loadCoverage(config, cwd);
+            }
+            // Monorepo/workspace reports key files by the PACKAGE-relative path while the git diff keys
+            // them by the repo-relative path — realign BOTH to the trusted changed-file paths (separately,
+            // before merging, so their keys line up), else the new test's fresh hits never match the
+            // changed lines and patch coverage stays frozen at 0%.
+            const merged = mergeReportHits(alignReportToChanged(report, diffScope.changed, cwd), alignReportToChanged(incremental, diffScope.changed, cwd), cwd);
             patchCoverageAfter = computePatchCoverage(merged, diffScope.changed, cwd, filesOutsideReport(scopedGaps, merged, cwd)).pct;
         }
         catch { /* keep the before value */ }
+        finally {
+            if (tmpCovDir)
+                await rm(tmpCovDir, { recursive: true, force: true }).catch(() => { });
+        }
     }
     // In improve mode we deliberately do NOT chase the threshold with contrived tests (see the
     // "COVERAGE IS A MEANS, NOT THE GOAL" prompt rule). So landing below the threshold is an
