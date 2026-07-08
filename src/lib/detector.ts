@@ -123,7 +123,7 @@ export function envForRunner(runner: string): DetectedEnvironment {
 // Wrap a shell argument in single quotes so that parentheses, spaces, and other
 // shell-special characters in file paths (e.g. Expo Router's app/(tabs)/...) are
 // treated as literals by /bin/sh. Escapes any embedded single-quote with '\''.
-function sq(path: string): string {
+export function sq(path: string): string {
   return `'${path.replace(/'/g, "'\\''")}'`
 }
 

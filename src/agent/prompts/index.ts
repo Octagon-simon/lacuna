@@ -10,6 +10,7 @@ import { buildTsRule } from './runners/typescript.js'
 import { buildHookMockHint, buildCallbackOutcomeHint } from '../../lib/hook-mock-hints.js'
 import { buildRenderVocabSection } from '../../lib/render-vocab.js'
 import { buildServiceMockHint } from '../../lib/service-mock-hints.js'
+import { extractFailureRegion } from '../../lib/validate.js'
 
 // Existing test files longer than this switch to surgical patch mode (<code_patch>) instead
 // of full-file rewrites — rewriting a large file risks hitting the output token limit mid-file.
@@ -397,6 +398,8 @@ export function buildSystemPrompt(env: DetectedEnvironment): string {
        e) LOADING TRIGGER MAP: Not all data loads on mount. For each piece of state, find what populates it. If a function like loadResults(classId) must be called explicitly (user selects something), the mount test will never see that data. Map: state → function that populates it → when that function is triggered.
        f) FIXTURE FIELD NAMES: Read the source's selector logic — every .find(), .filter(), and property access. Field names in fixture data must match what the source reads, not what sounds reasonable. \`is_active\` and \`is_current\` are both plausible; only one will pass the filter. Read the source.
        g) MOCK STRUCTURE — object vs factory: when the source imports a client/service as a module export and calls it as \`SomeClient.method()\`, the mock must be a plain object \`{ SomeClient: { method: ${mockApi}.fn() } }\`. If you mock it as \`${mockApi}.fn().mockReturnValue({ method: ${mockApi}.fn() })\`, SomeClient.method is undefined at runtime — the mock replaced a singleton with a callable that the source never calls. The mock structure must match how the source uses the import, not how you'd design an API.
+       g2) CALLABLE-VALUE MOCKS — mock the real SHAPE, not a convenient subset. Many dependency values are "a function that ALSO has methods" (postgres.js \`sql\`, axios instances, express apps, some SDK clients). If the source CALLS the dependency (e.g. a health check runs \`sql\\\`SELECT 1\\\`\`) AND also reads a method on it (\`.end()\`), the mock must be BOTH callable and carry the method: \`Object.assign(${mockApi}.fn().mockResolvedValue(<happy result>), { end: ${mockApi}.fn().mockResolvedValue(undefined) })\`. A plain \`{ end }\` object is not callable — calling it throws, which silently drives any \`catch\` (retry/exit/error) branch instead of the path you meant to test.
+       g3) ASYNC FACTORY / SINGLETON — if a factory or singleton accessor is \`async\` (getInstance/connect/init returning a Promise), \`await\` it at EVERY call site: \`const client = await Factory.getInstance(cfg)\`. A non-awaited call returns a Promise (never \`instanceof\` the class, so \`expect(x).toBeInstanceOf(...)\` fails), and if it rejects the rejection escapes as an UNHANDLED REJECTION that fails the whole file — not a clean assertion. For a rejection you mean to test, use \`await expect(Factory.getInstance(bad)).rejects.toThrow(...)\`. When the factory has a fail-loud health check (\`catch { process.exit(1) / throw }\`), mock its happy path to RESOLVE so the test doesn't drive the exit branch — and NEVER edit that production exit to make a test pass.
        h) DATA TRANSFORMATIONS: Before writing any assertion about the shape of loaded data, read every .map(), .filter(), and mutation the hook applies to the raw API response. If the hook does \`.map(s => ({ ...s, selected: true, status: 'promoted' }))\`, the fixture assertion must expect the TRANSFORMED shape, not the raw API fixture. Keep two separate fixtures: the raw API response (for mockResolvedValue) and the expected hook output (for assertions).
        i) USEEFFECT COMPOUND SIDE EFFECTS: For each useEffect, read its dependency array AND every state setter it calls. Some effects reset sibling state as a side effect (e.g. fetchSourceClasses always calls setSelectedSourceClassId('')). Setting state that triggers such an effect will silently undo other state you set in the same act(). Map the full chain: which state changes trigger which effects, and what those effects do to other state — before writing any test that sets multiple state values.
        HOOK STATE SYNC: If the test mocks a hook or function that returns an object (e.g. useClasses(), useUsers()), compare its CURRENT return signature in the source against the mocked return object in the test. If any properties are missing, renamed, or stale, realign the mock FIRST — before touching any assertions.
@@ -884,7 +887,7 @@ export function buildFixPrompt(args: {
 
   parts.push('\nFAILURE OUTPUT:')
   parts.push('```')
-  parts.push(errorOutput.slice(0, 3000))
+  parts.push(extractFailureRegion(errorOutput))
   parts.push('```')
 
   const realRequestWarning = detectRealRequestInError(errorOutput, mockApi)
@@ -1074,7 +1077,7 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
   // tests failed" contradicts the error text in several of those. Let the output speak.
   parts.push(`The previous attempt did not pass. Output from the last run:`)
   parts.push('```')
-  parts.push(failureOutput.slice(0, 3000))
+  parts.push(extractFailureRegion(failureOutput))
   parts.push('```')
 
   const realRequestWarning = detectRealRequestInError(failureOutput)

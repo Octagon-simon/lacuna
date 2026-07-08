@@ -5,9 +5,10 @@ import chalk from 'chalk'
 import { loadConfig } from '../lib/config.js'
 import { detectEnvironment, scopedCoverageCommand } from '../lib/detector.js'
 import { runCommand } from '../lib/runner.js'
+import { parsePassCount } from '../lib/validate.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { loadCoverage, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps } from '../lib/coverage/index.js'
-import { resolveDiffScope, countChangedLines, GitDiffError } from '../lib/git-diff.js'
+import { resolveDiffScope, countChangedLines, scopeDiffToDir, GitDiffError } from '../lib/git-diff.js'
 import type { DiffScope } from '../lib/git-diff.js'
 import { reportTerminal, buildJsonReport, buildMarkdownReport, getExitCode } from '../lib/reporter.js'
 import type { ReportInput } from '../lib/reporter.js'
@@ -22,17 +23,24 @@ export default class Analyze extends Command {
     '$ lacuna analyze',
     '$ lacuna analyze src/payments',
     '$ lacuna analyze @diff:origin/main',
+    '$ lacuna analyze @diff packages/api',
     '$ lacuna analyze --threshold 90',
     '$ lacuna analyze --format json',
     '$ lacuna analyze --format markdown',
   ]
 
-  // Optional positional: a directory to scope the analysis to (a scoped run only walks/instruments
-  // that subtree, so a brand-new folder reports in seconds instead of running the whole suite),
-  // or @diff[:<ref>] for read-only patch-coverage analysis of the lines changed vs the base ref.
+  // Two optional positionals, order-independent: a directory to scope the analysis to (a scoped
+  // run only walks/instruments that subtree, so a brand-new folder reports in seconds), and/or
+  // @diff[:<ref>] for read-only patch-coverage analysis of the lines changed vs the base ref.
+  // Combining them — `analyze @diff packages/api` — reports patch coverage of just the changed
+  // lines inside that folder.
   static args = {
     path: Args.string({
-      description: 'Directory to scope the analysis to, or @diff[:<ref>] for patch coverage (default: whole project)',
+      description: 'Directory to scope to, or @diff[:<ref>] for patch coverage (default: whole project)',
+      required: false,
+    }),
+    scope: Args.string({
+      description: 'Directory to scope @diff to, when the first arg is @diff (e.g. `analyze @diff packages/api`)',
       required: false,
     }),
   }
@@ -68,30 +76,49 @@ export default class Analyze extends Command {
     const threshold = flags.threshold ?? config.threshold
     const cwd = process.cwd()
 
-    // Resolve the optional scope: the @diff[:<ref>] token enters read-only patch-coverage
-    // mode (not a filesystem path — no stat); otherwise a directory scopes the analysis.
-    // A file is accepted but scoped to its parent dir (single files are a `lacuna generate
-    // --file` concern; analyze reports on a neighborhood).
+    // Resolve the two optional positionals in either order: the @diff[:<ref>] token enters
+    // read-only patch-coverage mode (not a filesystem path — no stat); a plain path scopes the
+    // analysis to a directory (a file is accepted but scoped to its parent dir — single files
+    // are a `lacuna generate --file` concern). Both together = patch coverage within the dir.
+    const isDiffToken = (s?: string) => s === '@diff' || (s?.startsWith('@diff:') ?? false)
+    let diffToken: string | undefined
+    let dirArg: string | undefined
+    for (const a of [args.path, args.scope]) {
+      if (!a) continue
+      if (isDiffToken(a)) {
+        if (diffToken) this.error('Pass @diff only once.')
+        diffToken = a
+      } else {
+        if (dirArg) this.error(`Unexpected extra argument: ${a}`)
+        dirArg = a
+      }
+    }
+
     let scopeDir: string | undefined
     let diffScope: DiffScope | undefined
-    if (args.path === '@diff' || args.path?.startsWith('@diff:')) {
-      const ref = args.path === '@diff' ? undefined : args.path.slice('@diff:'.length)
+    if (dirArg) {
+      const abs = resolve(cwd, dirArg)
+      try {
+        scopeDir = (await stat(abs)).isDirectory() ? abs : dirname(abs)
+      } catch {
+        this.error(`Path not found: ${dirArg}`)
+      }
+    }
+    if (diffToken) {
+      const ref = diffToken === '@diff' ? undefined : diffToken.slice('@diff:'.length)
       try {
         diffScope = await resolveDiffScope(cwd, ref)
       } catch (err) {
         this.error(err instanceof GitDiffError ? err.message : String(err))
       }
-    } else if (args.path) {
-      const abs = resolve(cwd, args.path)
-      try {
-        scopeDir = (await stat(abs)).isDirectory() ? abs : dirname(abs)
-      } catch {
-        this.error(`Path not found: ${args.path}`)
-      }
+      // `@diff <dir>`: keep only changed files under the directory before any downstream work.
+      if (scopeDir && diffScope) diffScope = scopeDiffToDir(diffScope, scopeDir)
     }
     const scopeRel = scopeDir ? scopeDir.replace(cwd + '/', '') : undefined
     // Scoped coverage keeps the run cheap; null (runner unsupported) → full command + post-filter.
-    const coverageCommand = (scopeRel && scopedCoverageCommand(env, scopeRel)) || env.coverageCommand
+    // In diff mode use the FULL command even when scoped to a dir: patch coverage must match what
+    // Codecov measured (a dir-scoped run executes only a subset of the tests that cover the file).
+    const coverageCommand = (scopeRel && !diffScope && scopedCoverageCommand(env, scopeRel)) || env.coverageCommand
 
     if (flags.format === 'terminal') {
       this.log(chalk.bold('\nlacuna analyze\n'))
@@ -104,7 +131,7 @@ export default class Analyze extends Command {
 
     if (flags.format === 'terminal') {
       this.log(`${chalk.dim('Detected:')}  ${chalk.cyan(env.testRunner)} (${env.language})`)
-      if (diffScope) this.log(`${chalk.dim('Scope:')}     ${chalk.cyan(`diff vs ${diffScope.baseRef} (${diffScope.changed.size} changed file(s), ${countChangedLines(diffScope.changed)} line(s))`)}`)
+      if (diffScope) this.log(`${chalk.dim('Scope:')}     ${chalk.cyan(`diff vs ${diffScope.baseRef}${scopeRel ? ` under ${scopeRel}` : ''} (${diffScope.changed.size} changed file(s), ${countChangedLines(diffScope.changed)} line(s))`)}`)
       else if (scopeRel) this.log(`${chalk.dim('Scope:')}     ${chalk.cyan(scopeRel)}`)
       this.log(`${chalk.dim('Threshold:')} ${threshold}%\n`)
     }
@@ -156,6 +183,25 @@ export default class Analyze extends Command {
         this.exit(2)
       }
       // partial failures are fine — coverage is still collected for passing tests
+
+      // Diff mode measures patch coverage against the CI baseline. A fresh full-suite run that
+      // executed ZERO passing tests measured nothing, so every changed line would look uncovered
+      // (a phantom 0% patch). This is the monorepo trap: the root `vitest run --coverage` skips a
+      // package's prerequisites (a build step, or the config/env its globalSetup needs) and exits
+      // fast with an empty report or "No test files found". Don't report a bogus number — bail
+      // and point the user at reusing their real (CI/test:cov) coverage.
+      if (diffScope && parsePassCount(combined) === 0) {
+        const setupErr = /Unhandled Error|Configuration property .*? is not defined|globalSetup\b|No test files found|Cannot find (?:module|package)/i.exec(combined)
+        this.log(chalk.red('\nThe full-suite coverage run executed 0 tests — there is no coverage to measure the diff against.'))
+        if (setupErr) this.log(chalk.yellow(`The suite aborted before running: "${setupErr[0]}".`))
+        this.log(chalk.dim(`\nIn a monorepo, \`${coverageCommand}\` from the repo root often skips a package's`))
+        this.log(chalk.dim('prerequisites (a build step, or the config/env its globalSetup needs) and finishes'))
+        this.log(chalk.dim('fast with an empty report — so every changed line looks uncovered (a phantom 0%).'))
+        this.log(chalk.yellow('\nFix: the full suite must actually run from the repo root for patch coverage to be real.'))
+        this.log(chalk.yellow('Run each package the way its own script does (build steps + config/env), or measure'))
+        this.log(chalk.yellow(`coverage per-package and point lacuna at that lcov via ./${config.coverageDir}/.\n`))
+        this.exit(2)
+      }
 
       try {
         report = await loadCoverage(config, cwd)

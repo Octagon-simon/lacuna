@@ -11,6 +11,7 @@ oclif.manifest.json
 
 ## local-only dev/release notes
 .release-steps.md
+AGENTS.md
 
 ## docs/ is the GitHub Pages source. Keep local research/scratch markdown out of git,
 ## but DO publish the blog post (and index.html, which isn't .md so isn't matched).

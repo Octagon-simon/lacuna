@@ -113,6 +113,34 @@ export function parseFailCount(output: string): number {
   return summaryLine ? parseInt(summaryLine[1], 10) : 0
 }
 
+// Test runners print PASSING tests first and the actual failures + summary LAST. Naively
+// slicing the HEAD of a long, mostly-passing run (slice(0, N)) therefore shows the model only
+// ✓ passes and hides every failure — so it concludes "the tests pass, the output is just
+// truncated" and stops fixing (or starts DELETING tests to force green). Keep the region that
+// actually carries the failure: from the earliest failure/summary marker to the end, and if
+// that still overflows the budget keep its TAIL (the summary and last-printed failures live
+// there). Falls back to the tail of the whole output when no marker is found.
+const FAILURE_MARKERS: RegExp[] = [
+  /^[ \t]*(?:FAIL|×|✗|❯|❌)[ \t]/m,        // per-file / per-test failure lines (vitest/jest)
+  /⎯{3,}/,                                 // vitest "Failed Tests" separator banner
+  /^\s*●/m,                                // jest failure bullet
+  /^\s*(?:Failed Tests|Test Files)\b/m,    // vitest end-of-run summary block
+  /\b\d+\s+failed\b/,                      // "N failed" (summary or inline)
+]
+export function extractFailureRegion(output: string, maxChars = 3000): string {
+  const clean = stripAnsi(output)
+  if (clean.length <= maxChars) return clean
+  let start = -1
+  for (const re of FAILURE_MARKERS) {
+    const m = re.exec(clean)
+    if (m && (start === -1 || m.index < start)) start = m.index
+  }
+  const region = start >= 0 ? clean.slice(start) : clean
+  return region.length > maxChars
+    ? '…(earlier passing output trimmed)…\n' + region.slice(region.length - maxChars)
+    : region
+}
+
 // Strips leading prose/thinking lines from generated code output.
 // When a model bleeds reasoning into <code_output>, the file starts with fragments
 // like ", nothing else." or "I'll write the test now." before the real code begins.
@@ -295,6 +323,57 @@ export function typeImportOriginalCalls(code: string): string {
     const insertAt = m.index + 'importOriginal'.length
     out += code.slice(last, insertAt) + `<typeof import('${mockMatch[1]}')>`
     last = insertAt
+  }
+  return out + code.slice(last)
+}
+
+// The bare `Function` type trips @typescript-eslint/no-unsafe-function-type. That rule is NOT
+// auto-fixable (eslint can't infer the intended signature) and it's an ESLint error, not a tsc
+// error — so it survives BOTH the type-check retry loop and formatFile's `eslint --fix`, and ends
+// up in the accepted file. This replaces `Function`, in TYPE positions only, with the parenthesized
+// general callable `((...args: unknown[]) => unknown)` — the parens keep the arrow-type valid in
+// EVERY type position (annotation, union, array, cast, generic arg). Value uses of the global
+// (`instanceof Function`, `toBeInstanceOf(Function)`, `new Function`, `Function.prototype`,
+// `typeof Function`) are left untouched. Deterministic and behavior-preserving (types erase at
+// runtime). CONSERVATIVE: on any ambiguity it SKIPS — a leftover lint warning is better than a
+// broken file. Scans string/comment-masked code so a `Function` inside text can't match.
+export function replaceUnsafeFunctionType(code: string): string {
+  if (!/\bFunction\b/.test(code)) return code
+  const masked = blankStringsAndComments(code)
+  const CALLABLE = '((...args: unknown[]) => unknown)'
+  const re = /\bFunction\b/g
+  let out = ''
+  let last = 0
+  for (let m = re.exec(masked); m; m = re.exec(masked)) {
+    const start = m.index
+    const end = start + 'Function'.length
+    const before = masked.slice(Math.max(0, start - 32), start)
+    const after = masked.slice(end)
+    const prevCh = (before.match(/(\S)\s*$/) || ['', ''])[1]
+    const nextCh = (after.match(/^\s*(\S)/) || ['', ''])[1]
+    const prevWord = (before.match(/([A-Za-z0-9_$]+)\s*$/) || ['', ''])[1]
+
+    // Value positions — never a type, always skip.
+    if (prevCh === '.' || nextCh === '.' || nextCh === '(') continue
+    if (prevWord === 'new' || prevWord === 'instanceof' || prevWord === 'typeof') continue
+
+    // Strong type-position signals (default is skip on anything else).
+    const isCast = /\bas\s*$/.test(before)
+    // Param/property/return annotation: `name: Function`, `name?: Function`, `): Function`.
+    const isAnnotation =
+      /[({;,]\s*[A-Za-z0-9_$]+\??\s*:\s*$/.test(before) ||
+      /\b(?:let|const|var|readonly|public|private|protected)\s+[A-Za-z0-9_$]+\??\s*:\s*$/.test(before) ||
+      /^\s*(?:readonly\s+)?[A-Za-z0-9_$]+\??\s*:\s*$/.test(before) ||
+      /\)\s*:\s*$/.test(before)
+    const isUnion = prevCh === '|' || prevCh === '&' || nextCh === '|' || nextCh === '&'
+    const isArray = /^\s*\[\]/.test(after)
+    // Generic argument: `Record<string, Function>`, `Map<Function, X>`.
+    const isGeneric = (prevCh === '<' || prevCh === ',') && (nextCh === '>' || nextCh === ',')
+
+    if (isCast || isAnnotation || isUnion || isArray || isGeneric) {
+      out += code.slice(last, start) + CALLABLE
+      last = end
+    }
   }
   return out + code.slice(last)
 }
@@ -665,6 +744,39 @@ export function buildUnhandledErrorMessage(currentError: string, passCount: numb
     `${RULE_DIVIDER}\n` +
     `${currentError}\n` +
     `${RULE_DIVIDER}`
+  )
+}
+
+// A very specific, high-signal failure: the stack bottoms out in `process.exit`
+// inside PRODUCTION code (a fail-loud health check in an async factory/singleton
+// — getInstance/connect/init), invoked from the test, NOT on an `expect` line.
+// This is almost always an unawaited async factory whose rejection leaked, and/or
+// a dependency mocked as a plain object when the source CALLS it (so the call
+// throws and drives the catch → process.exit path). The generic "unhandled
+// rejection" advice (await the error state) misdiagnoses it, so name it precisely.
+// Returns a guidance block to append, or '' when the signature is absent.
+export function processExitLeakGuidance(output: string): string {
+  // `process.exit unexpectedly called with "1"` is vitest's banner for this exact
+  // case. Match it (and the bare `process.exit(` in a stack) as the trigger.
+  if (!/process\.exit unexpectedly called/i.test(output) && !/\bprocess\.exit\(/.test(output)) return ''
+  return (
+    `PROCESS.EXIT LEAK — the stack bottoms out in \`process.exit\` inside PRODUCTION code (a fail-loud ` +
+    `health check in an async factory/singleton such as getInstance/connect/init), reached from the ` +
+    `test and NOT from an \`expect(...)\` line. Do NOT touch the production code — that exit is ` +
+    `intentional. The test is at fault, in one or both of these ways:\n` +
+    `  1) UNAWAITED ASYNC FACTORY — the method is \`async\` (returns a Promise), but the test calls it ` +
+    `without \`await\`, so its rejection escapes the test body as an unhandled rejection. Fix: \`await\` ` +
+    `every call site (e.g. \`const client = await Factory.getInstance(cfg)\`), or for the failure case ` +
+    `\`await expect(Factory.getInstance(cfg)).rejects.toThrow(...)\`. A returned Promise is never an ` +
+    `instance of the class — assert against the awaited value.\n` +
+    `  2) NON-CALLABLE / NON-RESOLVING MOCK — the source CALLS the mocked dependency (e.g. a health ` +
+    `check runs \`sql\\\`SELECT 1\\\`\`), but the mock is a plain object, so calling it throws and trips ` +
+    `the catch → process.exit path. Mock the dependency's REAL shape: many library values are "a ` +
+    `function that ALSO has methods" (postgres.js \`sql\`, axios instances, express apps). Make it ` +
+    `callable AND resolve the happy path:\n` +
+    `       const sql = Object.assign(vi.fn().mockResolvedValue([{ '?column?': 1 }]), { end: vi.fn().mockResolvedValue(undefined) })\n` +
+    `     A plain \`{ end }\` object is NOT callable and drives the failure branch. When code has a ` +
+    `\`catch { process.exit/throw }\` health check, the happy-path mock MUST resolve.`
   )
 }
 
