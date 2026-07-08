@@ -119,6 +119,7 @@ Runs the suite, collects coverage, and reports what's below threshold. Writes no
 ```bash
 lacuna analyze
 lacuna analyze @diff:origin/main    # patch coverage of the lines your branch changed
+lacuna analyze @diff packages/api   # ...scoped to one directory (monorepo package)
 lacuna analyze --threshold 90
 lacuna analyze --format json --output report.json
 lacuna analyze --format markdown
@@ -148,6 +149,7 @@ Codecov (and similar gates) judge **patch coverage**: the coverage of only the l
 ```bash
 lacuna generate @diff                       # diff vs the repo's default branch (origin/HEAD → main/master)
 lacuna generate @diff:origin/main           # explicit base ref
+lacuna generate @diff packages/api          # narrow to the changed lines inside ONE directory (monorepo package)
 lacuna generate @diff -f src/lib/Service.ts # narrow to ONE changed file's uncovered lines
 lacuna analyze  @diff:origin/main           # read-only: report patch coverage + the gap, write nothing
 ```

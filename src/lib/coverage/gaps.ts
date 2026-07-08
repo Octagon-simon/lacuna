@@ -239,6 +239,35 @@ function toAbs(path: string, cwd: string): string {
   return path.startsWith('/') ? path : join(cwd, path)
 }
 
+// Monorepo / vitest-workspace coverage reports frequently store file paths relative to the
+// PACKAGE root (e.g. `src/foo.ts` for a package at `packages/api`), while the git diff — run at
+// the repo root — yields repo-root-relative paths (`packages/api/src/foo.ts`). `toAbs(path, cwd)`
+// then keys the SAME file two different ways, so patch coverage sees the changed file as "outside
+// the report", routes it through `assumeUncovered`, and counts every changed line as uncovered —
+// a spurious 0% that never moves even after a passing test covers the lines. This realigns report
+// paths to the trusted git-diff paths: for each report file not already at a known changed path,
+// if its stored path is a trailing path-segment SUFFIX of exactly ONE changed absolute path,
+// rewrite it to that path. Base-agnostic (handles absolute or package-relative SF paths), only
+// ever touches changed files, and only on an unambiguous single match (never guesses).
+export function alignReportToChanged(
+  report: CoverageReport,
+  changed: Map<string, Set<number>>,
+  cwd: string,
+): CoverageReport {
+  const changedAbs = [...changed.keys()].map((p) => p.replace(/\\/g, '/'))
+  const changedSet = new Set(changedAbs)
+  let touched = false
+  const files = report.files.map((f) => {
+    const abs = toAbs(f.path, cwd).replace(/\\/g, '/')
+    if (changedSet.has(abs)) return f // already aligned
+    const rel = f.path.replace(/\\/g, '/').replace(/^\.?\/+/, '')
+    const matches = changedAbs.filter((c) => c.endsWith('/' + rel))
+    if (matches.length === 1) { touched = true; return { ...f, path: matches[0] } }
+    return f
+  })
+  return touched ? { ...report, files } : report
+}
+
 // Keeps only gaps for files the diff touched and narrows each gap's target lines to the
 // intersection of "uncovered per the report" ∩ "changed per git". A file with a coverage
 // entry whose changed lines are all covered is dropped (its patch coverage is already 100%).

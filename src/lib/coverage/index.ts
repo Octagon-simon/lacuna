@@ -24,6 +24,7 @@ export async function coverageAgeSeconds(config: LacunaConfig, cwd: string = pro
   }
 }
 
-export { extractGaps, filterTestableGaps, findUncoveredFiles, formatCoverageSummary, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps } from './gaps.js'
+export { parseLcov } from './lcov.js'
+export { extractGaps, filterTestableGaps, findUncoveredFiles, formatCoverageSummary, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps, alignReportToChanged } from './gaps.js'
 export type { FilterGapsOptions, PatchCoverage } from './gaps.js'
 export type { CoverageReport, CoverageGap, FileCoverage } from './types.js'

@@ -5,6 +5,7 @@ import chalk from 'chalk'
 import { loadConfig } from '../lib/config.js'
 import { detectEnvironment, scopedCoverageCommand } from '../lib/detector.js'
 import { runCommand } from '../lib/runner.js'
+import { parsePassCount } from '../lib/validate.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { loadCoverage, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps } from '../lib/coverage/index.js'
 import { resolveDiffScope, countChangedLines, scopeDiffToDir, GitDiffError } from '../lib/git-diff.js'
@@ -182,6 +183,25 @@ export default class Analyze extends Command {
         this.exit(2)
       }
       // partial failures are fine — coverage is still collected for passing tests
+
+      // Diff mode measures patch coverage against the CI baseline. A fresh full-suite run that
+      // executed ZERO passing tests measured nothing, so every changed line would look uncovered
+      // (a phantom 0% patch). This is the monorepo trap: the root `vitest run --coverage` skips a
+      // package's prerequisites (a build step, or the config/env its globalSetup needs) and exits
+      // fast with an empty report or "No test files found". Don't report a bogus number — bail
+      // and point the user at reusing their real (CI/test:cov) coverage.
+      if (diffScope && parsePassCount(combined) === 0) {
+        const setupErr = /Unhandled Error|Configuration property .*? is not defined|globalSetup\b|No test files found|Cannot find (?:module|package)/i.exec(combined)
+        this.log(chalk.red('\nThe full-suite coverage run executed 0 tests — there is no coverage to measure the diff against.'))
+        if (setupErr) this.log(chalk.yellow(`The suite aborted before running: "${setupErr[0]}".`))
+        this.log(chalk.dim(`\nIn a monorepo, \`${coverageCommand}\` from the repo root often skips a package's`))
+        this.log(chalk.dim('prerequisites (a build step, or the config/env its globalSetup needs) and finishes'))
+        this.log(chalk.dim('fast with an empty report — so every changed line looks uncovered (a phantom 0%).'))
+        this.log(chalk.yellow('\nFix: the full suite must actually run from the repo root for patch coverage to be real.'))
+        this.log(chalk.yellow('Run each package the way its own script does (build steps + config/env), or measure'))
+        this.log(chalk.yellow(`coverage per-package and point lacuna at that lcov via ./${config.coverageDir}/.\n`))
+        this.exit(2)
+      }
 
       try {
         report = await loadCoverage(config, cwd)

@@ -10,6 +10,7 @@ import { buildTsRule } from './runners/typescript.js'
 import { buildHookMockHint, buildCallbackOutcomeHint } from '../../lib/hook-mock-hints.js'
 import { buildRenderVocabSection } from '../../lib/render-vocab.js'
 import { buildServiceMockHint } from '../../lib/service-mock-hints.js'
+import { extractFailureRegion } from '../../lib/validate.js'
 
 // Existing test files longer than this switch to surgical patch mode (<code_patch>) instead
 // of full-file rewrites — rewriting a large file risks hitting the output token limit mid-file.
@@ -886,7 +887,7 @@ export function buildFixPrompt(args: {
 
   parts.push('\nFAILURE OUTPUT:')
   parts.push('```')
-  parts.push(errorOutput.slice(0, 3000))
+  parts.push(extractFailureRegion(errorOutput))
   parts.push('```')
 
   const realRequestWarning = detectRealRequestInError(errorOutput, mockApi)
@@ -1076,7 +1077,7 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
   // tests failed" contradicts the error text in several of those. Let the output speak.
   parts.push(`The previous attempt did not pass. Output from the last run:`)
   parts.push('```')
-  parts.push(failureOutput.slice(0, 3000))
+  parts.push(extractFailureRegion(failureOutput))
   parts.push('```')
 
   const realRequestWarning = detectRealRequestInError(failureOutput)
