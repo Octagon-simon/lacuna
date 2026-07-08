@@ -19,6 +19,7 @@ export interface FileContext {
 }
 export declare function computeRelativeImport(fromFile: string, toFile: string): string;
 export declare function findFileByName(dir: string, filename: string, depth?: number, maxDepth?: number): Promise<string | null>;
+export declare function findExistingTestFile(sourceFile: string, cwd: string, sourceDirs?: string[]): Promise<string | null>;
 export declare function collectTypeDefinitions(sourceCode: string, absoluteSourcePath: string, cwd: string): Promise<string | null>;
 export declare function collectLocalImportPaths(sourceCode: string, absoluteSourcePath: string, absoluteTestFilePath: string, cwd: string): Promise<string[] | null>;
 export declare function collectUsedSymbolsContext(sourceCode: string, absoluteSourcePath: string, cwd: string): Promise<string | null>;

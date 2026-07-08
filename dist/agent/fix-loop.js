@@ -2,7 +2,7 @@ import { readFile, writeFile, mkdir, unlink, readdir } from 'fs/promises';
 import { join, dirname, basename, extname, isAbsolute, relative } from 'path';
 import { access, stat } from 'fs/promises';
 import chalk from 'chalk';
-import { fileTestCommand, multiFileTestCommand, scopedTestCommand } from '../lib/detector.js';
+import { resolveFileTestRun, resolveScopeTestRun, resolveMultiFileTestRun } from '../lib/test-run.js';
 import { isWithinDir } from '../lib/coverage/index.js';
 import { formatFile } from '../lib/format.js';
 import { runCommand } from '../lib/runner.js';
@@ -74,9 +74,14 @@ function parseFailingTestFiles(output, runner) {
             }
         }
         if (runner === 'jest' || runner === 'vitest' || runner === 'unknown') {
-            const m = clean.match(new RegExp(`^FAIL\\s+(${TEST_FILE_RE.source})`));
-            if (m) {
-                failFiles.add(m[1]);
+            // `FAIL <path>` (jest / plain vitest) OR `FAIL <project> <path>` (vitest workspace &
+            // monorepo mode, where the package label — e.g. `@afriex/admin` — sits between FAIL and the
+            // path). Match the first test-file token anywhere on a FAIL-prefixed line rather than
+            // requiring it immediately after FAIL, so the workspace label can't hide the file.
+            if (/^FAIL\b/.test(clean)) {
+                const m = clean.match(new RegExp(`(${TEST_FILE_RE.source})`));
+                if (m)
+                    failFiles.add(m[1]);
             }
         }
     }
@@ -132,6 +137,63 @@ function parseFailingTestFiles(output, runner) {
         }
     }
     return [...combined];
+}
+async function pathExists(p) {
+    try {
+        await access(p);
+        return true;
+    }
+    catch {
+        return false;
+    }
+}
+// Collect every file under `root` whose basename equals `name` (skips node_modules and dot dirs).
+async function findAllByBasename(root, name, depth = 0, maxDepth = 12) {
+    if (depth > maxDepth)
+        return [];
+    let entries;
+    try {
+        entries = await readdir(root, { withFileTypes: true, encoding: 'utf-8' });
+    }
+    catch {
+        return [];
+    }
+    const out = [];
+    for (const e of entries) {
+        const full = join(root, e.name);
+        if (e.isDirectory()) {
+            if (e.name.startsWith('.') || e.name === 'node_modules')
+                continue;
+            out.push(...await findAllByBasename(full, name, depth + 1, maxDepth));
+        }
+        else if (e.name === name) {
+            out.push(full);
+        }
+    }
+    return out;
+}
+// vitest workspace / monorepo runs print test paths RELATIVE TO THE PACKAGE ROOT — e.g.
+// `src/screens/…/X.test.tsx` for a package living at `packages/admin` — not relative to cwd
+// (the monorepo root). Such a path doesn't exist at `cwd/<path>`, so both the existence check and
+// the scope filter reject it and the file is silently dropped ("could not identify any failing
+// test files"). Map the reported path to the real file: use the literal path when it exists, else
+// find a file under `searchRoot` whose path ENDS WITH the reported (package-relative) suffix.
+// Returns an absolute path, or null when unresolved/ambiguous (never guesses between duplicates).
+async function resolveReportedTestPath(f, cwd, searchRoot) {
+    const norm = f.replace(/\\/g, '/').replace(/^\.\//, '');
+    const direct = isAbsolute(norm) ? norm : join(cwd, norm);
+    if (await pathExists(direct))
+        return direct;
+    const matches = await findAllByBasename(searchRoot, basename(norm));
+    if (matches.length === 0)
+        return null;
+    const suffix = '/' + norm;
+    const bySuffix = matches.filter((m) => m.replace(/\\/g, '/').endsWith(suffix));
+    if (bySuffix.length === 1)
+        return bySuffix[0];
+    if (bySuffix.length > 1)
+        return null; // ambiguous suffix — don't guess
+    return matches.length === 1 ? matches[0] : null;
 }
 // ─── Find the source file that a test file is testing ────────────────────────
 async function findSourceFile(testFilePath, cwd, configSourceDirs = 'src') {
@@ -210,11 +272,29 @@ async function fixFile(testFilePath, options, generator, onStatus, projectMemory
     const { config, env, cwd, dryRun, verbose, log } = options;
     const shortPath = testFilePath.replace(cwd + '/', '');
     const absTestPath = testFilePath.startsWith('/') ? testFilePath : join(cwd, testFilePath);
+    // Per-file verify runs must honor the configurable timeout, not a hardcoded 60s. A slow
+    // integration suite (real DB, heavy transform/import) can take 60–120s+ to finish, so a 60s
+    // cap KILLS the run mid-stream: the captured output ends after a few passing tests with no
+    // summary line, which the gate misreads as "tests failing" and the model — shown only passes —
+    // "fixes" by looping forever, then deleting tests. coverageTimeout defaults to 300s.
+    const runTimeout = config.coverageTimeout * 1000;
+    // Run under the file's OWN package config (monorepo setupFiles/cleanup/env), not bare from root.
+    const fileRun = await resolveFileTestRun(env, absTestPath, cwd);
     if (!onStatus)
         log(chalk.bold(`\n  Fixing: ${chalk.cyan(shortPath)}`));
     onStatus?.({ phase: 'running', file: shortPath });
     // Run just this test file to get focused error output
-    const firstRun = await runCommand(fileTestCommand(env, absTestPath), cwd, 60_000);
+    const firstRun = await runCommand(fileRun.command, fileRun.cwd, runTimeout);
+    // A killed run is NOT a test failure — editing tests can't fix a timeout, and the partial,
+    // summary-less output would send the fix loop chasing a phantom failure. Surface it instead.
+    if (firstRun.timedOut) {
+        if (!onStatus)
+            log(chalk.red(`  ⚠ ${shortPath} did not finish within ${config.coverageTimeout}s — the suite was killed before completing, not failing.`));
+        if (!onStatus)
+            log(chalk.yellow(`    Raise the limit in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`));
+        onStatus?.({ phase: 'failed', file: shortPath });
+        return { success: false, error: `Test run timed out after ${config.coverageTimeout}s (suite killed before completing — raise coverageTimeout).` };
+    }
     let typeErrorsAtStart = null;
     if (firstRun.success) {
         // Tests pass. In targeted (--file) or --types mode, a green file may still have
@@ -505,7 +585,13 @@ async function fixFile(testFilePath, options, generator, onStatus, projectMemory
         if (!onStatus)
             log(chalk.dim('  Written. Running tests...'));
         onStatus?.({ phase: 'running', file: shortPath });
-        const result = await runCommand(fileTestCommand(env, absTestPath), cwd, 60_000);
+        const result = await runCommand(fileRun.command, fileRun.cwd, runTimeout);
+        if (result.timedOut) {
+            if (!onStatus)
+                log(chalk.red(`  ⚠ ${shortPath} did not finish within ${config.coverageTimeout}s — keeping the current file; raise coverageTimeout to verify it.`));
+            onStatus?.({ phase: 'failed', file: shortPath });
+            return { success: false, error: `Test run timed out after ${config.coverageTimeout}s (raise coverageTimeout).` };
+        }
         if (result.success) {
             if (hasPlaceholderBodies(testFileContent)) {
                 errorOutput =
@@ -659,7 +745,8 @@ function victimInFailing(victim, failing, cwd) {
 async function victimFailsWithSubset(victim, subset, env, cwd) {
     if (subset.length === 0)
         return false;
-    const result = await runCommand(multiFileTestCommand(env, [...subset, victim]), cwd, 120_000);
+    const run = await resolveMultiFileTestRun(env, [...subset, victim], cwd);
+    const result = await runCommand(run.command, run.cwd, 120_000);
     if (result.success)
         return false;
     const failing = parseFailingTestFiles(result.stdout + '\n' + result.stderr, env.testRunner);
@@ -721,7 +808,8 @@ async function findAndFixPolluters(victimFiles, options, projectMemory) {
         }
         seenPolluters.add(polluter);
         // Capture the victim's failure output when run after the polluter
-        const errorRun = await runCommand(multiFileTestCommand(env, [polluter, victim]), cwd, 60_000);
+        const pvRun = await resolveMultiFileTestRun(env, [polluter, victim], cwd);
+        const errorRun = await runCommand(pvRun.command, pvRun.cwd, 60_000);
         const victimError = extractTestFailure(errorRun.stdout + '\n' + errorRun.stderr);
         const pollutorCode = await readFile(polluter, 'utf-8').catch(() => null);
         const victimCode = await readFile(victim, 'utf-8').catch(() => null);
@@ -748,7 +836,8 @@ async function findAndFixPolluters(victimFiles, options, projectMemory) {
             continue;
         }
         await writeFile(polluter, fixed, 'utf-8');
-        const verifyRun = await runCommand(multiFileTestCommand(env, [polluter, victim]), cwd, 60_000);
+        const pvVerify = await resolveMultiFileTestRun(env, [polluter, victim], cwd);
+        const verifyRun = await runCommand(pvVerify.command, pvVerify.cwd, 60_000);
         const verifyFailing = parseFailingTestFiles(verifyRun.stdout + '\n' + verifyRun.stderr, env.testRunner);
         const victimResolved = !victimInFailing(victim, verifyFailing, cwd);
         if (victimResolved) {
@@ -824,7 +913,12 @@ async function regenerateFile(testFilePath, options, onStatus, projectMemory, ba
         // Never-regress: a "green" regen with fewer tests than the original is still a net loss
         // (e.g. 50 passing replacing 477). Re-run the regenerated file and keep it only if it has
         // at least as many passing tests as the original — otherwise restore the original.
-        const regenRun = await runCommand(fileTestCommand(options.env, absTestFile), options.cwd, 60_000);
+        const regenFileRun = await resolveFileTestRun(options.env, absTestFile, options.cwd);
+        const regenRun = await runCommand(regenFileRun.command, regenFileRun.cwd, options.config.coverageTimeout * 1000);
+        // A timed-out re-run parses as 0 passing → would look like a regression vs baseline and
+        // restore the original. Don't punish a slow suite: keep the regen when the run was killed.
+        if (regenRun.timedOut)
+            return { success: true };
         const regenPass = parsePassCount(regenRun.stdout + '\n' + regenRun.stderr);
         if (regenPass < baselinePassCount && originalContent !== null) {
             await writeFile(absTestFile, originalContent, 'utf-8').catch(() => { });
@@ -927,7 +1021,6 @@ export async function runFixLoop(options) {
     // Scope (`lacuna fix <dir>`): restrict selection + the discovery run to a subtree.
     const scopeDir = options.scopeDir;
     const scopeRel = scopeDir ? scopeDir.replace(cwd + '/', '').replace(/\/+$/, '') : undefined;
-    const inScope = (f) => !scopeDir || isWithinDir(f.startsWith('/') ? f : join(cwd, f), scopeDir);
     let failingFiles;
     if (options.types && !options.targetFile) {
         // Types mode: select by type errors rather than test failures. One project-wide tsc
@@ -957,8 +1050,14 @@ export async function runFixLoop(options) {
             ? options.targetFile
             : join(cwd, options.targetFile);
         const spinner = startCoverageSpinner(chalk.dim(`  Checking ${options.targetFile}...`), env.testRunner);
-        const fileResult = await runCommand(fileTestCommand(env, absTarget), cwd, 60_000, spinner.onLine);
+        const targetRun = await resolveFileTestRun(env, absTarget, cwd);
+        const fileResult = await runCommand(targetRun.command, targetRun.cwd, config.coverageTimeout * 1000, spinner.onLine);
         spinner.stop();
+        if (fileResult.timedOut) {
+            log(chalk.red(`\n  ⚠ ${options.targetFile} did not finish within ${config.coverageTimeout}s — the suite was killed before completing, not failing.`));
+            log(chalk.yellow(`    Raise the limit in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`));
+            return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [`${options.targetFile}: test run timed out after ${config.coverageTimeout}s`] };
+        }
         if (fileResult.success) {
             // Tests pass — but the runner only transpiles, it doesn't type-check. A green file
             // can still have TypeScript errors (the exact case `generate` hands off here). Only
@@ -983,10 +1082,14 @@ export async function runFixLoop(options) {
             failingFiles = cache.files;
         }
         else {
-            const runCmd = (scopeRel && scopedTestCommand(env, scopeRel)) || env.testCommand;
+            // Run under the scoped package's OWN config (monorepo setupFiles/cleanup/env), so a test
+            // that only passes with its package setup isn't reported as a false failure.
+            const scopeRun = scopeDir
+                ? await resolveScopeTestRun(env, scopeDir, cwd)
+                : { command: env.testCommand, cwd };
             const label = scopeRel ? `  Running tests under ${scopeRel} to find failures...` : '  Running test suite to find failures...';
             const spinner = startCoverageSpinner(chalk.dim(label), env.testRunner);
-            const suiteResult = await runCommand(runCmd, cwd, config.coverageTimeout * 1000, spinner.onLine);
+            const suiteResult = await runCommand(scopeRun.command, scopeRun.cwd, config.coverageTimeout * 1000, spinner.onLine);
             spinner.stop();
             if (suiteResult.timedOut) {
                 throw new Error(`Test suite timed out after ${config.coverageTimeout}s.\n` +
@@ -997,15 +1100,26 @@ export async function runFixLoop(options) {
                 log(chalk.green(`\n  All tests${where} are passing — nothing to fix.`));
                 return { filesProcessed: 0, filesFixed: 0, filesAlreadyPassing: 0, pollutersFixed: 0, victimsRegenerated: 0, errors: [] };
             }
-            failingFiles = parseFailingTestFiles(suiteResult.stdout + suiteResult.stderr, env.testRunner);
-            failingFiles = failingFiles.filter((f) => {
-                const abs = f.startsWith('/') ? f : join(cwd, f);
-                return abs.startsWith(cwd) && !abs.includes('node_modules') && inScope(f);
-            });
+            const parsedFiles = parseFailingTestFiles(suiteResult.stdout + suiteResult.stderr, env.testRunner);
+            // Resolve each reported path to a real file (handles vitest workspace/monorepo package-
+            // relative paths), then keep those inside cwd, out of node_modules, and within scope.
+            const searchRoot = scopeDir ?? cwd;
+            const resolved = new Set();
+            for (const f of parsedFiles) {
+                const abs = await resolveReportedTestPath(f, cwd, searchRoot);
+                if (!abs)
+                    continue;
+                if (!abs.startsWith(cwd) || abs.includes('node_modules'))
+                    continue;
+                if (scopeDir && !isWithinDir(abs, scopeDir))
+                    continue;
+                resolved.add(abs);
+            }
+            failingFiles = [...resolved];
             if (failingFiles.length === 0) {
                 const where = scopeRel ? ` under ${scopeRel}` : '';
                 log(chalk.yellow(`\n  Could not identify any failing test files${where} from the output.`));
-                log(chalk.dim(`  Try running ${runCmd} directly to inspect the output.`));
+                log(chalk.dim(`  Try running ${scopeRun.command} directly (in ${scopeRun.cwd}) to inspect the output.`));
                 const lastLines = (suiteResult.stdout + suiteResult.stderr)
                     .split('\n')
                     .filter((l) => l.trim())

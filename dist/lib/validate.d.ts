@@ -4,6 +4,7 @@ export declare function isZeroTestsOutput(raw: string): boolean;
 export declare function enrichNoTestsError(extracted: string, rawOutput?: string): string;
 export declare function parsePassCount(output: string): number;
 export declare function parseFailCount(output: string): number;
+export declare function extractFailureRegion(output: string, maxChars?: number): string;
 export declare function stripLeadingProse(code: string): {
     code: string;
     stripped: string | null;

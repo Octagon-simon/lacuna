@@ -6,6 +6,7 @@ export interface FilterGapsOptions {
 export declare function filterTestableGaps(gaps: CoverageGap[], userIgnore?: string[], opts?: FilterGapsOptions): Promise<CoverageGap[]>;
 export declare function isWithinDir(absPath: string, absDir: string): boolean;
 export declare function findUncoveredFiles(report: CoverageReport, sourceDir: string | string[], cwd: string, userIgnore?: string[], scopeDir?: string): Promise<CoverageGap[]>;
+export declare function alignReportToChanged(report: CoverageReport, changed: Map<string, Set<number>>, cwd: string): CoverageReport;
 export declare function narrowGapsToDiff(gaps: CoverageGap[], changed: Map<string, Set<number>>, report: CoverageReport, cwd: string): CoverageGap[];
 export declare function missingChangedFileGaps(changed: Map<string, Set<number>>, report: CoverageReport, existingGaps: CoverageGap[], cwd: string, userIgnore?: string[]): Promise<CoverageGap[]>;
 export interface PatchCoverage {

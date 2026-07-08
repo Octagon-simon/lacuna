@@ -99,6 +99,35 @@ export function parseFailCount(output) {
     const summaryLine = stripAnsi(output).match(/^\s*Tests\b[^\n]*?(\d+)\s+failed/m);
     return summaryLine ? parseInt(summaryLine[1], 10) : 0;
 }
+// Test runners print PASSING tests first and the actual failures + summary LAST. Naively
+// slicing the HEAD of a long, mostly-passing run (slice(0, N)) therefore shows the model only
+// ✓ passes and hides every failure — so it concludes "the tests pass, the output is just
+// truncated" and stops fixing (or starts DELETING tests to force green). Keep the region that
+// actually carries the failure: from the earliest failure/summary marker to the end, and if
+// that still overflows the budget keep its TAIL (the summary and last-printed failures live
+// there). Falls back to the tail of the whole output when no marker is found.
+const FAILURE_MARKERS = [
+    /^[ \t]*(?:FAIL|×|✗|❯|❌)[ \t]/m, // per-file / per-test failure lines (vitest/jest)
+    /⎯{3,}/, // vitest "Failed Tests" separator banner
+    /^\s*●/m, // jest failure bullet
+    /^\s*(?:Failed Tests|Test Files)\b/m, // vitest end-of-run summary block
+    /\b\d+\s+failed\b/, // "N failed" (summary or inline)
+];
+export function extractFailureRegion(output, maxChars = 3000) {
+    const clean = stripAnsi(output);
+    if (clean.length <= maxChars)
+        return clean;
+    let start = -1;
+    for (const re of FAILURE_MARKERS) {
+        const m = re.exec(clean);
+        if (m && (start === -1 || m.index < start))
+            start = m.index;
+    }
+    const region = start >= 0 ? clean.slice(start) : clean;
+    return region.length > maxChars
+        ? '…(earlier passing output trimmed)…\n' + region.slice(region.length - maxChars)
+        : region;
+}
 // Strips leading prose/thinking lines from generated code output.
 // When a model bleeds reasoning into <code_output>, the file starts with fragments
 // like ", nothing else." or "I'll write the test now." before the real code begins.

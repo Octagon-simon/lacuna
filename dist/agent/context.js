@@ -165,7 +165,7 @@ async function inferTestFilePath(sourceFile, cwd, env, sourceDirs = ['src']) {
     await mkdir(testsDir, { recursive: true });
     return join(dir, '__tests__', `${base}.test${ext}`);
 }
-async function findExistingTestFile(sourceFile, cwd, sourceDirs = ['src']) {
+export async function findExistingTestFile(sourceFile, cwd, sourceDirs = ['src']) {
     const ext = extname(sourceFile);
     const base = basename(sourceFile, ext);
     const dir = dirname(sourceFile);
