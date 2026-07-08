@@ -179,7 +179,7 @@ async function inferTestFilePath(
   return join(dir, '__tests__', `${base}.test${ext}`)
 }
 
-async function findExistingTestFile(sourceFile: string, cwd: string, sourceDirs: string[] = ['src']): Promise<string | null> {
+export async function findExistingTestFile(sourceFile: string, cwd: string, sourceDirs: string[] = ['src']): Promise<string | null> {
   const ext = extname(sourceFile)
   const base = basename(sourceFile, ext)
   const dir = dirname(sourceFile)
