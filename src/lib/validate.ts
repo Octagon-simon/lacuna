@@ -43,19 +43,33 @@ export function isZeroTestsOutput(raw: string): boolean {
   return /Tests:?\s+(?:0\s+total|no tests)\b|no tests? found|found 0 tests/i.test(stripAnsi(raw))
 }
 
+// Human-facing display name for a runner id (from env.testRunner). Falls back to a neutral
+// phrase for unknown/omitted runners so the message never lies about which runner ran.
+function runnerDisplayName(runner?: string): string {
+  const names: Record<string, string> = {
+    jest: 'Jest', vitest: 'Vitest', mocha: 'Mocha', pytest: 'pytest',
+    'go-test': 'go test', phpunit: 'PHPUnit', pest: 'Pest', rspec: 'RSpec',
+  }
+  return (runner && names[runner]) || 'The test runner'
+}
+
 // If the runner output indicates "no tests found", replace it with a clear instruction
 // so the AI knows exactly what went wrong. The zero-tests decision is made on `rawOutput`
 // (the full runner output, which still carries the authoritative Tests summary line);
 // `extracted` is the already-trimmed failure text that gets returned/appended. Callers that
-// only have one string can omit `rawOutput` — it defaults to `extracted`.
-export function enrichNoTestsError(extracted: string, rawOutput: string = extracted): string {
+// only have one string can omit `rawOutput` — it defaults to `extracted`. Pass `runner`
+// (env.testRunner) so the message names the ACTUAL runner instead of hardcoding "Vitest" —
+// naming the wrong runner sends the model chasing vitest-specific fixes in a jest project.
+export function enrichNoTestsError(extracted: string, rawOutput: string = extracted, runner?: string): string {
   if (!isZeroTestsOutput(rawOutput)) return extracted
   return (
-    'ERROR: Vitest found 0 tests in this file. The file ran but had nothing to execute.\n\n' +
+    `ERROR: ${runnerDisplayName(runner)} found 0 tests in this file. The file ran but had nothing to execute.\n\n` +
     'This means one of:\n' +
     '  1. You wrote only imports, types, or describe() blocks with no it()/test() inside\n' +
     '  2. A module import failed during collection — check the output below for an error\n' +
-    '  3. Tests are inside a plain function that is never called\n\n' +
+    '  3. Tests are inside a plain function that is never called\n' +
+    '  4. The runner matched 0 files for this path (look for a "0 matches" / "No tests found" line\n' +
+    '     below — this is a runner invocation issue, NOT something to fix by rewriting the tests)\n\n' +
     'REQUIRED: Every test file must have at least one test like this:\n' +
     '  it(\'description\', () => {\n' +
     '    expect(result).toBe(expected)\n' +
