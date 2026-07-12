@@ -5,6 +5,7 @@ import { execSync } from 'child_process'
 import { select, input, confirm } from '@inquirer/prompts'
 import chalk from 'chalk'
 import { detectEnvironment } from '../lib/detector.js'
+import { detectPlaywright, installPlaywright, ensurePlaywrightConfig, ensureE2EAuthScaffolding } from '../lib/playwright.js'
 import { PRESETS } from '../lib/providers/index.js'
 import type { LacunaConfig } from '../lib/config.js'
 
@@ -635,6 +636,34 @@ async function ensureTestRunnerSetup(
       log(chalk.green(`  ✓ Created .mocharc.json`))
     }
     log(chalk.dim(`\n  Add to package.json scripts: "test": "c8 --reporter=lcov mocha"`))
+  }
+
+  // ── End-to-end (Playwright) setup ──────────────────────────────────────────
+  // Browser E2E only makes sense for the web frameworks the route discovery supports
+  // (Next.js, React Router). Playwright is a heavy, opt-in install (it downloads browser
+  // binaries), so it lives here in the wizard rather than being a side effect of a later
+  // `lacuna generate --e2e`. Default the prompt to no — it's an extra, not the core path.
+  if (meta.isNextJs || meta.isReact) {
+    if (await detectPlaywright(cwd)) {
+      log(chalk.dim('\n  @playwright/test already installed.'))
+      await ensurePlaywrightConfig(cwd, log)   // scaffold a config if they have the dep but none yet
+      await ensureE2EAuthScaffolding(cwd, log)
+      log(chalk.dim('  Run `lacuna generate --e2e` for browser specs.'))
+    } else {
+      const wantE2E = await confirm({
+        message: 'Set up end-to-end (Playwright) testing? Installs @playwright/test and browser binaries.',
+        default: false,
+      })
+      if (wantE2E) {
+        if (installPlaywright(cwd, log)) {
+          await ensurePlaywrightConfig(cwd, log)   // complete the setup with a runnable config
+          await ensureE2EAuthScaffolding(cwd, log) // + auth helpers (test user, login setup)
+          log(chalk.green('  ✓ Playwright ready — run `lacuna generate --e2e` to create browser specs.'))
+        }
+      } else {
+        log(chalk.dim('  Skipped. `lacuna generate --e2e` will offer to install it when you need it.'))
+      }
+    }
   }
 
   return createdSetupFile

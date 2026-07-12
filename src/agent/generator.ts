@@ -334,8 +334,17 @@ export class TestGenerator {
   private lastIsPatch = false
   private patchMode = false   // file is large enough to require <code_patch> mode — retries must stay in it
   private reactish = false     // React/RN project — gates React-specific retry guidance
+  private e2eMode = false       // E2E (Playwright) repair — gates E2E retry guidance over unit causes
   private readonly debugFile: string | null   // configured base path (or null)
   private activeDebugFile: string | null = null   // per-file path for the file currently being processed
+  private systemPromptOverride?: string   // set by generateE2E so generate AND retries use the E2E system prompt
+
+  // The system prompt for the current task. E2E generation overrides the default unit-test
+  // system prompt; everything else uses the env-derived one. Centralised so retry() picks up
+  // the override without special-casing.
+  private systemPrompt(): string {
+    return this.systemPromptOverride ?? buildSystemPrompt(this.env)
+  }
 
   constructor(options: GeneratorOptions) {
     this.provider = createProvider(options.config)
@@ -389,6 +398,8 @@ export class TestGenerator {
     this.lastHypothesis = ''
     this.failedAttempts = []
     this.previousCodes = []
+    this.systemPromptOverride = undefined   // unit path uses the env-derived system prompt
+    this.e2eMode = false
     // Mirrors buildGeneratePrompt's patch-mode decision so retries stay in the same mode.
     this.patchMode = (context.existingTestCode?.split('\n').length ?? 0) > PATCH_MODE_LINE_THRESHOLD
     this.reactish = context.reactMajorVersion != null
@@ -425,7 +436,7 @@ export class TestGenerator {
 
     const response = await this.provider.generate(
       this.history,
-      buildSystemPrompt(this.env),
+      this.systemPrompt(),
       this.buildOnToken(),
       estimateMaxTokens(context.sourceCode, this.maxTokens),
       GENERATE_TEMPERATURE,
@@ -445,6 +456,8 @@ export class TestGenerator {
     this.lastHypothesis = ''
     this.failedAttempts = []
     this.previousCodes = []
+    this.systemPromptOverride = undefined   // unit path uses the env-derived system prompt
+    this.e2eMode = false
     // Mirrors buildFixPrompt's patch-mode decision so retries stay in the same mode.
     this.patchMode = (args.existingTestLineCount ?? 0) > PATCH_MODE_LINE_THRESHOLD
     this.reactish = args.reactMajorVersion != null
@@ -455,12 +468,65 @@ export class TestGenerator {
 
     const response = await this.provider.generate(
       this.history,
-      buildSystemPrompt(this.env),
+      this.systemPrompt(),
       this.buildOnToken(),
       estimateMaxTokens(args.sourceCode, this.maxTokens),
       GENERATE_TEMPERATURE,
     )
     await debugWrite(this.activeDebugFile, 'RESPONSE (fix)', response)
+
+    const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response)
+    this.lastHypothesis = hypothesis
+    this.lastIsPatch = isPatch
+    this.previousCodes.push(normalizeCode(code))
+    this.history.push({ role: 'assistant', content: response })
+    if (truncated) throw new TruncatedOutputError(code)
+    return code
+  }
+
+  // E2E spec generation. The caller (e2e-loop) owns the prompts via prompts/e2e.ts, so this runs
+  // one provider round under the E2E system prompt and returns the parsed spec.
+  async generateE2E(systemPrompt: string, userPrompt: string, debugName: string): Promise<string> {
+    return this.runE2ERound(systemPrompt, userPrompt, debugName, 'e2e generate')
+  }
+
+  // E2E spec repair (lacuna fix --e2e). Same single-round mechanics as generateE2E but with the
+  // failure-analysis/repair prompt; retry() reuses the E2E system prompt via the override.
+  async fixE2E(systemPrompt: string, userPrompt: string, debugName: string): Promise<string> {
+    return this.runE2ERound(systemPrompt, userPrompt, debugName, 'e2e fix')
+  }
+
+  // data-testid injection (lacuna generate --e2e --inject-testids). The model returns the
+  // component source with data-testid attributes added; same single-round mechanics — the caller
+  // verifies the result against a re-snapshot and reverts if it didn't take.
+  async injectTestIds(systemPrompt: string, userPrompt: string, debugName: string): Promise<string> {
+    return this.runE2ERound(systemPrompt, userPrompt, debugName, 'e2e inject-testids')
+  }
+
+  // Shared E2E round: sets the E2E system prompt as the override (so subsequent retry() calls
+  // reuse it instead of buildSystemPrompt), runs one provider call, and parses the spec.
+  // Oscillation/truncation handling is shared with the rest of the agent.
+  private async runE2ERound(systemPrompt: string, userPrompt: string, debugName: string, label: string): Promise<string> {
+    this.lastHypothesis = ''
+    this.failedAttempts = []
+    this.previousCodes = []
+    this.patchMode = false   // specs are written whole; no patch mode
+    this.reactish = false    // no React-specific retry guidance for browser specs
+    this.e2eMode = true      // retries get E2E guidance (selector/sync/redirect), not unit mock causes
+    this.systemPromptOverride = systemPrompt
+
+    this.history = [{ role: 'user', content: userPrompt }]
+    this.activeDebugFile = perFileDebugPath(this.debugFile, debugName)
+    await debugWrite(this.activeDebugFile, `PROMPT (${label})`, userPrompt, /* clear= */ true)
+
+    const response = await this.provider.generate(
+      this.history,
+      systemPrompt,
+      this.buildOnToken(),
+      this.maxTokens,
+      GENERATE_TEMPERATURE,
+    )
+    await debugWrite(this.activeDebugFile, `RESPONSE (${label})`, response)
 
     const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response)
     this.lastHypothesis = hypothesis
@@ -479,7 +545,7 @@ export class TestGenerator {
     this.history = [{ role: 'user', content: buildPollutionFixPrompt(args) }]
     const response = await this.provider.generate(
       this.history,
-      buildSystemPrompt(this.env),
+      this.systemPrompt(),
       this.buildOnToken(),
       this.maxTokens,
       RETRY_TEMPERATURE,
@@ -514,13 +580,13 @@ export class TestGenerator {
 
     this.history.push({
       role: 'user',
-      content: buildRetryPrompt(failureOutput, this.failedAttempts, this.patchMode, this.reactish),
+      content: buildRetryPrompt(failureOutput, this.failedAttempts, this.patchMode, this.reactish, this.e2eMode),
     })
     await debugWrite(this.activeDebugFile, `PROMPT (retry ${this.failedAttempts.length})`, this.history[this.history.length - 1].content)
 
     const response = await this.provider.generate(
       this.history,
-      buildSystemPrompt(this.env),
+      this.systemPrompt(),
       this.buildOnToken(),
       this.maxTokens,
       RETRY_TEMPERATURE,

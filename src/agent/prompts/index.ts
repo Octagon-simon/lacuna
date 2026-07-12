@@ -1051,7 +1051,7 @@ export interface FailedAttempt {
   failureReason: string
 }
 
-export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAttempt[] = [], patchMode = false, reactish = true): string {
+export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAttempt[] = [], patchMode = false, reactish = true, e2e = false): string {
   const parts: string[] = []
 
   if (failedAttempts.length > 0) {
@@ -1099,6 +1099,16 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
   if (tsErrorWarning) parts.push(`\n⚠️  ${tsErrorWarning}`)
 
   parts.push('')
+  if (e2e) {
+    // Playwright spec repair — the unit causes (mocks/import paths/barrel mocks) are noise here.
+    parts.push('Common causes for a Playwright spec:')
+    parts.push('- Selector drift: a getByRole name / data-testid / CSS selector no longer matches. Fix it against the FRESH SNAPSHOT from the original prompt. If the selector lives in a SHARED helper/config file, fix it THERE via a // ---HELPER_FILE: <path>--- section — do NOT inline a workaround.')
+    parts.push('- Strict-mode violation ("resolved to N elements"): make the locator unique (role + accessible name, or a testid), not .first()/.nth().')
+    parts.push('- Timeout / hang: a step is waiting on something that never appears (usually a wrong selector or an un-awaited navigation). Fix the selector or wait on a real UI signal — never waitForTimeout.')
+    parts.push('- Redirect / auth: the route now redirects (e.g. to /login). Expect the new URL; do not fabricate a login flow if the project has a fixture/helper for it.')
+    parts.push('- Setup/data dependency: the spec\'s beforeAll/beforeEach or an imported helper (admin/api setup, seeded data) failed. Read the helper and the failure; the fix may belong in the spec\'s setup, not the assertions.')
+    parts.push('- KEEP the project\'s conventions: reuse its selectors object and helpers; do not inline selector strings or convert them to getByRole.')
+  } else {
   parts.push('Common causes:')
   parts.push('- Wrong import path — check the path aliases and dependency list from the original prompt')
   parts.push('- Missing mock — if a module needs mocking, add it to the shared mock file')
@@ -1113,13 +1123,17 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
     parts.push('- Loading state — if the error is "Unable to find element" on a Submit/Save button, the component likely unmounts the button during loading rather than disabling it. Assert on the spinner or loading indicator instead.')
     parts.push('- Unhandled rejection (an "unhandled error" / "Unhandled Rejection" warning from the test runner): a mockRejectedValueOnce promise is escaping the test scope. After the action that triggers the rejection, add: await waitFor(() => expect(screen.getByText(/error/i)).toBeInTheDocument()) — this keeps the rejection chained inside the test so the runner doesn\'t treat it as unhandled. The component may already catch the error internally, but the test still needs to await the resulting state change.')
   }
+  }
   parts.push('')
   // Preserve the response mode the file is in. For a large (patch-mode) file, forcing a full
-  // <code_output> rewrite risks truncation mid-file — keep it on <code_patch>.
+  // <code_output> rewrite risks truncation mid-file — keep it on <code_patch>. E2E specs are
+  // written whole, so they always use <code_output> (plus any // ---HELPER_FILE--- sections).
   parts.push(
     patchMode
       ? 'Fix the issue using <code_patch> tags with the patch operations from the original prompt — do NOT rewrite the whole file, and do NOT use <code_output>.'
-      : 'Fix the issue and return your response in the required <thinking> + <code_output> format.',
+      : e2e
+        ? 'Fix the issue and return the COMPLETE repaired spec in <code_output> (plus any // ---HELPER_FILE: <path>--- sections if a shared selector/config needs fixing at its source).'
+        : 'Fix the issue and return your response in the required <thinking> + <code_output> format.',
   )
 
   return parts.join('\n')

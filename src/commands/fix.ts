@@ -19,6 +19,7 @@ export default class Fix extends Command {
     '$ lacuna fix --dry-run',
     '$ lacuna fix --regenerate-on-failure',
     '$ lacuna fix --fix-polluters',
+    '$ lacuna fix --e2e',
   ]
 
   // Optional positional: a test file (single-file mode) OR a directory (only repair failing
@@ -70,6 +71,10 @@ export default class Fix extends Command {
       description: 'Select files by TypeScript type errors instead of test failures — repairs test files that pass but fail type-checking (one project-wide tsc, honors --workers)',
       default: false,
     }),
+    e2e: Flags.boolean({
+      description: 'Repair failing Playwright end-to-end specs instead of unit tests (selects specs by running Playwright, requires @playwright/test)',
+      default: false,
+    }),
   }
 
   async run(): Promise<void> {
@@ -100,19 +105,32 @@ export default class Fix extends Command {
 
     this.log(chalk.bold('\nlacuna fix\n'))
     this.log(`${chalk.dim('Model:')}   ${chalk.cyan(config.model)}`)
-    this.log(`${chalk.dim('Runner:')}  ${chalk.cyan(env.testRunner)}`)
+    // In e2e mode the unit runner is irrelevant — runFixLoop swaps in the Playwright env — so
+    // show that rather than a misleading "unknown".
+    this.log(`${chalk.dim('Runner:')}  ${chalk.cyan(flags.e2e ? 'playwright' : env.testRunner)}`)
     if (flags.types) this.log(`${chalk.dim('Mode:')}    ${chalk.cyan('type errors')} ${chalk.dim('(selecting files by TypeScript errors, not test failures)')}`)
+    if (flags.e2e) this.log(`${chalk.dim('Mode:')}    ${chalk.cyan('end-to-end')} ${chalk.dim('(repairing Playwright specs, not unit tests)')}`)
     if (flags.workers > 1) this.log(`${chalk.dim('Workers:')} ${flags.workers}`)
-    if (config.mocksFile) this.log(`${chalk.dim('Mocks:')}   ${chalk.cyan(config.mocksFile)}`)
+    // Mocks are a unit-test concern; e2e specs drive a real browser and never use the unit mock file.
+    if (config.mocksFile && !flags.e2e) this.log(`${chalk.dim('Mocks:')}   ${chalk.cyan(config.mocksFile)}`)
     const debugPattern = debugLogPattern(config.debug)
     if (debugPattern) this.log(`${chalk.dim('Debug:')}   ${chalk.green('on')} ${chalk.dim(`→ ${debugPattern}`)}`)
     if (flags['dry-run']) this.log(chalk.yellow('  [dry-run — no files will be written]'))
     if (scopeDir) this.log(`${chalk.dim('Scope:')}   ${args.path}`)
     else if (targetFile) this.log(`${chalk.dim('Target:')}  ${targetFile}`)
 
-    if (env.testRunner === 'unknown') {
+    // E2E mode selects specs by running Playwright (runFixLoop checks for @playwright/test), so
+    // it does NOT need a unit test runner — skip the guard that would otherwise bail here.
+    if (env.testRunner === 'unknown' && !flags.e2e) {
       this.warn('Could not detect test runner. Run `lacuna init` to configure.')
       this.exit(2)
+    }
+
+    // --fix-polluters is a UNIT-test mechanism (bisect files that share module/global state via the
+    // unit runner). It's meaningless for Playwright specs — ignore it in e2e mode rather than run a
+    // unit bisect against browser specs.
+    if (flags['fix-polluters'] && flags.e2e) {
+      this.log(chalk.yellow('  Note: --fix-polluters is for unit tests and does not apply to e2e specs — ignoring it.'))
     }
 
     let result
@@ -130,6 +148,7 @@ export default class Fix extends Command {
         regenerateOnFailure: flags['regenerate-on-failure'],
         fixPolluters: flags['fix-polluters'],
         types: flags.types,
+        e2e: flags.e2e,
         log: (msg) => this.log(msg),
       })
     } catch (err) {
@@ -156,9 +175,11 @@ export default class Fix extends Command {
       this.log(`  ${chalk.dim(flags.types ? 'Still erroring:' : 'Still failing:')}  ${chalk.red(String(stillFailing))}`)
     }
 
-    // The pollution hint only makes sense for suite-failure selection — in --types mode a
-    // "skipped" file is a type-clean false match, not a pollution victim.
-    if (result.filesAlreadyPassing > 0 && !flags['fix-polluters'] && !flags.types) {
+    // The pollution hint only makes sense for unit suite-failure selection. In --types mode a
+    // "skipped" file is a type-clean false match; in --e2e mode there is no module/global-state
+    // pollution between specs (and the polluter bisect is a unit-runner mechanism) — a spec that
+    // passes alone just passes, so don't suggest --fix-polluters.
+    if (result.filesAlreadyPassing > 0 && !flags['fix-polluters'] && !flags.types && !flags.e2e) {
       this.log(chalk.dim(`\n  ${result.filesAlreadyPassing} file(s) passed in isolation but fail in the suite. Use --fix-polluters to bisect + regenerate them.`))
     }
 
