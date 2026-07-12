@@ -1,6 +1,15 @@
 import { dirname, join, relative } from 'path';
 import { readFile, access } from 'fs/promises';
-import { fileTestCommand, multiFileTestCommand, scopedTestCommand, sq } from './detector.js';
+import { fileTestCommand, multiFileTestCommand, scopedTestCommand, sq, jestPath } from './detector.js';
+// Quote a path for a `npm test -- <path>` argument. For Jest, the positional arg is a
+// testPathPattern REGEX, not a literal path — so regex meta-chars (e.g. the parens in Expo
+// Router's app/(tabs)/...) must be escaped or the path matches 0 files ("No tests found"),
+// which lacuna then misreports as an empty/no-it() test file. sq() alone shell-quotes but
+// does NOT escape the regex, so Jest still sees (tabs) as a capture group. Vitest/others
+// treat the positional as a literal substring filter, so plain shell-quoting is correct.
+function npmTestArg(env, rel) {
+    return env.testRunner === 'jest' ? jestPath(rel) : sq(rel);
+}
 // Monorepo/workspace support: a test must run under ITS OWN package's config so the package's
 // `setupFiles` (cleanup, jest-dom), `environment`, and projects apply — exactly like the
 // developer's own `npm test`. Running a bare `npx vitest run <file>` from the repo root skips
@@ -80,7 +89,7 @@ export async function resolveFileTestRun(env, absFile, repoRoot) {
     const rel = relative(cwd, absFile);
     if (npmTest) {
         const covOff = env.testRunner === 'vitest' ? ' --coverage.enabled=false' : '';
-        return { command: `npm test -- ${sq(rel)}${covOff}`, cwd };
+        return { command: `npm test -- ${npmTestArg(env, rel)}${covOff}`, cwd };
     }
     return { command: fileTestCommand(env, rel), cwd };
 }
@@ -89,7 +98,7 @@ export async function resolveScopeTestRun(env, absDir, repoRoot) {
     const { cwd, npmTest } = await findTestRoot(absDir, repoRoot, env.testRunner);
     const rel = relative(cwd, absDir);
     if (npmTest)
-        return { command: rel ? `npm test -- ${sq(rel)}` : 'npm test', cwd };
+        return { command: rel ? `npm test -- ${npmTestArg(env, rel)}` : 'npm test', cwd };
     return { command: (rel && scopedTestCommand(env, rel)) || env.testCommand, cwd };
 }
 // Incremental patch-coverage run for `generate --file <src> @diff`: run the ONE new test file
@@ -117,7 +126,7 @@ export async function resolveIncrementalCoverageRun(env, absTestFile, absSourceF
         covFlags = `--coverage --collectCoverageFrom=${sq(relSrc)} --coverageReporters=lcov --coverageDirectory=${sq(outDir)}`;
         bareRun = `npx jest ${sq(relTest)}`;
     }
-    const command = npmTest ? `npm test -- ${sq(relTest)} ${covFlags}` : `${bareRun} ${covFlags}`;
+    const command = npmTest ? `npm test -- ${npmTestArg(env, relTest)} ${covFlags}` : `${bareRun} ${covFlags}`;
     return { command, cwd };
 }
 // Multi-file run (pollution victim/polluter checks). Uses the shared package root only when ALL
@@ -126,7 +135,7 @@ export async function resolveMultiFileTestRun(env, absFiles, repoRoot) {
     const first = await findTestRoot(dirname(absFiles[0]), repoRoot, env.testRunner);
     const allUnder = absFiles.every((f) => f === first.cwd || f.startsWith(first.cwd + '/'));
     if (allUnder && first.npmTest) {
-        const rels = absFiles.map((f) => sq(relative(first.cwd, f))).join(' ');
+        const rels = absFiles.map((f) => npmTestArg(env, relative(first.cwd, f))).join(' ');
         return { command: `npm test -- ${rels}`, cwd: first.cwd };
     }
     if (allUnder) {
