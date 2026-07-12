@@ -126,9 +126,10 @@ export function sq(path: string): string {
 }
 
 // Escape regex meta-characters in a file path so it can be used as a literal
-// match in Jest's --testPathPattern. Without this, app/(tabs)/... becomes a
+// match in Jest's --testPathPattern (or a bare positional arg, which Jest also
+// treats as a testPathPattern regex). Without this, app/(tabs)/... becomes a
 // regex capturing group that matches "app/tabs/..." (no parens) — 0 matches.
-function jestPath(path: string): string {
+export function jestPath(path: string): string {
   return sq(path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
 }
 
