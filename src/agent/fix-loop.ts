@@ -833,8 +833,8 @@ async function fixFile(
     // rawExtracted there so the actual module error isn't buried in boilerplate.
     const leakGuidance = processExitLeakGuidance(rawRunOutput)
     const extracted = leakGuidance
-      ? `${leakGuidance}\n\n${enrichNoTestsError(rawExtracted, rawRunOutput)}`
-      : enrichNoTestsError(rawExtracted, rawRunOutput)
+      ? `${leakGuidance}\n\n${enrichNoTestsError(rawExtracted, rawRunOutput, env.testRunner)}`
+      : enrichNoTestsError(rawExtracted, rawRunOutput, env.testRunner)
 
     // Track the high-water mark — the attempt with the most passing tests so far.
     // Only collecting runs qualify (structureBroken === 0 tests is never "best").

@@ -447,8 +447,8 @@ export async function processGap(
     const rawExtracted = extractTestFailure(rawRunOutput)
     const leakGuidance = processExitLeakGuidance(rawRunOutput)
     const extracted = leakGuidance
-      ? `${leakGuidance}\n\n${enrichNoTestsError(rawExtracted, rawRunOutput)}`
-      : enrichNoTestsError(rawExtracted, rawRunOutput)
+      ? `${leakGuidance}\n\n${enrichNoTestsError(rawExtracted, rawRunOutput, env.testRunner)}`
+      : enrichNoTestsError(rawExtracted, rawRunOutput, env.testRunner)
     const passCount = parsePassCount(rawRunOutput)
 
     if (!isZeroTestsOutput(rawRunOutput) && passCount > bestPassCount) {

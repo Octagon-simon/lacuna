@@ -5,11 +5,11 @@ export function buildReactCauses(isJSRunner: boolean, mockApi: string): string {
   return `
     - "renders without crashing" tests: NEVER write \`expect(true).toBe(true)\` as a render smoke-test. It proves nothing and will be rejected. Instead, assert on at least one element that must be visible: \`expect(screen.getByText('Some Heading')).toBeTruthy()\` or \`expect(screen.getByTestId('...')).toBeDefined()\`. Read the component's JSX to find a reliable element — a title, a label, a button text.
 
-    - React 18 act() async rule: ALWAYS await act() when it wraps async code. Unawaited act() calls cause state to leak across tests, producing "Cannot read properties of null" failures in unrelated tests.
+    - React act() async rule: ALWAYS await act() when it wraps async code. Unawaited act() calls cause state to leak across tests, producing "Cannot read properties of null" failures in unrelated tests.
 
     - Act batching boundary: multiple state updates triggered in the same tick must be wrapped in a single act() block to avoid partial render assertions.
 
-    - React 18 Strict Mode double-invocation: effects and event handlers may run twice in test environment. Assertions must tolerate idempotent execution or explicitly assert call counts when needed.
+    - React Strict Mode double-invocation: effects and event handlers may run twice in test environment. Assertions must tolerate idempotent execution or explicitly assert call counts when needed.
 
     - Loading state architecture: before asserting a button is disabled during loading, verify whether the element is replaced or unmounted. If unmounted, getByText("Submit") will throw — assert spinner or fallback UI instead.
 
@@ -61,7 +61,7 @@ export function buildReactCauses(isJSRunner: boolean, mockApi: string): string {
 
     - Infinite retry guard: never generate recursive waitFor → trigger → waitFor chains. If a condition does not resolve within a single waitFor block, fail explicitly.
 
-    - React 18 act() flush rule: when an event handler awaits a service mock and then calls setState, do NOT try to wrap the event in await act(async () => { ... }) — act flushes only one microtask level and misses multi-hop mockResolvedValue chains. The correct fix is await waitFor(() => expect(element).toBeInTheDocument()) after the triggering event. waitFor polls inside act until the assertion passes, draining all async hops.
+    - React act() flush rule: when an event handler awaits a service mock and then calls setState, do NOT try to wrap the event in await act(async () => { ... }) — act flushes only one microtask level and misses multi-hop mockResolvedValue chains. The correct fix is await waitFor(() => expect(element).toBeInTheDocument()) after the triggering event. waitFor polls inside act until the assertion passes, draining all async hops.
 
     - EMPTY / CLEARED inputs (user-event v14): NEVER call userEvent.type(el, '') — v14 throws "Expected key descriptor but found \\"\\"". To test an empty or cleared field, use \`await user.clear(el)\` or \`fireEvent.change(el, { target: { value: '' } })\`. To type-then-clear: \`await user.type(el, 'x'); await user.clear(el)\`. type() is only for non-empty strings.
 

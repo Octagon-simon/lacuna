@@ -1119,9 +1119,9 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
   // React/RTL-specific causes — only relevant to component tests. Omitted for backend/library
   // projects (e.g. a service interactor) where they are pure noise on every retry.
   if (reactish) {
-    parts.push('- React 18 act() async: every act(async () => ...) MUST be awaited. Unawaited act() calls cause state to leak across tests, producing "Cannot read properties of null" or timeout failures in unrelated tests. Fix: add await before every act() call that wraps async code.')
+    parts.push('- React act() async rule: every act(async () => ...) MUST be awaited. Unawaited act() calls cause state to leak across tests, producing "Cannot read properties of null" or timeout failures in unrelated tests. Fix: add await before every act() call that wraps async code.')
     parts.push('- Loading state — if the error is "Unable to find element" on a Submit/Save button, the component likely unmounts the button during loading rather than disabling it. Assert on the spinner or loading indicator instead.')
-    parts.push('- Unhandled rejection ("Vitest caught 1 unhandled error" / "Unhandled Rejection"): a mockRejectedValueOnce promise is escaping the test scope. After the action that triggers the rejection, add: await waitFor(() => expect(screen.getByText(/error/i)).toBeInTheDocument()) — this keeps the rejection chained inside the test so Vitest doesn\'t treat it as unhandled. The component may already catch the error internally, but the test still needs to await the resulting state change.')
+    parts.push('- Unhandled rejection (an "unhandled error" / "Unhandled Rejection" warning from the test runner): a mockRejectedValueOnce promise is escaping the test scope. After the action that triggers the rejection, add: await waitFor(() => expect(screen.getByText(/error/i)).toBeInTheDocument()) — this keeps the rejection chained inside the test so the runner doesn\'t treat it as unhandled. The component may already catch the error internally, but the test still needs to await the resulting state change.')
   }
   }
   parts.push('')
