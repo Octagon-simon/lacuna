@@ -1,6 +1,38 @@
-import { readFile } from 'fs/promises'
+import { readFile, readdir, stat, access } from 'fs/promises'
 import { join } from 'path'
 import type { CoverageReport, FileCoverage, LineCoverage, FunctionCoverage } from './types.js'
+
+// Some projects customize their reporter's output filename (e.g. Vitest's
+// `['lcov', { file: 'coverage.lcov' }]`, often for CI shard-merging) instead of the tool
+// default `lcov.info`. Fall back to whatever `.lcov` file is actually in coverageDir — the
+// most recently written one, if there happen to be several (leftover shard files) — rather
+// than assuming a fixed name that may not match the project's own reporter config.
+export async function resolveLcovPath(coverageDir: string, cwd: string): Promise<string> {
+  const dir = join(cwd, coverageDir)
+  const standard = join(dir, 'lcov.info')
+  try {
+    await access(standard)
+    return standard
+  } catch { /* fall through to discovery */ }
+
+  try {
+    const entries = await readdir(dir, { withFileTypes: true })
+    const lcovFiles = entries.filter((e) => e.isFile() && e.name.endsWith('.lcov'))
+    if (lcovFiles.length === 0) return standard // let the caller's readFile raise the real ENOENT
+    if (lcovFiles.length === 1) return join(dir, lcovFiles[0].name)
+    const withMtime = await Promise.all(
+      lcovFiles.map(async (e) => {
+        const p = join(dir, e.name)
+        const { mtimeMs } = await stat(p)
+        return { p, mtimeMs }
+      }),
+    )
+    withMtime.sort((a, b) => b.mtimeMs - a.mtimeMs)
+    return withMtime[0].p
+  } catch {
+    return standard
+  }
+}
 
 interface LcovEntry {
   file: string
@@ -50,7 +82,7 @@ function toFileCoverage(entry: LcovEntry): FileCoverage {
 }
 
 export async function parseLcov(coverageDir: string, cwd: string = process.cwd()): Promise<CoverageReport> {
-  const lcovPath = join(cwd, coverageDir, 'lcov.info')
+  const lcovPath = await resolveLcovPath(coverageDir, cwd)
   const text = await readFile(lcovPath, 'utf-8')
   const entries = parseLcovText(text)
   const files = entries.map(toFileCoverage)

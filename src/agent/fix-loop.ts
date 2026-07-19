@@ -4,7 +4,7 @@ import { access, stat } from 'fs/promises'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
-import { resolveFileTestRun, resolveScopeTestRun, resolveMultiFileTestRun } from '../lib/test-run.js'
+import { resolveFileTestRun, resolveScopeTestRun, resolveMultiFileTestRun, resolveEnvForFile } from '../lib/test-run.js'
 import { isWithinDir } from '../lib/coverage/index.js'
 import { formatFile } from '../lib/format.js'
 import { runCommand } from '../lib/runner.js'
@@ -301,6 +301,10 @@ async function fixFile(
   const runTimeout = config.coverageTimeout * 1000
   // Run under the file's OWN package config (monorepo setupFiles/cleanup/env), not bare from root.
   const fileRun = await resolveFileTestRun(env, absTestPath, cwd)
+  // A monorepo can mix runners per package — resolve THIS file's actual runner so prompt-building
+  // (mock API choice, etc.) matches whatever will really execute it, not the repo-wide default.
+  const fileEnv = await resolveEnvForFile(env, absTestPath, cwd)
+  generator.setEnv(fileEnv)
 
   if (!onStatus) log(chalk.bold(`\n  Fixing: ${chalk.cyan(shortPath)}`))
   onStatus?.({ phase: 'running', file: shortPath })
@@ -423,7 +427,7 @@ async function fixFile(
             sourceCode,
             sourceImportPath,
             errorOutput,
-            env,
+            env: fileEnv,
             mocksCode: ctx?.mocksCode ?? null,
             mocksImportPath: ctx?.mocksImportPath ?? null,
             setupFileCode: ctx?.setupFileCode ?? null,
@@ -854,6 +858,10 @@ async function findAndFixPolluters(
     }
 
     log(chalk.dim(`  Sending to ${config.model} for cleanup...`))
+    // Resolve the polluter's OWN package runner — the file being edited, so its mock API
+    // (vi.fn vs jest.fn) must match whatever actually executes it.
+    const pollutorEnv = await resolveEnvForFile(env, polluter, cwd)
+    generator.setEnv(pollutorEnv)
     let fixed: string
     try {
       fixed = await generator.fixPollution({
@@ -862,7 +870,7 @@ async function findAndFixPolluters(
         victimFile: shortVictim,
         victimCode,
         victimError,
-        env,
+        env: pollutorEnv,
       })
     } catch (err) {
       log(chalk.red(`  AI error: ${err instanceof Error ? err.message : String(err)}`))

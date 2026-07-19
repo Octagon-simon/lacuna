@@ -76,6 +76,15 @@ export async function resolveDiffScope(cwd: string, explicitRef?: string): Promi
     throw new GitDiffError('@diff needs a git repository — this directory is not one (or git is not installed).')
   }
 
+  // `git diff` always reports paths relative to the repo ROOT, regardless of which
+  // subdirectory it's invoked from (e.g. a monorepo package). Resolve that root once so
+  // parseUnifiedDiff builds correct absolute paths even when `cwd` is a package directory,
+  // not the repo root — joining against `cwd` there would double the package prefix
+  // (packages/admin/packages/admin/src/...), a path that doesn't exist, silently zeroing
+  // out every changed line.
+  const topLevel = await git(cwd, 'rev-parse --show-toplevel')
+  const repoRoot = topLevel.ok && topLevel.out ? topLevel.out : cwd
+
   const baseRef = await resolveBaseRef(cwd, explicitRef)
 
   const mb = await git(cwd, `merge-base ${baseRef} HEAD`)
@@ -98,7 +107,7 @@ export async function resolveDiffScope(cwd: string, explicitRef?: string): Promi
     GIT_TIMEOUT_MS,
   )
   // A failed/empty diff run means "no changed files" — never throw the run for this.
-  const changed = diff.stdout ? parseUnifiedDiff(diff.stdout, cwd) : new Map<string, Set<number>>()
+  const changed = diff.stdout ? parseUnifiedDiff(diff.stdout, repoRoot) : new Map<string, Set<number>>()
 
   return { baseRef, mergeBase, changed }
 }

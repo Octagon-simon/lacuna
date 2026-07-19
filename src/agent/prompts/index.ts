@@ -727,7 +727,7 @@ import { NewThing } from './path'
 // @@@ END
 
 // @@@ ADD_AFTER_IMPORTS:
-vi.mock('./some/module', () => ({ default: vi.fn() }))
+${mockApi}.mock('./some/module', () => ({ default: ${mockApi}.fn() }))
 // @@@ END
 
 // @@@ REPLACE:
@@ -738,7 +738,7 @@ import { render, screen, waitFor } from '@testing-library/react-native'
 
 Rules:
 - ADD_IMPORT: appends a new import line. Use REPLACE instead when you need to add to an EXISTING import from the same module — never write a second import from the same module.
-- ADD_AFTER_IMPORTS: for vi.mock() / module-level setup that must go AFTER all imports.
+- ADD_AFTER_IMPORTS: for ${mockApi}.mock() / module-level setup that must go AFTER all imports.
 - REPLACE: exact old_string → new_string for any section (imports, beforeEach, helpers). Copy old text verbatim from the CURRENT TEST FILE above — character-for-character including quotes and whitespace. First occurrence only.
 - ADD_AFTER_DESCRIBE anchor must exactly match the describe() name in the file.
 - Do NOT output <code_output> tags in patch mode.`)
@@ -964,7 +964,7 @@ import { NewThing } from './path'
 // @@@ END
 
 // @@@ ADD_AFTER_IMPORTS:
-vi.mock('./some/module', () => ({ default: vi.fn() }))
+${mockApi}.mock('./some/module', () => ({ default: ${mockApi}.fn() }))
 // @@@ END
 
 // @@@ REPLACE:
@@ -978,7 +978,7 @@ Rules:
 - REPLACE: use for any section that isn't an entire it/test block — imports, beforeEach, helpers. Copy old text verbatim from the CURRENT TEST FILE. Use instead of ADD_IMPORT when adding to an existing import from the same module.
 - Only include operations for what actually needs to change. Do not restate passing tests.
 - ADD_IMPORT: appends a new import line — only for modules not yet imported at all.
-- ADD_AFTER_IMPORTS: for vi.mock() / module-level setup that must go AFTER all imports.
+- ADD_AFTER_IMPORTS: for ${mockApi}.mock() / module-level setup that must go AFTER all imports.
 - Do NOT output <code_output> tags in patch mode. Use <code_patch> only.`)
   } else {
     parts.push('\nReturn your response in the required <thinking> + <code_output> format.')
@@ -996,7 +996,8 @@ export function buildPollutionFixPrompt(args: {
   victimError: string
   env: DetectedEnvironment
 }): string {
-  const { pollutorFile, pollutorCode, victimFile, victimCode, victimError } = args
+  const { pollutorFile, pollutorCode, victimFile, victimCode, victimError, env } = args
+  const mockApi = env.testRunner === 'vitest' ? 'vi' : 'jest'
   const parts: string[] = []
 
   parts.push('This test file corrupts shared state and causes another test file to fail when run afterwards.')
@@ -1032,11 +1033,11 @@ export function buildPollutionFixPrompt(args: {
   parts.push('3. Add afterEach (or afterAll) in the polluting file to reset exactly that thing')
   parts.push('')
   parts.push('Common cleanup patterns:')
-  parts.push('  afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks() })')
+  parts.push(`  afterEach(() => { ${mockApi}.restoreAllMocks(); ${mockApi}.clearAllMocks() })`)
   parts.push('  afterEach(() => { localStorage.clear(); sessionStorage.clear() })')
   parts.push('  afterEach(() => { delete (window as any).myProperty })')
   parts.push('  afterEach(() => { myModuleSingleton.reset() })')
-  parts.push('  afterEach(() => { vi.useRealTimers() })')
+  parts.push(`  afterEach(() => { ${mockApi}.useRealTimers() })`)
   parts.push('')
   parts.push('Return the complete modified polluting file in the required <thinking> + <code_output> format.')
 

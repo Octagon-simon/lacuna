@@ -5,7 +5,7 @@ import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import { scopedCoverageCommand, relatedCoverageCommand } from '../lib/detector.js'
-import { resolveFileTestRun, resolveIncrementalCoverageRun } from '../lib/test-run.js'
+import { resolveFileTestRun, resolveIncrementalCoverageRun, resolveEnvForFile, resolveEnvForDir } from '../lib/test-run.js'
 import { runCommand } from '../lib/runner.js'
 import { loadCoverage, parseLcov, coverageAgeSeconds, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps, alignReportToChanged } from '../lib/coverage/index.js'
 import { resolveDiffScope, scopeDiffToDir } from '../lib/git-diff.js'
@@ -119,6 +119,11 @@ export async function processGap(
   const testRun = parallel
     ? await resolveFileTestRun(env, context.suggestedTestFile, cwd)
     : { command: env.testCommand, cwd }
+
+  // A monorepo can mix runners per package — make prompt-building (mock API choice, etc.) match
+  // whatever runner actually executes this file, not the repo-wide default the generator/worker
+  // was constructed with.
+  generator.setEnv(await resolveEnvForFile(env, context.suggestedTestFile, cwd))
 
   // Capture pre-existing test file so we can restore on failure
   let originalTestContent: string | null = null
@@ -691,7 +696,11 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   // integration/DI test that reaches the method indirectly) looks uncovered, so lacuna would
   // over-target lines Codecov shows green. The cheap path in patch mode is REUSING an existing
   // full report (below), not running a smaller one.
-  const scopedCmd = (scopeRel && !diffMode) ? scopedCoverageCommand(env, scopeRel) : null
+  // A monorepo scope directory can run a different runner than the repo-wide default (e.g. one
+  // package still on Jest, another on Vitest) — resolve the scope's OWN runner from its package.json
+  // / config file rather than trusting the global default for this scoped coverage command.
+  const scopeEnv = (scopeDir && !diffMode) ? await resolveEnvForDir(env, scopeDir, cwd) : env
+  const scopedCmd = (scopeRel && !diffMode) ? scopedCoverageCommand(scopeEnv, scopeRel) : null
   const coverageCommand = scopedCmd ?? env.coverageCommand
   // The changed target file (relative), for the cheap diff-mode AFTER measurement only.
   const relTargetFile = diffMode && options.targetFile
@@ -735,7 +744,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       const label = (scopeRel && !diffMode)
         ? `  Running tests under ${scopeRel} to collect coverage...`
         : '  Running test suite to collect coverage...'
-      const spinner = startCoverageSpinner(chalk.dim(label), env.testRunner)
+      const spinner = startCoverageSpinner(chalk.dim(label), scopeEnv.testRunner)
       const coverageResult = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine)
       spinner.stop()
 

@@ -23,11 +23,11 @@ export interface ProviderPreset {
 }
 
 export class ModelStallError extends Error {
-  constructor(public readonly reason: 'first-token-timeout' | 'stream-stall') {
+  constructor(public readonly reason: 'first-token-timeout' | 'stream-stall', timeoutMs: number) {
     super(
       reason === 'first-token-timeout'
-        ? 'No response from model after 30s — connection may be down'
-        : 'Model stream stalled — no tokens received for 60s',
+        ? `No response from model after ${Math.round(timeoutMs / 1000)}s — connection may be down`
+        : `Model stream stalled — no tokens received for ${Math.round(timeoutMs / 1000)}s`,
     )
     this.name = 'ModelStallError'
   }

@@ -6,11 +6,26 @@ import { ModelStallError } from './types.js'
 const FIRST_TOKEN_TIMEOUT_MS = 30_000
 const STALL_TIMEOUT_MS = 60_000
 
+// Local backends (LM Studio, Ollama) process the prompt on the user's own CPU/GPU with a
+// single inference slot — ingesting a large agentic prompt (system + source + test context)
+// can easily take well past 30s before the first token streams back, especially for
+// reasoning models that think before answering. The hosted-API timeouts above starved local
+// models of the time they need and made every request look "stuck", so local gets more room.
+// Small distilled reasoning models (e.g. DeepSeek-R1-Qwen3-8B) are known to think for many
+// thousands of tokens — sometimes tens of thousands — before answering, so both windows are
+// generous: 10 minutes of total silence (across content AND reasoning_content) before giving up.
+const LOCAL_FIRST_TOKEN_TIMEOUT_MS = 600_000
+const LOCAL_STALL_TIMEOUT_MS = 600_000
+
 export class OpenAICompatibleProvider implements ModelProvider {
   private client: OpenAI
   private model: string
+  private firstTokenTimeoutMs: number
+  private stallTimeoutMs: number
 
-  constructor(model: string, options: { baseURL: string; apiKey?: string }) {
+  constructor(model: string, options: { baseURL: string; apiKey?: string; isLocal?: boolean }) {
+    this.firstTokenTimeoutMs = options.isLocal ? LOCAL_FIRST_TOKEN_TIMEOUT_MS : FIRST_TOKEN_TIMEOUT_MS
+    this.stallTimeoutMs = options.isLocal ? LOCAL_STALL_TIMEOUT_MS : STALL_TIMEOUT_MS
     this.client = new OpenAI({
       apiKey: options.apiKey || 'no-key-required',
       baseURL: options.baseURL,
@@ -79,10 +94,10 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
     const firstTokenTimer = setTimeout(() => {
       controller.abort('first-token-timeout')
-    }, FIRST_TOKEN_TIMEOUT_MS)
+    }, this.firstTokenTimeoutMs)
 
     const stallInterval = setInterval(() => {
-      if (firstTokenReceived && Date.now() - lastTokenAt > STALL_TIMEOUT_MS) {
+      if (firstTokenReceived && Date.now() - lastTokenAt > this.stallTimeoutMs) {
         controller.abort('stream-stall')
       }
     }, 5_000)
@@ -104,15 +119,23 @@ export class OpenAICompatibleProvider implements ModelProvider {
       )
 
       for await (const chunk of stream) {
-        const token = chunk.choices[0]?.delta?.content ?? ''
-        if (token) {
+        // Reasoning models (DeepSeek R1 and compatible local servers, mirroring DeepSeek's own
+        // API) stream their <think> phase through a separate `reasoning_content` delta field,
+        // not `content`. If we only watch `content`, the entire thinking phase looks like dead
+        // air to the stall/first-token timers even though the model is actively generating —
+        // LM Studio's own token counter keeps climbing while our client silently times out.
+        // Treat either field as proof of life; only `content` feeds the parsed result.
+        const delta = chunk.choices[0]?.delta as { content?: string | null; reasoning_content?: string | null } | undefined
+        const token = delta?.content ?? ''
+        const reasoningToken = delta?.reasoning_content ?? ''
+        if (token || reasoningToken) {
           if (!firstTokenReceived) {
             firstTokenReceived = true
             clearTimeout(firstTokenTimer)
-            lastTokenAt = Date.now()
-          } else {
-            lastTokenAt = Date.now()
           }
+          lastTokenAt = Date.now()
+        }
+        if (token) {
           content += token
           onToken?.(token)
         }
@@ -121,15 +144,25 @@ export class OpenAICompatibleProvider implements ModelProvider {
       if (controller.signal.aborted) {
         clearTimeout(firstTokenTimer)
         clearInterval(stallInterval)
-        throw new ModelStallError(
-          (controller.signal.reason as string) === 'first-token-timeout' ? 'first-token-timeout' : 'stream-stall',
-        )
+        const reason = (controller.signal.reason as string) === 'first-token-timeout' ? 'first-token-timeout' : 'stream-stall'
+        throw new ModelStallError(reason, reason === 'first-token-timeout' ? this.firstTokenTimeoutMs : this.stallTimeoutMs)
       }
       if (err != null && typeof err === 'object' && 'status' in err) {
         const e = err as { status?: number; message?: string; error?: { message?: string; type?: string; code?: string } }
         const body = e.error?.message
           ? `${e.error.message}${e.error.type ? ` (type: ${e.error.type})` : ''}${e.error.code ? ` [${e.error.code}]` : ''}`
           : (e.message ?? 'no message')
+        if (/tokens to keep.*greater than.*context length|context length.*exceed|context.*window.*exceed/i.test(body)) {
+          throw new Error(
+            `${this.model} rejected the request — the prompt doesn't fit in the model's loaded context window.\n` +
+            `Local servers (LM Studio/Ollama) reserve context for the PROMPT plus maxTokens together, so a\n` +
+            `large maxTokens shrinks the room left for input.\n` +
+            `Options:\n` +
+            `  1. In LM Studio, reload this model with a larger Context Length (Model Settings before loading).\n` +
+            `  2. Lower maxTokens in .lacuna.json (e.g. "maxTokens": 4000) to leave more room for the prompt.\n` +
+            `  3. Use --file to target a smaller source file.`,
+          )
+        }
         if (e.status === 429 || /rate.?limit|output tokens per minute|request.*exceed.*limit/i.test(body)) {
           throw new Error(
             `Rate limit hit (HTTP 429) — ${this.model} is rejecting requests due to quota.\n` +

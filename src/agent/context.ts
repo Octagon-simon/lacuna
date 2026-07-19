@@ -231,12 +231,49 @@ function relativeMockPath(testFile: string, mockFile: string): string {
 
 // ─── Type definition collector ────────────────────────────────────────────────
 
+// Strips JSONC-style // and /* */ comments WITHOUT touching string contents — a naive
+// regex-replace (the previous approach) treats any `/*` inside a STRING VALUE as a comment
+// start, which is exactly the shape of the standard `"@/*": ["./src/*"]` path-alias entry.
+// That corrupts the JSON (silently eating everything up to the next stray `*/`-like substring
+// elsewhere in the file, e.g. inside an `exclude` glob like `src/**/__tests__`) and JSON.parse
+// then throws, caught by the `try candidates` loop above — so EVERY project using the extremely
+// common `@/*` alias pattern got zero aliases back, with no visible error.
+function stripJsonComments(text: string): string {
+  let result = ''
+  let inString = false
+  let inLineComment = false
+  let inBlockComment = false
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i]
+    const next = text[i + 1]
+    if (inLineComment) {
+      if (c === '\n') { inLineComment = false; result += c }
+      continue
+    }
+    if (inBlockComment) {
+      if (c === '*' && next === '/') { inBlockComment = false; i++ }
+      continue
+    }
+    if (inString) {
+      result += c
+      if (c === '\\') { result += next; i++; continue }
+      if (c === '"') inString = false
+      continue
+    }
+    if (c === '"') { inString = true; result += c; continue }
+    if (c === '/' && next === '/') { inLineComment = true; i++; continue }
+    if (c === '/' && next === '*') { inBlockComment = true; i++; continue }
+    result += c
+  }
+  return result
+}
+
 async function readTsconfigAliases(cwd: string): Promise<Record<string, string[]>> {
   const candidates = ['tsconfig.json', 'tsconfig.app.json', 'tsconfig.base.json']
   for (const name of candidates) {
     try {
       const raw = await readFile(join(cwd, name), 'utf-8')
-      const stripped = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*/g, '')
+      const stripped = stripJsonComments(raw)
       const tsconfig = JSON.parse(stripped) as { compilerOptions?: { paths?: Record<string, string[]> } }
       if (tsconfig.compilerOptions?.paths) return tsconfig.compilerOptions.paths
     } catch { /* try next */ }
@@ -268,24 +305,154 @@ function resolveLocalImport(
   return null
 }
 
-// Find the actual file by trying common extensions on a base path.
+// Find the actual file by trying common extensions on a base path. NodeNext-style projects
+// require an explicit compiled extension in relative specifiers even though the real source is
+// TypeScript (`import './foo.js'` resolving to `./foo.ts`) — strip it first, or every suffix
+// attempt below would double up (`foo.js.ts`) and silently fail to resolve.
 async function resolveToFile(basePath: string): Promise<string | null> {
+  const base = basePath.replace(/\.(m|c)?js$/, '')
   for (const suffix of ['.ts', '.tsx', '/index.ts', '/index.tsx', '']) {
-    try { await access(basePath + suffix); return basePath + suffix } catch { /* try next */ }
+    try { await access(base + suffix); return base + suffix } catch { /* try next */ }
   }
   return null
 }
 
+// A tsconfig path alias can point at another WORKSPACE PACKAGE's root (e.g.
+// `"@afriex/core": ["../core"]` in a monorepo), not just a local directory. When the import has
+// a subpath beyond the bare alias (`@afriex/core/domain`), the real target isn't a plain file
+// under that root — it's resolved through the package's OWN package.json `exports` map, which
+// commonly points at compiled output (`./dist/src/domain/index.js`) whose TypeScript source
+// lives one directory removed (`src/domain/index.ts`, since TS project references mirror
+// `src/**` into `dist/src/**` 1:1). Naively joining the subpath under the package root — what
+// the alias loop above does — silently produces a nonexistent path, hiding that package's real
+// exported types from the prompt entirely.
+async function resolvePackageExport(pkgRoot: string, subpath: string): Promise<string | null> {
+  let pkg: { exports?: unknown; main?: string; types?: string; typings?: string }
+  try { pkg = JSON.parse(await readFile(join(pkgRoot, 'package.json'), 'utf-8')) } catch { return null }
+
+  let target: string | undefined
+  const exportsMap = pkg.exports
+  if (exportsMap && typeof exportsMap === 'object') {
+    const entry = (exportsMap as Record<string, unknown>)[subpath ? `./${subpath}` : '.']
+    target = typeof entry === 'string'
+      ? entry
+      : (entry && typeof entry === 'object'
+          ? ((entry as Record<string, unknown>).types
+              ?? (entry as Record<string, unknown>).import
+              ?? (entry as Record<string, unknown>).default) as string | undefined
+          : undefined)
+  }
+  if (!target && !subpath) target = pkg.types ?? pkg.typings ?? pkg.main
+  if (!target) return null
+
+  // Map compiled output back to source: strip a leading dist/ segment and the compiled/
+  // declaration extension, leaving a base resolveToFile can re-attach .ts/.tsx suffixes to.
+  const stripped = target
+    .replace(/^\.\//, '')
+    .replace(/^dist\//, '')
+    .replace(/\.d\.ts$|\.(m|c)?js$/, '')
+  return join(pkgRoot, stripped)
+}
+
+// Fallback for when the plain alias-join resolution (resolveLocalImport + resolveToFile) misses
+// a cross-package subpath import — tries every alias whose prefix matches, resolving the
+// remainder through that package's own exports map instead of assuming a flat directory layout.
+async function resolveViaPackageExports(
+  importPath: string,
+  aliases: Record<string, string[]>,
+  cwd: string,
+): Promise<string | null> {
+  for (const [pattern, targets] of Object.entries(aliases)) {
+    const aliasPrefix = pattern.replace(/\*$/, '')
+    if (!importPath.startsWith(aliasPrefix)) continue
+    const targetBase = (targets[0] ?? '').replace(/\*$/, '')
+    const pkgRoot = join(cwd, targetBase)
+    const subpath = importPath.slice(aliasPrefix.length).replace(/^\/+/, '')
+    const resolved = await resolvePackageExport(pkgRoot, subpath)
+    if (!resolved) continue
+    const file = await resolveToFile(resolved)
+    if (file) return file
+  }
+  return null
+}
+
+// Matches `import ... from '...'` (including `import type`) — used where re-export forms don't
+// apply (collectLocalImportPaths only cares about the current file's own direct imports).
+const IMPORT_RE = /^import(?:\s+type)?\s[^'"]*['"]([^'"]+)['"]/gm
+
+export interface ModuleSpecifier {
+  path: string
+  // Named symbols imported/re-exported from `path` (alias-resolved to the LOCAL-facing name),
+  // or null for a wildcard/default/namespace form (`export * from`, `import Foo from`,
+  // `import * as NS from`) whose exported names can't be determined from this line alone.
+  names: string[] | null
+}
+
+function parseNamedList(braceContent: string): string[] {
+  return braceContent
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => {
+      const asMatch = /^(?:type\s+)?[\w$]+\s+as\s+([\w$]+)$/.exec(s)
+      if (asMatch) return asMatch[1]
+      const bare = /^(?:type\s+)?([\w$]+)$/.exec(s)
+      return bare ? bare[1] : s
+    })
+}
+
+const NAMED_IMPORT_RE = /^import(?:\s+type)?\s+([^'"]+?)\s+from\s*['"]([^'"]+)['"]/gm
+const NAMED_REEXPORT_RE = /^export(?:\s+type)?\s*(\*(?:\s+as\s+\w+)?|\{[\s\S]*?\})\s*from\s*['"]([^'"]+)['"]/gm
+
+// Extracts every import/re-export line's module path AND which named symbols it asks for.
+// Matches `import ... from '...'` (including `import type`) AND re-export forms (`export *
+// from '...'`, `export * as X from '...'`, `export {...} from '...'`, `export type {...} from
+// '...'`) — barrel/index files are overwhelmingly written as pure re-exports with ZERO `import`
+// statements (e.g. `export * from './enums/index.js'`), so following only `import` lines misses
+// every type funneled through one. Tracking names lets a barrel that re-exports dozens of
+// unrelated modules (e.g. `@/types`-style files) be traversed selectively instead of blindly, so
+// a handful of genuinely-needed types don't get crowded out of the MAX_TYPE_FILES/MAX_TYPE_CHARS
+// budget by unrelated ones the current file never actually uses.
+function extractModuleSpecifiersWithNames(code: string): ModuleSpecifier[] {
+  const specs: ModuleSpecifier[] = []
+
+  for (const m of code.matchAll(NAMED_IMPORT_RE)) {
+    const clause = m[1].trim()
+    const path = m[2]
+    const braceMatch = /^\{([\s\S]*)\}$/.exec(clause)
+    specs.push(braceMatch ? { path, names: parseNamedList(braceMatch[1]) } : { path, names: null })
+  }
+
+  for (const m of code.matchAll(NAMED_REEXPORT_RE)) {
+    const clause = m[1]
+    const path = m[2]
+    specs.push(clause.startsWith('*') ? { path, names: null } : { path, names: parseNamedList(clause.slice(1, -1)) })
+  }
+
+  return specs
+}
+
 // Extract exported interface/type/enum declarations via brace-depth tracking.
 // Only captures the declarations themselves — not function bodies, classes, or constants.
-function extractTypeDeclarations(code: string): string {
+// When `neededNames` is given (concrete, non-null), only declarations whose OWN name is in it
+// are kept. Only pass this for a file reached via a WILDCARD re-export (`export * from`) that
+// we're blindly traversing while chasing a specific name — such a file is often just one of many
+// pass-through siblings (e.g. an unrelated sibling enum under a package's `enums/index.ts`) and
+// showing its full, unrelated declarations would burn budget without value. A file reached via a
+// CONFIRMED named match (`export {Foo} from './bar'` where Foo is what we want) should NOT be
+// filtered this way — e.g. a component's OWN prop-type interface is legitimately named
+// differently from the component itself (`Button` → `ButtonProps`), and filtering by exact name
+// there would incorrectly drop it.
+function extractTypeDeclarations(code: string, neededNames: string[] | null = null): string {
   const lines = code.split('\n')
   const result: string[] = []
   let i = 0
 
   while (i < lines.length) {
     const line = lines[i]
-    if (/^\s*export\s+(interface|type|enum)\s+\w+/.test(line)) {
+    const declMatch = /^\s*export\s+(?:interface|type|enum)\s+(\w+)/.exec(line)
+    if (declMatch) {
+      if (neededNames && !neededNames.includes(declMatch[1])) { i++; continue }
       const block: string[] = [line]
       let depth = (line.match(/\{/g) ?? []).length - (line.match(/\}/g) ?? []).length
 
@@ -314,58 +481,116 @@ function extractTypeDeclarations(code: string): string {
   return result.join('\n').trim()
 }
 
-const MAX_TYPE_FILES = 10
-const MAX_TYPE_CHARS = 4000
+// Named-import-aware filtering (above) now lets barrels be followed without wasting budget on
+// unrelated re-exports, so a genuinely-needed type several barrel hops deep (e.g. an enum
+// re-exported through a chain of index.ts files across a workspace package boundary) no longer
+// gets crowded out by a source file's other, shallower direct imports competing for the same
+// budget. Raised from the original 10/4000 accordingly — those were calibrated for a world where
+// re-exports silently failed to resolve, so most of the budget went unused rather than being a
+// real constraint.
+const MAX_TYPE_FILES = 40
+const MAX_TYPE_CHARS = 15000
 
-// Scans a source file's imports and follows them transitively (BFS) to collect
-// interface/type/enum declarations from any locally-defined types they reference.
+// Scans a source file's imports and follows them transitively, depth-first per import, to
+// collect interface/type/enum declarations from any locally-defined types they reference.
 // Stops at MAX_TYPE_FILES files or MAX_TYPE_CHARS characters to stay prompt-safe.
+//
+// Depth-first (not breadth-first) matters here: a source file typically has many direct
+// imports, each shallow (one hop). But a single one of those can be a barrel (e.g. `@/types`)
+// whose real target is several re-export hops deep, possibly across a workspace package
+// boundary (`@scope/pkg/subpath` → that package's own exports map → its compiled-output
+// convention back to real source — see resolveViaPackageExports). A shared FIFO queue processes
+// every direct import's own single hop before any of them gets to go deeper, so the budget can
+// exhaust on shallow breadth before a deep-but-relevant chain is ever reached. Finishing each
+// import's chain (however deep) before starting the next avoids that.
 export async function collectTypeDefinitions(
   sourceCode: string,
   absoluteSourcePath: string,
   cwd: string,
 ): Promise<string | null> {
   const aliases = await readTsconfigAliases(cwd)
-
-  // BFS: each entry is a file whose imports we still need to follow.
-  // Start with the source file itself so we traverse its direct imports first.
-  const toFollow: Array<{ code: string; absolutePath: string }> = [
-    { code: sourceCode, absolutePath: absoluteSourcePath },
-  ]
-  // Mark the source file visited so we never re-process it as a type file.
-  const visited = new Set<string>([absoluteSourcePath])
-
+  // Keyed by file + which names we were chasing (not file alone): a shared barrel/index file
+  // (e.g. a workspace package's `domain/index.ts`) is commonly re-entered from DIFFERENT
+  // top-level imports chasing DIFFERENT names — deduping by file path alone means the first visit
+  // (chasing an unrelated name that happens to resolve through the same barrel) permanently
+  // blocks every later, differently-targeted visit from ever re-scanning it.
+  const visited = new Set<string>()
+  const visitKey = (file: string, names: string[] | null) => `${file}::${names ? names.slice().sort().join(',') : '*'}`
   const blocks: string[] = []
   let totalChars = 0
 
-  while (toFollow.length > 0 && blocks.length < MAX_TYPE_FILES && totalChars < MAX_TYPE_CHARS) {
-    const { code, absolutePath } = toFollow.shift()!
+  const topLevel = extractModuleSpecifiersWithNames(sourceCode)
+  // Fair-share cap per TOP-LEVEL import: DFS means one import's chain runs to completion before
+  // the next starts, so an early import that happens to be a deep/wide barrel (a component
+  // library re-exporting many components, each importing several more type files) could
+  // otherwise consume the entire global budget by itself, starving every import that comes
+  // after it in the file — including the one actually relevant to the current task. At least 3
+  // files / 1000 chars per import, however many imports there are, so a single-import file still
+  // gets the full global budget.
+  const perImportFileCap = Math.max(8, Math.ceil(MAX_TYPE_FILES / Math.max(1, topLevel.length)))
+  const perImportCharCap = Math.max(3000, Math.ceil(MAX_TYPE_CHARS / Math.max(1, topLevel.length)))
 
-    for (const m of code.matchAll(/^import(?:\s+type)?\s[^'"]*['"]([^'"]+)['"]/gm)) {
-      if (blocks.length >= MAX_TYPE_FILES || totalChars >= MAX_TYPE_CHARS) break
+  // neededNames: the specific symbols being chased FROM `specifier` (null = unfiltered — follow
+  // everything found inside, used for the root source file's own imports and any wildcard
+  // `export *` hop, since we can't know what a wildcard re-exports without reading it). A
+  // barrel/index file can re-export dozens of unrelated modules; without this, a handful of
+  // genuinely-needed types get crowded out of the budget by whichever unrelated re-export
+  // happens to appear first in the barrel.
+  async function visit(
+    specifier: string,
+    fromAbsolutePath: string,
+    neededNames: string[] | null,
+    arrivedViaWildcard: boolean,
+    branchBlocksStart: number,
+    branchCharsStart: number,
+  ): Promise<void> {
+    if (blocks.length >= MAX_TYPE_FILES || totalChars >= MAX_TYPE_CHARS) return
+    if (blocks.length - branchBlocksStart >= perImportFileCap) return
+    if (totalChars - branchCharsStart >= perImportCharCap) return
 
-      const base = resolveLocalImport(m[1], absolutePath, cwd, aliases)
-      if (!base) continue
+    const base = resolveLocalImport(specifier, fromAbsolutePath, cwd, aliases)
+    let file = base ? await resolveToFile(base) : null
+    if (!file) file = await resolveViaPackageExports(specifier, aliases, cwd)
+    if (!file || file === absoluteSourcePath) return
+    const key = visitKey(file, neededNames)
+    if (visited.has(key)) return
+    visited.add(key)
 
-      const file = await resolveToFile(base)
-      if (!file || visited.has(file)) continue
-      visited.add(file)
+    let content: string
+    try { content = await readFile(file, 'utf-8') } catch { return }
 
-      let content: string
-      try { content = await readFile(file, 'utf-8') } catch { continue }
-
-      // Collect type declarations from this file (if any)
-      const declarations = extractTypeDeclarations(content)
-      if (declarations) {
-        const block = `// from ${relative(cwd, file)}\n${declarations}`
-        blocks.push(block)
-        totalChars += block.length
-      }
-
-      // Always follow this file's imports too — it might re-export types from
-      // deeper files even if it has no declarations of its own.
-      toFollow.push({ code: content, absolutePath: file })
+    // Collect type declarations from this file (if any). Only filter by neededNames when we
+    // arrived via a wildcard (blind traversal, e.g. chasing one enum through `export * from
+    // './enums/index.js'` where most siblings are irrelevant) — a file reached via a CONFIRMED
+    // named match keeps its full declarations (e.g. a component's own differently-named props
+    // interface).
+    const declarations = extractTypeDeclarations(content, arrivedViaWildcard ? neededNames : null)
+    if (declarations) {
+      const block = `// from ${relative(cwd, file)}\n${declarations}`
+      blocks.push(block)
+      totalChars += block.length
     }
+
+    // Follow this file's imports too — it might re-export types from deeper files even if it
+    // has no declarations of its own. Each nested specifier's own names (if concrete) become the
+    // filter for ITS target; a wildcard here (names === null) means THIS line doesn't tell us
+    // what's inside, so keep chasing whatever we were ALREADY asked for (neededNames) rather than
+    // resetting to unfiltered — otherwise a single `export * from` hop anywhere in the chain
+    // (extremely common — e.g. `core/domain/index.ts` re-exporting `./enums/index.js` etc.)
+    // permanently disables filtering for its entire subtree, which is exactly the barrel-flood
+    // this filtering exists to prevent.
+    for (const { path: nextSpecifier, names } of extractModuleSpecifiersWithNames(content)) {
+      if (blocks.length >= MAX_TYPE_FILES || totalChars >= MAX_TYPE_CHARS) break
+      if (blocks.length - branchBlocksStart >= perImportFileCap) break
+      if (totalChars - branchCharsStart >= perImportCharCap) break
+      if (neededNames && names && !names.some((n) => neededNames.includes(n))) continue
+      await visit(nextSpecifier, file, names ?? neededNames, names === null, branchBlocksStart, branchCharsStart)
+    }
+  }
+
+  for (const { path: specifier, names } of topLevel) {
+    if (blocks.length >= MAX_TYPE_FILES || totalChars >= MAX_TYPE_CHARS) break
+    await visit(specifier, absoluteSourcePath, names, false, blocks.length, totalChars)
   }
 
   return blocks.length > 0 ? blocks.join('\n\n') : null
@@ -385,12 +610,11 @@ export async function collectLocalImportPaths(
   const results: string[] = []
   const seen = new Set<string>()
 
-  for (const m of sourceCode.matchAll(/^import(?:\s+type)?\s[^'"]*['"]([^'"]+)['"]/gm)) {
+  for (const m of sourceCode.matchAll(IMPORT_RE)) {
     const importPath = m[1]
     const base = resolveLocalImport(importPath, absoluteSourcePath, cwd, aliases)
-    if (!base) continue  // skip node_modules
-
-    const file = await resolveToFile(base)
+    let file = base ? await resolveToFile(base) : null
+    if (!file) file = await resolveViaPackageExports(importPath, aliases, cwd)
     if (!file || seen.has(file)) continue
     seen.add(file)
 
