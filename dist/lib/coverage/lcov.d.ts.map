@@ -1,0 +1,1 @@
+{"version":3,"file":"lcov.d.ts","sourceRoot":"","sources":["../../../src/lib/coverage/lcov.ts"],"names":[],"mappings":"AAEA,OAAO,KAAK,EAAE,cAAc,EAAgD,MAAM,YAAY,CAAA;AAO9F,wBAAsB,eAAe,CAAC,WAAW,EAAE,MAAM,EAAE,GAAG,EAAE,MAAM,GAAG,OAAO,CAAC,MAAM,CAAC,CAyBvF;AAiDD,wBAAsB,SAAS,CAAC,WAAW,EAAE,MAAM,EAAE,GAAG,GAAE,MAAsB,GAAG,OAAO,CAAC,cAAc,CAAC,CAgBzG"}
