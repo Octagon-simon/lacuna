@@ -80,9 +80,8 @@ export class AnthropicProvider implements ModelProvider {
       }
     } catch (err) {
       if (controller.signal.aborted) {
-        throw new ModelStallError(
-          (controller.signal.reason as string) === 'first-token-timeout' ? 'first-token-timeout' : 'stream-stall',
-        )
+        const reason = (controller.signal.reason as string) === 'first-token-timeout' ? 'first-token-timeout' : 'stream-stall'
+        throw new ModelStallError(reason, reason === 'first-token-timeout' ? FIRST_TOKEN_TIMEOUT_MS : STALL_TIMEOUT_MS)
       }
       const msg = err instanceof Error ? err.message : String(err)
 

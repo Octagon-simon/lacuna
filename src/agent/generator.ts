@@ -103,12 +103,26 @@ export const OSCILLATION_ESCAPE_MESSAGE =
 const GENERATE_TEMPERATURE = 0.4  // some creativity to match existing patterns
 const RETRY_TEMPERATURE = 0.1     // precise and deterministic when fixing errors
 
+// True "thinking" models (DeepSeek R1 and its distills, o1/o3, QwQ, etc.) can spend many
+// thousands of tokens in <think>/<thinking> alone before writing a single character of code —
+// far more than the 2000-token budget below assumes for non-reasoning chat models. Scaling
+// their budget down for small source files (as the line-count heuristic does) starves the
+// thinking phase, so the model hits maxTokens mid-<think> every time and never reaches
+// <code_output> — an unrecoverable truncation retried forever, each retry reprocessing the
+// whole prompt from scratch on a local server.
+const REASONING_MODEL_RE = /(?:^|[/-])(?:r1|o1|o3|o4|qwq|reasoner|think(?:ing)?)(?:[/-]|$)/i
+
+function isReasoningModel(model: string): boolean {
+  return REASONING_MODEL_RE.test(model)
+}
+
 // Estimate output token budget from source line count.
 // 2000 tokens reserved for the <thinking> block; ~40 tokens per source line covers
 // ~2-3 generated test lines × ~15 tokens/line. Clamped between 4000 (floor for small
-// files) and the user's configured ceiling.
-function estimateMaxTokens(sourceCode: string | null | undefined, configMax: number): number {
-  if (!sourceCode) return configMax
+// files) and the user's configured ceiling. Reasoning models skip the scale-down entirely
+// and always get the full configured ceiling — their thinking phase needs the headroom.
+function estimateMaxTokens(sourceCode: string | null | undefined, configMax: number, reasoningModel = false): number {
+  if (reasoningModel || !sourceCode) return configMax
   const lines = (sourceCode.match(/\n/g) ?? []).length + 1
   return Math.min(configMax, Math.max(4000, 2000 + lines * 40))
 }
@@ -327,6 +341,7 @@ export class TestGenerator {
   private rawOnToken?: (token: string) => void   // unwrapped callback; filter recreated per call
   private rawFirstTokenCallback?: () => void
   private maxTokens: number
+  private reasoningModel: boolean
   private history: ChatMessage[] = []
   private lastHypothesis: string = ''
   private failedAttempts: FailedAttempt[] = []
@@ -342,6 +357,7 @@ export class TestGenerator {
     this.env = options.env
     this.rawOnToken = options.onToken
     this.maxTokens = options.config.maxTokens ?? 16000
+    this.reasoningModel = isReasoningModel(options.config.model)
     // Resolve the debug base from config.debug (boolean | string) and LACUNA_DEBUG (env wins).
     this.debugFile = resolveDebugBase(options.config.debug)
   }
@@ -351,6 +367,14 @@ export class TestGenerator {
   // so calling this resets streaming state automatically.
   setTokenCallback(cb: ((token: string) => void) | undefined) {
     this.rawOnToken = cb
+  }
+
+  // A worker's TestGenerator is reused across every file it processes, but a monorepo can mix
+  // runners per package — call this before generate()/fix() so prompt-building (mock API choice,
+  // etc.) matches whatever runner will actually execute THIS file, not just the repo-wide default
+  // the generator was constructed with. See resolveEnvForFile in lib/test-run.ts.
+  setEnv(env: DetectedEnvironment) {
+    this.env = env
   }
 
   // Register a one-shot callback that fires on the very first token of the next provider call.
@@ -427,7 +451,7 @@ export class TestGenerator {
       this.history,
       buildSystemPrompt(this.env),
       this.buildOnToken(),
-      estimateMaxTokens(context.sourceCode, this.maxTokens),
+      estimateMaxTokens(context.sourceCode, this.maxTokens, this.reasoningModel),
       GENERATE_TEMPERATURE,
     )
     await debugWrite(this.activeDebugFile, 'RESPONSE (generate)', response)
@@ -457,7 +481,7 @@ export class TestGenerator {
       this.history,
       buildSystemPrompt(this.env),
       this.buildOnToken(),
-      estimateMaxTokens(args.sourceCode, this.maxTokens),
+      estimateMaxTokens(args.sourceCode, this.maxTokens, this.reasoningModel),
       GENERATE_TEMPERATURE,
     )
     await debugWrite(this.activeDebugFile, 'RESPONSE (fix)', response)

@@ -1,5 +1,6 @@
 import { readFile } from 'fs/promises'
 import { join } from 'path'
+import { runCommand } from './runner.js'
 
 export type TestRunner = 'jest' | 'vitest' | 'pytest' | 'mocha' | 'go-test' | 'phpunit' | 'pest' | 'rspec' | 'cargo-test' | 'dotnet-test' | 'gradle-test' | 'maven-test' | 'swift-test' | 'unknown'
 export type Language = 'typescript' | 'javascript' | 'python' | 'go' | 'php' | 'ruby' | 'rust' | 'csharp' | 'java' | 'swift' | 'unknown'
@@ -10,6 +11,11 @@ export interface DetectedEnvironment {
   testFilePattern: string
   coverageCommand: string
   testCommand: string
+  // Jest 30 hard-removed the singular `--testPathPattern` CLI flag in favor of
+  // `--testPathPatterns` (deprecated since 29.4, every invocation using the old
+  // name now exits with a CLI usage error before running a single test — see
+  // detectJestTestPathFlag). Only meaningful when testRunner === 'jest'.
+  jestTestPathFlag: string
 }
 
 const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironment> = {
@@ -19,6 +25,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: '**/*.{test,spec}.{ts,tsx,js,jsx}',
     coverageCommand: 'npx vitest run --coverage',
     testCommand: 'npx vitest run',
+    jestTestPathFlag: '',
   },
   jest: {
     testRunner: 'jest',
@@ -26,6 +33,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: '**/*.{test,spec}.{ts,tsx,js,jsx}',
     coverageCommand: 'npx jest --coverage',
     testCommand: 'npx jest',
+    jestTestPathFlag: '--testPathPatterns',
   },
   mocha: {
     testRunner: 'mocha',
@@ -33,6 +41,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: '**/*.{test,spec}.{js,mjs}',
     coverageCommand: 'npx nyc mocha',
     testCommand: 'npx mocha',
+    jestTestPathFlag: '',
   },
   pytest: {
     testRunner: 'pytest',
@@ -40,6 +49,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: 'test_*.py',
     coverageCommand: 'python -m pytest --cov --cov-report=lcov',
     testCommand: 'python -m pytest',
+    jestTestPathFlag: '',
   },
   'go-test': {
     testRunner: 'go-test',
@@ -47,6 +57,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: '*_test.go',
     coverageCommand: 'go test ./... -coverprofile=coverage/lcov.info',
     testCommand: 'go test ./...',
+    jestTestPathFlag: '',
   },
   phpunit: {
     testRunner: 'phpunit',
@@ -54,6 +65,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: '**/*Test.php',
     coverageCommand: './vendor/bin/phpunit --coverage-clover coverage/clover.xml',
     testCommand: './vendor/bin/phpunit',
+    jestTestPathFlag: '',
   },
   pest: {
     testRunner: 'pest',
@@ -61,6 +73,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: '**/*.test.php',
     coverageCommand: './vendor/bin/pest --coverage --coverage-clover coverage/clover.xml',
     testCommand: './vendor/bin/pest',
+    jestTestPathFlag: '',
   },
   rspec: {
     testRunner: 'rspec',
@@ -68,6 +81,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: 'spec/**/*_spec.rb',
     coverageCommand: 'bundle exec rspec',
     testCommand: 'bundle exec rspec',
+    jestTestPathFlag: '',
   },
   'cargo-test': {
     testRunner: 'cargo-test',
@@ -75,6 +89,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: 'src/**/*.rs',
     coverageCommand: 'cargo tarpaulin --out Lcov --output-dir coverage',
     testCommand: 'cargo test',
+    jestTestPathFlag: '',
   },
   'dotnet-test': {
     testRunner: 'dotnet-test',
@@ -82,6 +97,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: '**/*Tests.cs',
     coverageCommand: 'dotnet test --collect:"XPlat Code Coverage"',
     testCommand: 'dotnet test',
+    jestTestPathFlag: '',
   },
   'gradle-test': {
     testRunner: 'gradle-test',
@@ -89,6 +105,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: 'src/test/**/*Test.java',
     coverageCommand: './gradlew test jacocoTestReport',
     testCommand: './gradlew test',
+    jestTestPathFlag: '',
   },
   'maven-test': {
     testRunner: 'maven-test',
@@ -96,6 +113,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: 'src/test/**/*Test.java',
     coverageCommand: 'mvn test jacoco:report',
     testCommand: 'mvn test',
+    jestTestPathFlag: '',
   },
   'swift-test': {
     testRunner: 'swift-test',
@@ -103,6 +121,7 @@ const RUNNER_DEFAULTS: Record<Exclude<TestRunner, 'unknown'>, DetectedEnvironmen
     testFilePattern: '**/*Tests.swift',
     coverageCommand: 'swift test --enable-code-coverage',
     testCommand: 'swift test',
+    jestTestPathFlag: '',
   },
 }
 
@@ -114,6 +133,7 @@ export function envForRunner(runner: string): DetectedEnvironment {
       testFilePattern: '**/*.test.*',
       coverageCommand: '',
       testCommand: '',
+      jestTestPathFlag: '',
     }
   )
 }
@@ -126,8 +146,8 @@ export function sq(path: string): string {
 }
 
 // Escape regex meta-characters in a file path so it can be used as a literal
-// match in Jest's --testPathPattern (or a bare positional arg, which Jest also
-// treats as a testPathPattern regex). Without this, app/(tabs)/... becomes a
+// match in Jest's --testPathPattern(s) (or a bare positional arg, which Jest also
+// treats as a testPathPatterns regex). Without this, app/(tabs)/... becomes a
 // regex capturing group that matches "app/tabs/..." (no parens) — 0 matches.
 export function jestPath(path: string): string {
   return sq(path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
@@ -167,7 +187,7 @@ export function scopedCoverageCommand(env: DetectedEnvironment, relDir: string):
       // positional narrows which test files run; --coverage.include narrows instrumentation.
       return `npx vitest run ${q} --coverage --coverage.include=${sq(dir + '/**')}`
     case 'jest':
-      return `npx jest --coverage --testPathPattern=${jestPath(dir)} --collectCoverageFrom=${sq(dir + '/**/*.{js,jsx,ts,tsx}')}`
+      return `npx jest --coverage ${env.jestTestPathFlag}=${jestPath(dir)} --collectCoverageFrom=${sq(dir + '/**/*.{js,jsx,ts,tsx}')}`
     default:
       return null
   }
@@ -195,7 +215,7 @@ export function scopedTestCommand(env: DetectedEnvironment, relDir: string): str
   const dir = relDir.replace(/\/+$/, '')
   switch (env.testRunner) {
     case 'vitest': return `npx vitest run ${sq(dir)}`
-    case 'jest':   return `npx jest --testPathPattern=${jestPath(dir)}`
+    case 'jest':   return `npx jest ${env.jestTestPathFlag}=${jestPath(dir)}`
     default:       return null
   }
 }
@@ -208,7 +228,7 @@ export function fileTestCommand(env: DetectedEnvironment, testFilePath: string):
     // shared coverage tmp dir (ENOENT lstat '<reportsDir>/.tmp'). Disabling it avoids the race
     // and skips needless instrumentation.
     case 'vitest': return `npx vitest run ${q} --coverage.enabled=false`
-    case 'jest':   return `npx jest --testPathPattern=${jestPath(testFilePath)}`
+    case 'jest':   return `npx jest ${env.jestTestPathFlag}=${jestPath(testFilePath)}`
     case 'mocha':  return `npx mocha ${q}`
     case 'pytest': return `python -m pytest ${q} -v`
     case 'go-test': {
@@ -227,8 +247,30 @@ export function fileTestCommand(env: DetectedEnvironment, testFilePath: string):
   }
 }
 
+// Jest hard-removed the singular `--testPathPattern` CLI flag in v30 (deprecated since
+// 29.4) — every invocation with the old name now exits with a CLI usage error before
+// running a single test ("Option \"testPathPattern\" was replaced by \"--testPathPatterns\"").
+// We can't hardcode either form since plenty of projects are still on Jest <30, where the
+// plural flag isn't recognized at all. Ask the actually-installed binary which major it is
+// (once per run, cached on the DetectedEnvironment) and pick accordingly.
+export async function detectJestTestPathFlag(cwd: string): Promise<string> {
+  const result = await runCommand('npx jest --version', cwd, 15_000)
+  const match = /^(\d+)\./.exec(result.stdout.trim())
+  const major = match ? Number(match[1]) : NaN
+  return Number.isFinite(major) && major < 30 ? '--testPathPattern' : '--testPathPatterns'
+}
+
 export async function detectEnvironment(
   cwd: string = process.cwd(),
+  configRunner?: string,
+): Promise<DetectedEnvironment> {
+  const env = await resolveEnvironment(cwd, configRunner)
+  if (env.testRunner === 'jest') return { ...env, jestTestPathFlag: await detectJestTestPathFlag(cwd) }
+  return env
+}
+
+async function resolveEnvironment(
+  cwd: string,
   configRunner?: string,
 ): Promise<DetectedEnvironment> {
   // config always wins over auto-detection
@@ -302,5 +344,6 @@ export async function detectEnvironment(
     testFilePattern: '**/*.test.*',
     coverageCommand: '',
     testCommand: '',
+    jestTestPathFlag: '',
   }
 }

@@ -31,6 +31,7 @@ export function createProvider(config: LacunaConfig): ModelProvider {
     return new OpenAICompatibleProvider(config.model, {
       baseURL: config.baseURL,
       apiKey: apiKey || undefined,
+      isLocal,
     })
   }
 

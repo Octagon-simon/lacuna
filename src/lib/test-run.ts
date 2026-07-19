@@ -1,7 +1,7 @@
 import { dirname, join, relative } from 'path'
 import { readFile, access } from 'fs/promises'
-import type { DetectedEnvironment } from './detector.js'
-import { fileTestCommand, multiFileTestCommand, scopedTestCommand, sq, jestPath } from './detector.js'
+import type { DetectedEnvironment, TestRunner } from './detector.js'
+import { envForRunner, fileTestCommand, multiFileTestCommand, scopedTestCommand, sq, jestPath, detectJestTestPathFlag } from './detector.js'
 
 // Quote a path for a `npm test -- <path>` argument. For Jest, the positional arg is a
 // testPathPattern REGEX, not a literal path — so regex meta-chars (e.g. the parens in Expo
@@ -21,76 +21,131 @@ function npmTestArg(env: DetectedEnvironment, rel: string): string {
 // the run command there, preferring the package's own `test` npm script, falling back to bare
 // runner invocation. Coverage runs deliberately stay at the repo root (that report is what
 // Codecov ingests) — this is only for test EXECUTION (pass/fail) runs.
+//
+// A monorepo can also MIX runners across packages (one package still on Jest, another migrated
+// to Vitest) — trusting a single repo-wide `testRunner` config for every file is wrong, and
+// forces users to drop a redundant .lacuna.json into every package just to say what's already
+// on disk. So findTestRoot below resolves the ACTUAL runner for each file's own package from
+// filesystem ground truth (its npm test script / config file / own deps), not just the cwd to
+// run it from. `defaultRunner` (config.testRunner / auto-detected repo-wide default) is only used
+// when nothing nearer to the file says otherwise.
 
 async function exists(p: string): Promise<boolean> {
   try { await access(p); return true } catch { return false }
 }
 
-const CONFIG_NAMES = [
-  'vitest.config.ts', 'vitest.config.js', 'vitest.config.mjs', 'vitest.config.mts', 'vitest.config.cjs',
-  'vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts',
-  'jest.config.ts', 'jest.config.js', 'jest.config.cjs', 'jest.config.mjs', 'jest.config.json',
-]
+const CONFIG_RUNNER: Record<string, 'vitest' | 'jest'> = {
+  'vitest.config.ts': 'vitest', 'vitest.config.js': 'vitest', 'vitest.config.mjs': 'vitest',
+  'vitest.config.mts': 'vitest', 'vitest.config.cjs': 'vitest',
+  'vite.config.ts': 'vitest', 'vite.config.js': 'vitest', 'vite.config.mjs': 'vitest', 'vite.config.mts': 'vitest',
+  'jest.config.ts': 'jest', 'jest.config.js': 'jest', 'jest.config.cjs': 'jest', 'jest.config.mjs': 'jest', 'jest.config.json': 'jest',
+}
+const CONFIG_NAMES = Object.keys(CONFIG_RUNNER)
 
-// Is `script` a CLEAN single invocation of the detected runner, so `npm test -- <path>` safely
-// scopes to a file/dir? Rejects chained/compound scripts (`&&`, `||`, `;`, `|`) and scripts that
-// aren't the detected runner — for those we fall back to a bare runner call in the same cwd.
-function isCleanRunnerScript(script: string, runner: string): boolean {
-  if (/[&|;]/.test(script)) return false
+// A clean, single-command npm test script unambiguously names its runner — returns which, or
+// null for a compound/chained script (`&&`, `||`, `;`, `|`) or one that isn't a bare vitest/jest
+// invocation (for those we can't safely append `-- <path>`, so fall back to a bare runner call).
+function runnerFromCleanScript(script: string): 'vitest' | 'jest' | null {
+  if (/[&|;]/.test(script)) return null
   const s = script.trim().replace(/^npx\s+/, '')
-  if (runner === 'vitest') return /^vitest(\s+run)?(\s|$)/.test(s)
-  if (runner === 'jest') return /^jest(\s|$)/.test(s)
-  return false
+  if (/^vitest(\s+run)?(\s|$)/.test(s)) return 'vitest'
+  if (/^jest(\s|$)/.test(s)) return 'jest'
+  return null
 }
 
-export interface TestRoot { cwd: string; npmTest: boolean }
+export interface TestRoot { cwd: string; npmTest: boolean; runner: TestRunner }
 
-// Walk up from `fromDir` (absolute) to the nearest package/config root at or below `repoRoot`.
-// Prefers the nearest package.json whose `scripts.test` is a clean runner invocation (→ npm-test
-// mode); otherwise remembers the nearest package.json OR runner-config dir as the run cwd for a
-// bare invocation. Falls back to `repoRoot`. Single-package repos whose root script is a clean
-// runner resolve to root+npmTest — same effective behavior as before, just via `npm test`.
-export async function findTestRoot(fromDir: string, repoRoot: string, runner: string): Promise<TestRoot> {
+// Walk up from `fromDir` (absolute) to the nearest package/config root at or below `repoRoot`,
+// resolving BOTH the cwd to run tests from and the runner that actually governs that package.
+// Ground truth, closest wins: (1) a package.json `scripts.test` that cleanly invokes one runner
+// → npm-test mode (2) a vitest.config.*/vite.config.*/jest.config.* file (3) vitest/jest listed
+// in that package's own deps. Falls back to `repoRoot` / `defaultRunner` if nothing nearby says
+// otherwise. Single-package repos whose root script is a clean runner resolve to root+npmTest —
+// same effective behavior as before, just via `npm test`.
+export async function findTestRoot(fromDir: string, repoRoot: string, defaultRunner: TestRunner): Promise<TestRoot> {
   let dir = fromDir
   let fallbackCwd: string | null = null
+  let fallbackRunner: TestRunner | null = null
   while (true) {
     const pkgPath = join(dir, 'package.json')
     if (await exists(pkgPath)) {
-      let script: string | undefined
-      try { script = (JSON.parse(await readFile(pkgPath, 'utf-8')).scripts ?? {}).test } catch { /* ignore */ }
-      if (script && isCleanRunnerScript(script, runner)) return { cwd: dir, npmTest: true }
-      if (!fallbackCwd) fallbackCwd = dir // a package boundary, just no clean test script
+      let pkg: { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> } = {}
+      try { pkg = JSON.parse(await readFile(pkgPath, 'utf-8')) } catch { /* ignore */ }
+      const script = pkg.scripts?.test
+      if (script) {
+        const detected = runnerFromCleanScript(script)
+        if (detected) return { cwd: dir, npmTest: true, runner: detected }
+      }
+      if (!fallbackCwd) {
+        fallbackCwd = dir // a package boundary, just no clean test script
+        const deps = { ...(pkg.dependencies ?? {}), ...(pkg.devDependencies ?? {}) }
+        if ('vitest' in deps) fallbackRunner = 'vitest'
+        else if ('jest' in deps || '@jest/core' in deps) fallbackRunner = 'jest'
+      }
     }
-    if (!fallbackCwd) {
-      for (const c of CONFIG_NAMES) { if (await exists(join(dir, c))) { fallbackCwd = dir; break } }
+    if (!fallbackRunner) {
+      for (const c of CONFIG_NAMES) {
+        if (await exists(join(dir, c))) {
+          if (!fallbackCwd) fallbackCwd = dir
+          fallbackRunner = CONFIG_RUNNER[c]
+          break
+        }
+      }
     }
     if (dir === repoRoot) break
     const parent = dirname(dir)
     if (parent === dir) break
     dir = parent
   }
-  return { cwd: fallbackCwd ?? repoRoot, npmTest: false }
+  return { cwd: fallbackCwd ?? repoRoot, npmTest: false, runner: fallbackRunner ?? defaultRunner }
+}
+
+// Builds the DetectedEnvironment to actually use for a resolved TestRoot — identical to `base`
+// unless findTestRoot discovered a DIFFERENT runner for this specific package, in which case we
+// rebuild the runner-specific defaults (and, for Jest, re-probe the version-appropriate
+// --testPathPattern(s) flag against THAT package's own install).
+async function envForRoot(base: DetectedEnvironment, root: TestRoot): Promise<DetectedEnvironment> {
+  if (root.runner === base.testRunner) return base
+  const fresh = envForRunner(root.runner)
+  if (root.runner === 'jest') return { ...fresh, jestTestPathFlag: await detectJestTestPathFlag(root.cwd) }
+  return fresh
 }
 
 export interface ResolvedRun { command: string; cwd: string }
 
+// Resolves the DetectedEnvironment that actually governs `absFile`'s own package — used to keep
+// prompt-building (mock API choice, etc.) in sync with whatever runner will really execute the
+// file, exactly like the ResolvedRun helpers below.
+export async function resolveEnvForFile(env: DetectedEnvironment, absFile: string, repoRoot: string): Promise<DetectedEnvironment> {
+  const root = await findTestRoot(dirname(absFile), repoRoot, env.testRunner)
+  return envForRoot(env, root)
+}
+
+// Same as resolveEnvForFile but for a directory (a `generate <dir>` scope) rather than a file.
+export async function resolveEnvForDir(env: DetectedEnvironment, absDir: string, repoRoot: string): Promise<DetectedEnvironment> {
+  const root = await findTestRoot(absDir, repoRoot, env.testRunner)
+  return envForRoot(env, root)
+}
+
 // Per-file verify/repair run (pass/fail only — never consumes coverage).
 export async function resolveFileTestRun(env: DetectedEnvironment, absFile: string, repoRoot: string): Promise<ResolvedRun> {
-  const { cwd, npmTest } = await findTestRoot(dirname(absFile), repoRoot, env.testRunner)
-  const rel = relative(cwd, absFile)
-  if (npmTest) {
-    const covOff = env.testRunner === 'vitest' ? ' --coverage.enabled=false' : ''
-    return { command: `npm test -- ${npmTestArg(env, rel)}${covOff}`, cwd }
+  const root = await findTestRoot(dirname(absFile), repoRoot, env.testRunner)
+  const fileEnv = await envForRoot(env, root)
+  const rel = relative(root.cwd, absFile)
+  if (root.npmTest) {
+    const covOff = fileEnv.testRunner === 'vitest' ? ' --coverage.enabled=false' : ''
+    return { command: `npm test -- ${npmTestArg(fileEnv, rel)}${covOff}`, cwd: root.cwd }
   }
-  return { command: fileTestCommand(env, rel), cwd }
+  return { command: fileTestCommand(fileEnv, rel), cwd: root.cwd }
 }
 
 // Scoped failure-finding run (all tests under a directory).
 export async function resolveScopeTestRun(env: DetectedEnvironment, absDir: string, repoRoot: string): Promise<ResolvedRun> {
-  const { cwd, npmTest } = await findTestRoot(absDir, repoRoot, env.testRunner)
-  const rel = relative(cwd, absDir)
-  if (npmTest) return { command: rel ? `npm test -- ${npmTestArg(env, rel)}` : 'npm test', cwd }
-  return { command: (rel && scopedTestCommand(env, rel)) || env.testCommand, cwd }
+  const root = await findTestRoot(absDir, repoRoot, env.testRunner)
+  const fileEnv = await envForRoot(env, root)
+  const rel = relative(root.cwd, absDir)
+  if (root.npmTest) return { command: rel ? `npm test -- ${npmTestArg(fileEnv, rel)}` : 'npm test', cwd: root.cwd }
+  return { command: (rel && scopedTestCommand(fileEnv, rel)) || fileEnv.testCommand, cwd: root.cwd }
 }
 
 // Incremental patch-coverage run for `generate --file <src> @diff`: run the ONE new test file
@@ -107,13 +162,14 @@ export async function resolveIncrementalCoverageRun(
   repoRoot: string,
   outDir: string,
 ): Promise<ResolvedRun | null> {
-  if (env.testRunner !== 'vitest' && env.testRunner !== 'jest') return null
-  const { cwd, npmTest } = await findTestRoot(dirname(absTestFile), repoRoot, env.testRunner)
-  const relTest = relative(cwd, absTestFile)
-  const relSrc = relative(cwd, absSourceFile)
+  const root = await findTestRoot(dirname(absTestFile), repoRoot, env.testRunner)
+  const fileEnv = await envForRoot(env, root)
+  if (fileEnv.testRunner !== 'vitest' && fileEnv.testRunner !== 'jest') return null
+  const relTest = relative(root.cwd, absTestFile)
+  const relSrc = relative(root.cwd, absSourceFile)
   let covFlags: string
   let bareRun: string
-  if (env.testRunner === 'vitest') {
+  if (fileEnv.testRunner === 'vitest') {
     // Force coverage ON, narrowed to the changed source, reported as lcov into OUR temp dir —
     // overriding whatever custom provider/reporter/reportsDirectory the package config sets.
     covFlags = `--coverage --coverage.enabled=true --coverage.include=${sq(relSrc)} --coverage.reporter=lcov --coverage.reportsDirectory=${sq(outDir)}`
@@ -122,21 +178,22 @@ export async function resolveIncrementalCoverageRun(
     covFlags = `--coverage --collectCoverageFrom=${sq(relSrc)} --coverageReporters=lcov --coverageDirectory=${sq(outDir)}`
     bareRun = `npx jest ${sq(relTest)}`
   }
-  const command = npmTest ? `npm test -- ${npmTestArg(env, relTest)} ${covFlags}` : `${bareRun} ${covFlags}`
-  return { command, cwd }
+  const command = root.npmTest ? `npm test -- ${npmTestArg(fileEnv, relTest)} ${covFlags}` : `${bareRun} ${covFlags}`
+  return { command, cwd: root.cwd }
 }
 
 // Multi-file run (pollution victim/polluter checks). Uses the shared package root only when ALL
 // files live under it; otherwise falls back to a bare repo-root run so we never mis-scope.
 export async function resolveMultiFileTestRun(env: DetectedEnvironment, absFiles: string[], repoRoot: string): Promise<ResolvedRun> {
   const first = await findTestRoot(dirname(absFiles[0]), repoRoot, env.testRunner)
+  const fileEnv = await envForRoot(env, first)
   const allUnder = absFiles.every((f) => f === first.cwd || f.startsWith(first.cwd + '/'))
   if (allUnder && first.npmTest) {
-    const rels = absFiles.map((f) => npmTestArg(env, relative(first.cwd, f))).join(' ')
+    const rels = absFiles.map((f) => npmTestArg(fileEnv, relative(first.cwd, f))).join(' ')
     return { command: `npm test -- ${rels}`, cwd: first.cwd }
   }
   if (allUnder) {
-    return { command: multiFileTestCommand(env, absFiles.map((f) => relative(first.cwd, f))), cwd: first.cwd }
+    return { command: multiFileTestCommand(fileEnv, absFiles.map((f) => relative(first.cwd, f))), cwd: first.cwd }
   }
   return { command: multiFileTestCommand(env, absFiles.map((f) => relative(repoRoot, f))), cwd: repoRoot }
 }
