@@ -4,7 +4,7 @@ import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import type { ModelProvider, ChatMessage } from '../lib/providers/index.js'
 import { createProvider } from '../lib/providers/index.js'
-export { ModelStallError } from '../lib/providers/types.js'
+export { ModelStallError, ModelRateLimitError } from '../lib/providers/types.js'
 import { buildSystemPrompt, buildGeneratePrompt, buildFixPrompt, buildRetryPrompt, buildPollutionFixPrompt, PATCH_MODE_LINE_THRESHOLD } from './prompts/index.js'
 import type { FailedAttempt } from './prompts/index.js'
 import type { FileContext } from './context.js'
@@ -240,7 +240,17 @@ function stripCodeFences(code: string): string {
 // Patch-operation header anchored at line start. Used to recognize patch output
 // regardless of whether the model wrapped it in <code_patch> or — when nudged by the
 // truncation retry message ("Use <code_output> tags") — inside <code_output>.
-const PATCH_OP_RE = /^\/\/ @@@ (?:REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):/m
+//
+// Also matches the bare WITH/END delimiters, not just the opening TYPE headers. A weak
+// model sometimes emits a garbled patch — e.g. it writes `// @@@ WITH:` mid-response but
+// drops the preceding `// @@@ REPLACE:` header and/or the trailing `// @@@ END` — and a
+// header-only check would then classify that as ordinary "full file" code, so the raw
+// text (both the old and new blocks, with the literal marker comment still embedded)
+// gets written straight to disk as the complete file. Recognizing the stray markers
+// routes this content into the patch-apply path instead, where parsePatch parses zero
+// valid ops and the caller correctly treats it as a failed patch (retry with guidance)
+// rather than a real file rewrite.
+const PATCH_OP_RE = /^\/\/ @@@ (?:REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE|WITH):|^\/\/ @@@ END\s*$/m
 
 function parseStructuredResponse(raw: string): { hypothesis: string; code: string; truncated: boolean; isPatch: boolean } {
   const thinkingMatch = raw.match(/<(?:thinking|think)>([\s\S]*?)<\/(?:thinking|think)>/i)
@@ -324,7 +334,7 @@ function parseStructuredResponse(raw: string): { hypothesis: string; code: strin
   // inside it without a <code_patch> delimiter.  stripThinkingBleed strips everything
   // after the opening tag, leaving an empty string.  Recover by scanning the raw
   // response for the first patch-op header and using everything from there onward.
-  const PATCH_HEADER_RE = /\/\/ @@@ (?:REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):/m
+  const PATCH_HEADER_RE = PATCH_OP_RE
   if (!code.trim() && PATCH_HEADER_RE.test(raw)) {
     const idx = raw.search(PATCH_HEADER_RE)
     code = raw.slice(idx).trim()
@@ -430,6 +440,7 @@ export class TestGenerator {
           sourceImportPath: context.sourceImportPath,
           mocksCode: context.mocksCode,
           mocksImportPath: context.mocksImportPath,
+          extraMocks: context.extraMocks,
           setupFileCode: context.setupFileCode,
           packageDeps: context.packageDeps,
           tsconfigPaths: context.tsconfigPaths,

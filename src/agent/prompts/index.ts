@@ -162,6 +162,22 @@ function parseMockExports(code: string): string[] {
   return [...new Set(names)]
 }
 
+// Renders additional (read-only) shared mock files beyond the primary one — config.mocksFile[1..].
+// These are reference-only: the model can import from them, but has no separator to patch them
+// with (MOCKS_FILE/MOCKS_PATCH always target the primary file), so we just list their exports.
+function renderExtraMocks(extraMocks: { importPath: string; code: string | null }[] | null | undefined, parts: string[]): void {
+  if (!extraMocks) return
+  for (const { importPath, code } of extraMocks) {
+    if (!code) continue
+    const exports = parseMockExports(code)
+    parts.push(`\nADDITIONAL SHARED MOCK FILE (read-only — import from: '${importPath}')`)
+    if (exports.length > 0) {
+      parts.push(`Available exports: ${exports.join(', ')}`)
+      parts.push(`↑ Already exist — do NOT re-declare any of them. Import and use whichever match the source file's domain instead of creating inline mocks.`)
+    }
+  }
+}
+
 // ─── Error detectors ──────────────────────────────────────────────────────────
 
 function detectTypeScriptErrors(errorOutput: string): string | null {
@@ -526,6 +542,7 @@ export function buildGeneratePrompt(args: {
   sourceImportPath?: string | null
   mocksCode?: string | null
   mocksImportPath?: string | null
+  extraMocks?: { importPath: string; code: string | null }[] | null
   setupFileCode?: string | null
   packageDeps?: string | null
   tsconfigPaths?: string | null
@@ -538,7 +555,7 @@ export function buildGeneratePrompt(args: {
 }): string {
   const {
     sourceFile, env, existingTestCode, uncoveredFunctions, uncoveredLines,
-    sourceImportPath, mocksCode, mocksImportPath, setupFileCode, packageDeps,
+    sourceImportPath, mocksCode, mocksImportPath, extraMocks, setupFileCode, packageDeps,
     tsconfigPaths, typeDefinitions, localImportPaths, localImportContents, reactMajorVersion, projectMemory,
     existingTestLineCount,
   } = args
@@ -632,6 +649,7 @@ export function buildGeneratePrompt(args: {
       parts.push(`\nSHARED MOCK FILE (does not exist yet) — create it if you need mocks, return it via the // ---MOCKS_FILE--- separator. Path: '${mocksImportPath}'\n⚠ Mocks file must contain ONLY ${mockApi}.fn()/${mockApi}.mock() definitions and beforeEach resets — NEVER describe/it/test/expect blocks.`)
     }
   }
+  renderExtraMocks(extraMocks, parts)
 
   const networkGuidance = buildNetworkMockingGuidance(analyzeNetworkDeps(sourceCode), sourceFile, mockApi)
   if (networkGuidance) parts.push(`\n${networkGuidance}`)
@@ -760,6 +778,7 @@ export function buildFixPrompt(args: {
   env: DetectedEnvironment
   mocksCode?: string | null
   mocksImportPath?: string | null
+  extraMocks?: { importPath: string; code: string | null }[] | null
   setupFileCode?: string | null
   packageDeps?: string | null
   tsconfigPaths?: string | null
@@ -769,7 +788,7 @@ export function buildFixPrompt(args: {
   projectMemory?: string | null
   existingTestLineCount?: number
 }): string {
-  const { testFile, testCode, sourceFile, sourceImportPath, errorOutput, env, mocksCode, mocksImportPath, setupFileCode, packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, reactMajorVersion, projectMemory, existingTestLineCount } = args
+  const { testFile, testCode, sourceFile, sourceImportPath, errorOutput, env, mocksCode, mocksImportPath, extraMocks, setupFileCode, packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, reactMajorVersion, projectMemory, existingTestLineCount } = args
   const sourceCode = args.sourceCode ? compressSource(args.sourceCode) : null
   const mockApi = env.testRunner === 'vitest' ? 'vi' : 'jest'
   const parts: string[] = []
@@ -850,6 +869,7 @@ export function buildFixPrompt(args: {
       parts.push(`\nSHARED MOCK FILE (does not exist yet) — create it if you need mocks, return it via the // ---MOCKS_FILE--- separator. Path: '${mocksImportPath}'\n⚠ Mocks file must contain ONLY ${mockApi}.fn()/${mockApi}.mock() definitions and beforeEach resets — NEVER describe/it/test/expect blocks.`)
     }
   }
+  renderExtraMocks(extraMocks, parts)
 
   if (detectReactNative(packageDeps ?? null)) parts.push(`\n${buildReactNativeGuidance()}`)
   else if (detectVue(packageDeps ?? null)) parts.push(`\n${buildVueGuidance()}`)

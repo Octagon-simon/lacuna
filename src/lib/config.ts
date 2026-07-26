@@ -25,14 +25,14 @@ export const ConfigSchema = z.object({
     .describe('Optional explicit test directory. Rarely needed — test locations are auto-detected.'),
   ignore: z.array(z.string()).default([])
     .describe('Path substrings to exclude from gap detection, e.g. ["src/graphql/", "src/theme/"].'),
-  mocksFile: z.string().optional()
-    .describe('Path to a shared mock file every generated test imports from, e.g. "src/test/mocks.ts".'),
+  mocksFile: z.union([z.string(), z.array(z.string())]).optional()
+    .describe('Path to a shared mock file every generated test imports from, e.g. "src/test/mocks.ts". Pass an array to split mocks across multiple files, e.g. ["src/test/mocks.ts", "src/test/mocks.external.ts"] — the FIRST entry is the primary file (the AI creates/patches new mocks there); the rest are shown read-only as additional import sources.'),
   setupFile: z.string().optional()
     .describe('Path to your test setup file. Its contents are shown to the AI so it knows which globals/matchers exist.'),
   provider: z.enum(['anthropic', 'openai-compatible']).default('openai-compatible')
     .describe('AI provider. "anthropic" uses the Anthropic SDK; "openai-compatible" covers DeepSeek, OpenAI, Groq, OpenRouter, Ollama, etc.'),
-  model: z.string().default('deepseek-chat')
-    .describe('Model name, e.g. "deepseek-chat", "claude-sonnet-4-6", "gpt-4o".'),
+  model: z.string().default('deepseek-v4-flash')
+    .describe('Model name, e.g. "deepseek-v4-flash", "claude-sonnet-4-6", "gpt-4o".'),
   baseURL: z.string().default('https://api.deepseek.com/v1')
     .describe('API base URL. Required for the "openai-compatible" provider.'),
   apiKeyEnv: z.string().default('DEEPSEEK_API_KEY')
@@ -52,6 +52,14 @@ export const ConfigSchema = z.object({
 })
 
 export type LacunaConfig = z.infer<typeof ConfigSchema>
+
+// Normalizes config.mocksFile (string | string[] | undefined) to an array. The first entry
+// is always the primary/writable mocks file; any further entries are read-only reference
+// files shown to the AI so it can import from them without a way to accidentally patch them.
+export function mocksFileList(config: Pick<LacunaConfig, 'mocksFile'>): string[] {
+  if (!config.mocksFile) return []
+  return Array.isArray(config.mocksFile) ? config.mocksFile : [config.mocksFile]
+}
 
 const explorer = cosmiconfig('lacuna', {
   searchPlaces: [

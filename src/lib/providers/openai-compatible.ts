@@ -1,7 +1,7 @@
 import { gunzipSync } from 'node:zlib'
 import OpenAI from 'openai'
 import type { ModelProvider, ChatMessage } from './types.js'
-import { ModelStallError } from './types.js'
+import { ModelStallError, ModelRateLimitError } from './types.js'
 
 const FIRST_TOKEN_TIMEOUT_MS = 30_000
 const STALL_TIMEOUT_MS = 60_000
@@ -164,13 +164,25 @@ export class OpenAICompatibleProvider implements ModelProvider {
           )
         }
         if (e.status === 429 || /rate.?limit|output tokens per minute|request.*exceed.*limit/i.test(body)) {
-          throw new Error(
+          throw new ModelRateLimitError(
             `Rate limit hit (HTTP 429) — ${this.model} is rejecting requests due to quota.\n` +
             `Options:\n` +
             `  1. Lower maxTokens in .lacuna.json (e.g. "maxTokens": 4000) to reduce output per request.\n` +
             `  2. Use --workers 1 to avoid parallel requests consuming your quota.\n` +
             `  3. Try a different model: lacuna generate -m deepseek\n` +
             `  4. Check your provider's usage dashboard and upgrade if needed.`,
+          )
+        }
+        // Capacity/overload rejections — not a quota problem, a "too many requests RIGHT NOW"
+        // problem. Providers signal this differently: DeepSeek returns 503 with a message like
+        // "concurrency is too high" / "server is busy"; others return 502/504 under load. Worth
+        // a short backoff-and-retry (ModelRateLimitError) rather than failing the file outright,
+        // since the same request often succeeds moments later once other in-flight requests clear.
+        if (e.status === 503 || e.status === 502 || e.status === 504 || /overload|too many concurrent|concurrency.*(high|too)|server.*busy|try again later/i.test(body)) {
+          throw new ModelRateLimitError(
+            `${this.model} is overloaded (HTTP ${e.status ?? '?'}): ${body}\n` +
+            `This is the provider rejecting requests under load, not a bug in your test — lacuna will back off and retry.\n` +
+            `If this keeps happening: lower --workers, or try again later.`,
           )
         }
         throw new Error(`${this.model} API error (HTTP ${e.status ?? '?'}): ${body}`)

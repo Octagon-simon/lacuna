@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { ModelProvider, ChatMessage } from './types.js'
-import { ModelStallError } from './types.js'
+import { ModelStallError, ModelRateLimitError } from './types.js'
 
 const FIRST_TOKEN_TIMEOUT_MS = 30_000
 const STALL_TIMEOUT_MS = 60_000
@@ -94,7 +94,7 @@ export class AnthropicProvider implements ModelProvider {
       }
 
       if (/rate.?limit|429|output tokens per minute|request.*exceed.*limit/i.test(msg)) {
-        throw new Error(
+        throw new ModelRateLimitError(
           `Anthropic rate limit hit — your account has a low output-token-per-minute cap (Tier 1: 8k TPM).\n` +
           `Options:\n` +
           `  1. Lower maxTokens in .lacuna.json (e.g. "maxTokens": 4000) to reduce output per request.\n` +
@@ -102,6 +102,13 @@ export class AnthropicProvider implements ModelProvider {
           `  3. Switch to a cheaper/higher-limit provider: lacuna generate -m deepseek\n` +
           `  4. Upgrade your Anthropic account tier: https://console.anthropic.com/settings/billing`,
         )
+      }
+
+      // Anthropic returns 529 "Overloaded" when their infrastructure is at capacity — a
+      // transient "too much load right now" signal, worth a short backoff-and-retry rather
+      // than failing the file outright.
+      if (/overloaded|529/i.test(msg)) {
+        throw new ModelRateLimitError(`${this.model} is overloaded: ${msg}\nlacuna will back off and retry.`)
       }
 
       throw err

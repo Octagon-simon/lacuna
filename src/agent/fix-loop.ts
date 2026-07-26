@@ -3,6 +3,7 @@ import { join, dirname, basename, extname, isAbsolute, relative } from 'path'
 import { access, stat } from 'fs/promises'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
+import { mocksFileList } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import { resolveFileTestRun, resolveScopeTestRun, resolveMultiFileTestRun, resolveEnvForFile } from '../lib/test-run.js'
 import { isWithinDir } from '../lib/coverage/index.js'
@@ -12,7 +13,7 @@ import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 import { buildFixFileContext, computeRelativeImport, collectTypeDefinitions, collectLocalImportPaths, detectReactMajorVersion, findFileByName } from './context.js'
-import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
+import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, ModelRateLimitError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
 import { processGap } from './loop.js'
 import type { CoverageGap } from '../lib/coverage/types.js'
 import { ProjectMemory } from './project-memory.js'
@@ -384,6 +385,8 @@ async function fixFile(
 
   let stallRetries = 0
   const MAX_STALL_RETRIES = 2
+  let rateLimitRetries = 0
+  const MAX_RATE_LIMIT_RETRIES = 4
 
   // Keep-best across retries: a failing run can still be a net improvement over the
   // original (e.g. attempt 1 fixes 2 of 3 broken tests). Retries sometimes regress
@@ -430,6 +433,7 @@ async function fixFile(
             env: fileEnv,
             mocksCode: ctx?.mocksCode ?? null,
             mocksImportPath: ctx?.mocksImportPath ?? null,
+            extraMocks: ctx?.extraMocks ?? null,
             setupFileCode: ctx?.setupFileCode ?? null,
             packageDeps: ctx?.packageDeps ?? null,
             tsconfigPaths: ctx?.tsconfigPaths ?? null,
@@ -451,6 +455,24 @@ async function fixFile(
           onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() })
           await new Promise(r => setTimeout(r, 3000))
           attempt--   // don't consume an AI iteration for a connection stall
+          continue
+        }
+      }
+      // Provider is rejecting requests for capacity reasons (429 quota, or a 5xx/"overloaded"
+      // rejection under high concurrency) rather than because anything about this file/test is
+      // wrong. Back off with jitter and retry a few times before giving up — under N parallel
+      // workers, other in-flight requests finishing frees up capacity within seconds, so an
+      // immediate hard failure here wastes a worker slot for the rest of the run. Exponential
+      // backoff (2s, 4s, 8s, 16s + up to 1s jitter) spreads retries out instead of every
+      // rejected worker hammering the provider again at the same instant.
+      if (err instanceof ModelRateLimitError) {
+        if (rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
+          rateLimitRetries++
+          const delayMs = 2000 * 2 ** (rateLimitRetries - 1) + Math.floor(Math.random() * 1000)
+          if (!onStatus) log(chalk.yellow(`\n  ⌛ Provider is rate-limited/overloaded — backing off ${Math.round(delayMs / 1000)}s (${rateLimitRetries}/${MAX_RATE_LIMIT_RETRIES})...`))
+          onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() })
+          await new Promise(r => setTimeout(r, delayMs))
+          attempt--   // don't consume an AI iteration for a capacity rejection
           continue
         }
       }
@@ -537,12 +559,13 @@ async function fixFile(
     const MOCKS_PATCH_SEPARATOR = '// ---MOCKS_PATCH---'
     let testFileContent = fixed
 
-    if (fixed.includes(MOCKS_PATCH_SEPARATOR) && config.mocksFile) {
+    const primaryMocksFile = mocksFileList(config)[0]
+    if (fixed.includes(MOCKS_PATCH_SEPARATOR) && primaryMocksFile) {
       // Surgical patch mode: model only emits the changed sections
       const [newTestCode, patchContent] = fixed.split(MOCKS_PATCH_SEPARATOR)
       testFileContent = newTestCode.trim()
       if (patchContent?.trim()) {
-        const absoluteMocksFile = join(cwd, config.mocksFile)
+        const absoluteMocksFile = join(cwd, primaryMocksFile)
         let existing = ''
         try { existing = await readFile(absoluteMocksFile, 'utf-8') } catch { /* new file — patch can't apply */ }
         if (existing) {
@@ -555,24 +578,24 @@ async function fixFile(
               continue
             }
             await writeFile(absoluteMocksFile, applied.result, 'utf-8')
-            if (!onStatus) log(chalk.dim(`  Patched mocks file: ${config.mocksFile}`))
+            if (!onStatus) log(chalk.dim(`  Patched mocks file: ${primaryMocksFile}`))
           }
         }
       }
-    } else if (fixed.includes(MOCKS_SEPARATOR) && config.mocksFile) {
+    } else if (fixed.includes(MOCKS_SEPARATOR) && primaryMocksFile) {
       const [newTestCode, newMocksCode] = fixed.split(MOCKS_SEPARATOR)
       testFileContent = newTestCode.trim()
       if (newMocksCode?.trim()) {
         const { code: safeMocks, stripped } = sanitizeMocksContent(newMocksCode.trim())
         if (stripped && !onStatus) log(chalk.yellow(`  ⚠ Mocks file contained test blocks — stripped before writing`))
         if (safeMocks) {
-          const absoluteMocksFile = join(cwd, config.mocksFile)
+          const absoluteMocksFile = join(cwd, primaryMocksFile)
           await mkdir(dirname(absoluteMocksFile), { recursive: true })
           let existing = ''
           try { existing = await readFile(absoluteMocksFile, 'utf-8') } catch { /* new file */ }
           const merged = existing ? mergeMocksContent(existing, safeMocks) : safeMocks
           await writeFile(absoluteMocksFile, merged, 'utf-8')
-          if (!onStatus) log(chalk.dim(`  Updated mocks file: ${config.mocksFile}`))
+          if (!onStatus) log(chalk.dim(`  Updated mocks file: ${primaryMocksFile}`))
         }
       }
     }

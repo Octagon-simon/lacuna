@@ -3,6 +3,7 @@ import { tmpdir } from 'os'
 import { dirname, join, isAbsolute, relative } from 'path'
 import chalk from 'chalk'
 import type { LacunaConfig } from '../lib/config.js'
+import { mocksFileList } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import { scopedCoverageCommand, relatedCoverageCommand } from '../lib/detector.js'
 import { resolveFileTestRun, resolveIncrementalCoverageRun, resolveEnvForFile, resolveEnvForDir } from '../lib/test-run.js'
@@ -15,7 +16,7 @@ import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { buildFileContext, findExistingTestFile } from './context.js'
-import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
+import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, ModelRateLimitError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js'
@@ -141,6 +142,8 @@ export async function processGap(
   let firstPassCount = 0                    // passing tests on attempt 1
   let stallRetries = 0
   const MAX_STALL_RETRIES = 2
+  let rateLimitRetries = 0
+  const MAX_RATE_LIMIT_RETRIES = 4
   let consecutivePatchFailures = 0
 
   // Best collecting attempt seen so far — used on failure to keep a net-improving partial
@@ -205,6 +208,19 @@ export async function processGap(
           onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() })
           await new Promise(r => setTimeout(r, 3000))
           attempt--   // don't consume an AI iteration for a connection stall
+          continue
+        }
+      }
+      // See fix-loop.ts's identical branch: a capacity rejection (429/5xx/"overloaded") isn't
+      // this file's fault, so back off with jitter and retry instead of failing it outright.
+      if (err instanceof ModelRateLimitError) {
+        if (rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
+          rateLimitRetries++
+          const delayMs = 2000 * 2 ** (rateLimitRetries - 1) + Math.floor(Math.random() * 1000)
+          if (!onStatus) log(chalk.yellow(`\n  ⌛ Provider is rate-limited/overloaded — backing off ${Math.round(delayMs / 1000)}s (${rateLimitRetries}/${MAX_RATE_LIMIT_RETRIES})...`))
+          onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() })
+          await new Promise(r => setTimeout(r, delayMs))
+          attempt--   // don't consume an AI iteration for a capacity rejection
           continue
         }
       }
@@ -313,12 +329,13 @@ export async function processGap(
     const MOCKS_PATCH_SEPARATOR = '// ---MOCKS_PATCH---'
     let testCode = generatedCode
 
-    if (generatedCode.includes(MOCKS_PATCH_SEPARATOR) && config.mocksFile) {
+    const primaryMocksFile = mocksFileList(config)[0]
+    if (generatedCode.includes(MOCKS_PATCH_SEPARATOR) && primaryMocksFile) {
       // Surgical patch mode: model only emits the changed sections
       const [newTestCode, patchContent] = generatedCode.split(MOCKS_PATCH_SEPARATOR)
       testCode = newTestCode.trim()
       if (patchContent?.trim()) {
-        const absoluteMocksFile = join(cwd, config.mocksFile)
+        const absoluteMocksFile = join(cwd, primaryMocksFile)
         let existing = ''
         try { existing = await readFile(absoluteMocksFile, 'utf-8') } catch { /* new file — patch can't apply */ }
         if (existing) {
@@ -332,11 +349,11 @@ export async function processGap(
               continue
             }
             await writeFile(absoluteMocksFile, applied.result, 'utf-8')
-            if (!onStatus) log(chalk.dim(`  Patched mocks file: ${config.mocksFile}`))
+            if (!onStatus) log(chalk.dim(`  Patched mocks file: ${primaryMocksFile}`))
           }
         }
       }
-    } else if (generatedCode.includes(MOCKS_SEPARATOR) && config.mocksFile) {
+    } else if (generatedCode.includes(MOCKS_SEPARATOR) && primaryMocksFile) {
       // Full-rewrite mode (new mock file or explicit full replacement)
       const [newTestCode, newMocksCode] = generatedCode.split(MOCKS_SEPARATOR)
       testCode = newTestCode.trim()
@@ -344,13 +361,13 @@ export async function processGap(
         const { code: safeMocks, stripped } = sanitizeMocksContent(newMocksCode.trim())
         if (stripped && !onStatus) log(chalk.yellow(`  ⚠ Mocks file contained test blocks — stripped before writing`))
         if (safeMocks) {
-          const absoluteMocksFile = join(cwd, config.mocksFile)
+          const absoluteMocksFile = join(cwd, primaryMocksFile)
           await mkdir(dirname(absoluteMocksFile), { recursive: true })
           let existing = ''
           try { existing = await readFile(absoluteMocksFile, 'utf-8') } catch { /* new file */ }
           const merged = existing ? mergeMocksContent(existing, safeMocks) : safeMocks
           await writeFile(absoluteMocksFile, merged, 'utf-8')
-          if (!onStatus) log(chalk.dim(`  Updated mocks file: ${config.mocksFile}`))
+          if (!onStatus) log(chalk.dim(`  Updated mocks file: ${primaryMocksFile}`))
         }
       }
     }

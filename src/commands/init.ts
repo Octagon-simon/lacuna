@@ -12,6 +12,44 @@ import type { LacunaConfig } from '../lib/config.js'
 // Hosted (not a node_modules path) because lacuna installs globally, so there's no local copy.
 const LACUNA_SCHEMA_URL = 'https://raw.githubusercontent.com/Octagon-simon/lacuna/main/lacuna.schema.json'
 
+// Returns the absolute path of the first `names` entry found at `cwd`, or null if none exist.
+// Used before scaffolding a runner config so we don't create e.g. jest.config.js next to an
+// already-existing jest.config.ts — checking only the one canonical filename missed every
+// other valid extension (.ts/.cjs/.mjs/.json) and duplicated the config.
+async function findExistingConfig(cwd: string, names: string[]): Promise<string | null> {
+  for (const name of names) {
+    const p = resolve(cwd, name)
+    try { await access(p); return p } catch { /* try next */ }
+  }
+  return null
+}
+
+// When we skip scaffolding because a runner config already exists, that config is untouched —
+// we never parse or rewrite an arbitrary existing jest/vitest config (too risky: TS config files
+// can contain any expression, and a naive rewrite could corrupt it the way a bad JSON-comment
+// strip once corrupted tsconfig aliases). But lacuna's coverage-reading step has a hard
+// requirement the config must satisfy: an lcov reporter writing into `coverageDir` (from
+// .lacuna.json, 'coverage' by default). Neither is passed on the CLI — `npx jest --coverage` /
+// `npx vitest run --coverage` rely entirely on the project's own config for the reporter list
+// and output directory. If the existing config doesn't already produce lcov there, every
+// subsequent `lacuna generate`/`analyze` run will fail at "Could not read coverage report",
+// exactly like the vitest custom-reporter-filename issue this session fixed downstream — except
+// this case has no report to fall back to at all. Do a best-effort text scan (not a real
+// parser) and warn loudly with the exact keys to add, rather than failing silently later.
+function warnIfMissingLcovCoverage(configPath: string, configText: string, coverageDir: string, kind: 'jest' | 'vitest', log: (msg: string) => void): void {
+  const hasLcov = /lcov/i.test(configText)
+  const dirKey = kind === 'jest' ? 'coverageDirectory' : 'reportsDirectory'
+  const hasDirKey = new RegExp(dirKey).test(configText)
+  if (hasLcov && hasDirKey) return
+  const reporterHint = kind === 'jest'
+    ? `coverageReporters: ['lcov', 'text-summary'],\n  coverageDirectory: '${coverageDir}',`
+    : `coverage: { provider: 'v8', reporter: ['lcov', 'text-summary'], reportsDirectory: '${coverageDir}' }`
+  log(chalk.yellow(`  ⚠ ${configPath} exists but doesn't appear to configure an lcov reporter${hasDirKey ? '' : ` or ${dirKey}`}.`))
+  log(chalk.yellow(`    lacuna reads coverage from ${coverageDir}/lcov.info after every run — without this, "generate"/"analyze" will fail`))
+  log(chalk.yellow(`    with "Could not read coverage report". Add to your ${kind} config:`))
+  log(chalk.dim(`      ${reporterHint}`))
+}
+
 interface ProjectMeta {
   isReact: boolean
   isReactNative: boolean
@@ -525,10 +563,15 @@ async function ensureTestRunnerSetup(
     // Always resolve to an absolute path so the config is never created inside
     // a subdirectory regardless of how cwd was derived.
     const configPath = resolve(cwd, 'vitest.config.ts')
-    try {
-      await access(configPath)
-      log(chalk.dim(`  vitest.config.ts already exists at ${configPath} — skipping.`))
-    } catch {
+    const existing = await findExistingConfig(cwd, [
+      'vitest.config.ts', 'vitest.config.js', 'vitest.config.mjs', 'vitest.config.mts', 'vitest.config.cjs',
+      'vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts',
+    ])
+    if (existing) {
+      log(chalk.dim(`  ${existing} already exists — skipping.`))
+      const existingText = await readFile(existing, 'utf-8').catch(() => '')
+      warnIfMissingLcovCoverage(existing, existingText, 'coverage', 'vitest', log)
+    } else {
       const setupLine = createdSetupFile
         ? `\n    setupFiles: ['./${createdSetupFile}'],`
         : ''
@@ -587,10 +630,14 @@ async function ensureTestRunnerSetup(
 
   } else if (runner === 'jest') {
     const configPath = resolve(cwd, 'jest.config.js')
-    try {
-      await access(configPath)
-      log(chalk.dim(`  jest.config.js already exists — skipping.`))
-    } catch {
+    const existing = await findExistingConfig(cwd, [
+      'jest.config.ts', 'jest.config.js', 'jest.config.cjs', 'jest.config.mjs', 'jest.config.json',
+    ])
+    if (existing) {
+      log(chalk.dim(`  ${existing} already exists — skipping.`))
+      const existingText = await readFile(existing, 'utf-8').catch(() => '')
+      warnIfMissingLcovCoverage(existing, existingText, 'coverage', 'jest', log)
+    } else {
       const setupLine = createdSetupFile
         ? `\n  setupFilesAfterEnv: ['<rootDir>/${createdSetupFile}'],`
         : ''
@@ -754,12 +801,17 @@ export default class Init extends Command {
       default: true,
     })
 
-    let mocksFile: string | undefined
+    let mocksFile: string | string[] | undefined
     if (hasMocks) {
-      mocksFile = await input({
-        message: 'Path to shared mock file:',
+      // Accepts a comma-separated list for projects that split mocks across multiple files
+      // (e.g. one for external services, one for internal utils) — the first path becomes
+      // the primary/writable file the AI creates and patches; the rest are shown read-only.
+      const mocksInput = await input({
+        message: 'Path to shared mock file (comma-separate if you have more than one):',
         default: (await readProjectMeta(cwd)).isReactNative ? `${sourceDir}/test/mock.tsx` : `${sourceDir}/test/mocks.ts`,
       })
+      const paths = mocksInput.split(',').map(p => p.trim()).filter(Boolean)
+      mocksFile = paths.length > 1 ? paths : paths[0]
     }
 
     // ── Coverage threshold ────────────────────────────────────────────────────
@@ -799,7 +851,7 @@ export default class Init extends Command {
     this.log(`  Source dir: ${chalk.cyan(sourceDir)}`)
     this.log(`  Threshold:  ${threshold}%`)
     if (setupFile) this.log(`  Setup file: ${chalk.cyan(setupFile)}`)
-    if (mocksFile) this.log(`  Mocks file: ${chalk.cyan(mocksFile)}`)
+    if (mocksFile) this.log(`  Mocks file: ${chalk.cyan(Array.isArray(mocksFile) ? mocksFile.join(', ') : mocksFile)}`)
 
     if (preset.apiKeyEnv) {
       const keySet = process.env[preset.apiKeyEnv]
