@@ -91,8 +91,18 @@
       "description": "Path substrings to exclude from gap detection, e.g. [\"src/graphql/\", \"src/theme/\"]."
     },
     "mocksFile": {
-      "type": "string",
-      "description": "Path to a shared mock file every generated test imports from, e.g. \"src/test/mocks.ts\"."
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      ],
+      "description": "Path to a shared mock file every generated test imports from, e.g. \"src/test/mocks.ts\". Pass an array to split mocks across multiple files, e.g. [\"src/test/mocks.ts\", \"src/test/mocks.external.ts\"] — the FIRST entry is the primary file (the AI creates/patches new mocks there); the rest are shown read-only as additional import sources."
     },
     "setupFile": {
       "type": "string",
@@ -109,8 +119,8 @@
     },
     "model": {
       "type": "string",
-      "default": "deepseek-chat",
-      "description": "Model name, e.g. \"deepseek-chat\", \"claude-sonnet-4-6\", \"gpt-4o\"."
+      "default": "deepseek-v4-flash",
+      "description": "Model name, e.g. \"deepseek-v4-flash\", \"claude-sonnet-4-6\", \"gpt-4o\"."
     },
     "baseURL": {
       "type": "string",

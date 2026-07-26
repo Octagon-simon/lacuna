@@ -2,7 +2,7 @@ import { Command, Flags, Args } from '@oclif/core'
 import { writeFile, stat } from 'fs/promises'
 import { resolve } from 'path'
 import chalk from 'chalk'
-import { loadConfig, applyModelOverride } from '../lib/config.js'
+import { loadConfig, applyModelOverride, mocksFileList } from '../lib/config.js'
 import { detectEnvironment } from '../lib/detector.js'
 import { runAgentLoop } from '../agent/loop.js'
 import { resolveDiffScope, countChangedLines, scopeDiffToDir, GitDiffError } from '../lib/git-diff.js'
@@ -163,7 +163,7 @@ export default class Generate extends Command {
     this.log(`${chalk.dim('Runner:')}     ${chalk.cyan(env.testRunner)}`)
     this.log(`${chalk.dim('Threshold:')}  ${config.threshold}%`)
     if (flags.workers > 1) this.log(`${chalk.dim('Workers:')}    ${flags.workers}`)
-    if (config.mocksFile) this.log(`${chalk.dim('Mocks:')}      ${chalk.cyan(config.mocksFile)}`)
+    if (config.mocksFile) this.log(`${chalk.dim('Mocks:')}      ${chalk.cyan(mocksFileList(config).join(', '))}`)
     const debugPattern = debugLogPattern(config.debug)
     if (debugPattern) this.log(`${chalk.dim('Debug:')}      ${chalk.green('on')} ${chalk.dim(`→ ${debugPattern}`)}`)
     if (flags['dry-run']) this.log(chalk.yellow('  [dry-run — no files will be written]'))

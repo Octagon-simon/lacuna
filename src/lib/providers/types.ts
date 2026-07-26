@@ -33,6 +33,20 @@ export class ModelStallError extends Error {
   }
 }
 
+// Transient, capacity-related provider rejection — HTTP 429 (rate limit) or a 5xx "server
+// overloaded / too much concurrency" response. Distinct from ModelStallError (which means the
+// connection itself hung) and from a generic Error (which the fix/generate loop treats as a
+// permanent failure for that file, no retry). This is worth a short backoff-and-retry instead:
+// under N parallel workers, a provider's capacity ceiling can reject a fraction of concurrent
+// requests while still succeeding moments later once other in-flight requests complete — the
+// same request retried a few seconds after the others thin out often just works.
+export class ModelRateLimitError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ModelRateLimitError'
+  }
+}
+
 export const PRESETS: Record<string, ProviderPreset> = {
   claude: {
     label: 'Claude (Anthropic) — claude-sonnet-4-6',
@@ -49,9 +63,9 @@ export const PRESETS: Record<string, ProviderPreset> = {
     apiKeyHint: 'https://console.anthropic.com',
   },
   deepseek: {
-    label: 'DeepSeek — deepseek-chat',
+    label: 'DeepSeek — deepseek-v4-flash',
     provider: 'openai-compatible',
-    model: 'deepseek-chat',
+    model: 'deepseek-v4-flash',
     baseURL: 'https://api.deepseek.com/v1',
     apiKeyEnv: 'DEEPSEEK_API_KEY',
     apiKeyHint: 'https://platform.deepseek.com',

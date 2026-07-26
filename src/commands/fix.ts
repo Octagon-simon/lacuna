@@ -2,7 +2,7 @@ import { Command, Flags, Args } from '@oclif/core'
 import { stat } from 'fs/promises'
 import { resolve } from 'path'
 import chalk from 'chalk'
-import { loadConfig, applyModelOverride } from '../lib/config.js'
+import { loadConfig, applyModelOverride, mocksFileList } from '../lib/config.js'
 import { detectEnvironment } from '../lib/detector.js'
 import { runFixLoop } from '../agent/fix-loop.js'
 import { debugLogPattern } from '../agent/generator.js'
@@ -103,7 +103,7 @@ export default class Fix extends Command {
     this.log(`${chalk.dim('Runner:')}  ${chalk.cyan(env.testRunner)}`)
     if (flags.types) this.log(`${chalk.dim('Mode:')}    ${chalk.cyan('type errors')} ${chalk.dim('(selecting files by TypeScript errors, not test failures)')}`)
     if (flags.workers > 1) this.log(`${chalk.dim('Workers:')} ${flags.workers}`)
-    if (config.mocksFile) this.log(`${chalk.dim('Mocks:')}   ${chalk.cyan(config.mocksFile)}`)
+    if (config.mocksFile) this.log(`${chalk.dim('Mocks:')}   ${chalk.cyan(mocksFileList(config).join(', '))}`)
     const debugPattern = debugLogPattern(config.debug)
     if (debugPattern) this.log(`${chalk.dim('Debug:')}   ${chalk.green('on')} ${chalk.dim(`→ ${debugPattern}`)}`)
     if (flags['dry-run']) this.log(chalk.yellow('  [dry-run — no files will be written]'))

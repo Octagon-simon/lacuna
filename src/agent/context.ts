@@ -2,6 +2,16 @@ import { readFile, access, mkdir, readdir } from 'fs/promises'
 import { join, dirname, basename, extname, relative } from 'path'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import type { LacunaConfig } from '../lib/config.js'
+import { mocksFileList } from '../lib/config.js'
+
+// A mocks file beyond the primary one (config.mocksFile[0]) — shown to the AI as read-only
+// reference so it imports from the RIGHT file instead of re-declaring mocks that already
+// exist elsewhere. Only the primary file is ever created/patched via the MOCKS_FILE /
+// MOCKS_PATCH response separators, since those have no way to say which file they target.
+export interface ExtraMockFile {
+  importPath: string
+  code: string | null
+}
 
 export interface FileContext {
   sourceFile: string
@@ -12,6 +22,7 @@ export interface FileContext {
   sourceImportPath: string | null  // relative import path from test file to source file
   mocksCode: string | null
   mocksImportPath: string | null
+  extraMocks: ExtraMockFile[]      // additional (read-only) shared mock files, config.mocksFile[1..]
   setupFileCode: string | null
   packageDeps: string | null      // test-relevant lines from package.json
   tsconfigPaths: string | null    // path aliases from tsconfig.json
@@ -1022,16 +1033,23 @@ export async function buildFixFileContext(
   absTestPath: string,
   cwd: string,
   config?: LacunaConfig,
-): Promise<Pick<FileContext, 'mocksCode' | 'mocksImportPath' | 'setupFileCode' | 'packageDeps' | 'tsconfigPaths'>> {
+): Promise<Pick<FileContext, 'mocksCode' | 'mocksImportPath' | 'extraMocks' | 'setupFileCode' | 'packageDeps' | 'tsconfigPaths'>> {
+  const mocksPaths = config ? mocksFileList(config) : []
   let mocksCode: string | null = null
   let mocksImportPath: string | null = null
-  if (config?.mocksFile) {
-    const absoluteMocks = join(cwd, config.mocksFile)
+  if (mocksPaths[0]) {
+    const absoluteMocks = join(cwd, mocksPaths[0])
     mocksImportPath = relativeMockPath(absTestPath, absoluteMocks)
     try {
       mocksCode = await readFile(absoluteMocks, 'utf-8')
     } catch { /* mocks file not created yet — AI will create it */ }
   }
+  const extraMocks = await Promise.all(mocksPaths.slice(1).map(async (p): Promise<ExtraMockFile> => {
+    const absoluteMocks = join(cwd, p)
+    const importPath = relativeMockPath(absTestPath, absoluteMocks)
+    const code = await readFile(absoluteMocks, 'utf-8').catch(() => null)
+    return { importPath, code }
+  }))
 
   let setupFileCode: string | null = null
   if (config?.setupFile) {
@@ -1045,7 +1063,7 @@ export async function buildFixFileContext(
     readTsconfigPaths(cwd),
   ])
 
-  return { mocksCode, mocksImportPath, setupFileCode, packageDeps, tsconfigPaths }
+  return { mocksCode, mocksImportPath, extraMocks, setupFileCode, packageDeps, tsconfigPaths }
 }
 
 export async function buildFileContext(
@@ -1066,10 +1084,11 @@ export async function buildFileContext(
 
   const sourceImportPath = computeRelativeImport(suggestedTestFile, absoluteSource)
 
+  const mocksPaths = config ? mocksFileList(config) : []
   let mocksCode: string | null = null
   let mocksImportPath: string | null = null
-  if (config?.mocksFile) {
-    const absoluteMocks = join(cwd, config.mocksFile)
+  if (mocksPaths[0]) {
+    const absoluteMocks = join(cwd, mocksPaths[0])
     // Always compute the import path — even if the file doesn't exist yet,
     // the AI needs to know where to create/import it from.
     mocksImportPath = relativeMockPath(suggestedTestFile, absoluteMocks)
@@ -1077,6 +1096,12 @@ export async function buildFileContext(
       mocksCode = await readFile(absoluteMocks, 'utf-8')
     } catch { /* file not created yet — AI will create it */ }
   }
+  const extraMocks = await Promise.all(mocksPaths.slice(1).map(async (p): Promise<ExtraMockFile> => {
+    const absoluteMocks = join(cwd, p)
+    const importPath = relativeMockPath(suggestedTestFile, absoluteMocks)
+    const code = await readFile(absoluteMocks, 'utf-8').catch(() => null)
+    return { importPath, code }
+  }))
 
   let setupFileCode: string | null = null
   if (config?.setupFile) {
@@ -1103,6 +1128,7 @@ export async function buildFileContext(
     sourceImportPath,
     mocksCode,
     mocksImportPath,
+    extraMocks,
     setupFileCode,
     packageDeps,
     tsconfigPaths,
