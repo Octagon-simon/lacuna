@@ -49,9 +49,31 @@ export const ConfigSchema = z.object({
     .describe('Run the project\'s local eslint --fix and prettier on each generated/fixed test file before declaring success, so output matches your repo style and passes lint. Best-effort; set false to disable.'),
   nodeEnvRouting: z.boolean().default(true)
     .describe('For DOM-free generated tests (services, utils, validators) in a jsdom project, add a `@vitest-environment node` / `@jest-environment node` docblock so the file skips jsdom startup and runs much faster. Verified per-file (reverted if it breaks the test). Set false to disable.'),
+  memory: z.object({
+    enabled: z.boolean().default(true)
+      .describe('Retrieve and persist learned rules (framework conventions, mock patterns, error→fix mappings) in a structured memory store, so prompts pull in only what\'s relevant instead of static "just in case" context. Set false to disable.'),
+    distill: z.boolean().default(true)
+      .describe('When a fix is learned for the first time, make one small model call to turn it into a cleaner rule than the raw mechanical diff. Set false to skip the extra call and keep the mechanical version.'),
+  }).default({})
+    .describe('Structured memory store (~/.lacuna/memory, shared across every project on this machine) for learned test-generation/fix rules — retrieved per file/error instead of statically stuffing every prompt with the same rules.'),
 })
 
-export type LacunaConfig = z.infer<typeof ConfigSchema>
+// The hard upper bound on attempts per file. The loops start at config.maxIterations but extend up
+// to this ceiling while each attempt keeps fixing a distinct new error (convergence-based budget —
+// see loop.ts/fix-loop.ts). Single source of truth so the CLI, both loops, and the extension's
+// worst-case cost disclosure all agree.
+export function iterationCeiling(maxIterations: number): number {
+  return maxIterations * 2
+}
+
+export type LacunaConfig = z.infer<typeof ConfigSchema> & {
+  // Runtime-only API key supplied programmatically by an embedding host (the VS Code extension
+  // resolves it from SecretStorage and assigns it here before a run). Deliberately NOT a
+  // ConfigSchema field: keeping it off the schema means it can never be read from or written to
+  // .lacuna.json, so a committed secret is impossible. createProvider prefers it over
+  // process.env[apiKeyEnv]; the CLI never sets it, so the env-var path is unchanged.
+  apiKey?: string
+}
 
 // Normalizes config.mocksFile (string | string[] | undefined) to an array. The first entry
 // is always the primary/writable mocks file; any further entries are read-only reference
@@ -72,6 +94,12 @@ const explorer = cosmiconfig('lacuna', {
     'lacuna.config.js',
     'lacuna.config.cjs',
   ],
+  // Disable cosmiconfig's default result cache. The CLI is a fresh process per invocation so caching
+  // never mattered there, but an EMBEDDER (the VS Code extension) is long-lived: with the cache on,
+  // the first loadConfig(cwd) result is pinned for the life of the extension host, so every later run
+  // reuses a stale config — edits to .lacuna.json (model, provider, threshold, anything) are ignored
+  // until a window reload. cache:false makes each loadConfig re-read the file from disk.
+  cache: false,
 })
 
 // Applies a -m / --model flag to the config. If the value matches a preset key

@@ -6,7 +6,7 @@ export interface TipContext {
     fresh?: boolean;
     model: string;
     threshold: number;
-    mocksFile?: string;
+    mocksFile?: string | string[];
     ignore?: string[];
     command?: 'generate' | 'fix';
 }

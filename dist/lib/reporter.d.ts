@@ -41,6 +41,8 @@ export interface JsonReport {
     };
     filesProcessed?: number;
     testsWritten?: number;
+    fixHandoffs?: number;
+    fixHandoffRecovered?: number;
     gaps?: Array<{
         file: string;
         uncoveredFunctions: string[];

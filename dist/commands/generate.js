@@ -2,7 +2,7 @@ import { Command, Flags, Args } from '@oclif/core';
 import { writeFile, stat } from 'fs/promises';
 import { resolve } from 'path';
 import chalk from 'chalk';
-import { loadConfig, applyModelOverride } from '../lib/config.js';
+import { loadConfig, applyModelOverride, mocksFileList } from '../lib/config.js';
 import { detectEnvironment } from '../lib/detector.js';
 import { runAgentLoop } from '../agent/loop.js';
 import { resolveDiffScope, countChangedLines, scopeDiffToDir, GitDiffError } from '../lib/git-diff.js';
@@ -79,6 +79,11 @@ export default class Generate extends Command {
         improve: Flags.boolean({
             description: 'Also extend existing below-threshold tests (not just create tests for untested files)',
             default: false,
+        }),
+        'fix-on-failure': Flags.boolean({
+            description: 'If generate exhausts all retries, hand the best attempt off to the fix specialist for its own retries before giving up (default: on). Use --no-fix-on-failure to disable.',
+            default: true,
+            allowNo: true,
         }),
     };
     async run() {
@@ -167,10 +172,12 @@ export default class Generate extends Command {
         if (flags.workers > 1)
             this.log(`${chalk.dim('Workers:')}    ${flags.workers}`);
         if (config.mocksFile)
-            this.log(`${chalk.dim('Mocks:')}      ${chalk.cyan(config.mocksFile)}`);
+            this.log(`${chalk.dim('Mocks:')}      ${chalk.cyan(mocksFileList(config).join(', '))}`);
         const debugPattern = debugLogPattern(config.debug);
         if (debugPattern)
             this.log(`${chalk.dim('Debug:')}      ${chalk.green('on')} ${chalk.dim(`→ ${debugPattern}`)}`);
+        if (!flags['fix-on-failure'])
+            this.log(`${chalk.dim('Fix-on-failure:')} ${chalk.yellow('off')}`);
         if (flags['dry-run'])
             this.log(chalk.yellow('  [dry-run — no files will be written]'));
         if (diffHeader)
@@ -199,6 +206,7 @@ export default class Generate extends Command {
                 diffRef,
                 workers: flags.workers,
                 fresh: flags.fresh,
+                fixOnFailure: flags['fix-on-failure'],
                 log: (msg) => this.log(msg),
             });
         }

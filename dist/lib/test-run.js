@@ -138,8 +138,17 @@ export async function resolveFileTestRun(env, absFile, repoRoot) {
     const fileEnv = await envForRoot(env, root);
     const rel = relative(root.cwd, absFile);
     if (root.npmTest) {
-        const covOff = fileEnv.testRunner === 'vitest' ? ' --coverage.enabled=false' : '';
-        return { command: `npm test -- ${npmTestArg(fileEnv, rel)}${covOff}`, cwd: root.cwd };
+        // --no-cache (jest): see fileTestCommand in detector.ts — a fresh `npx jest`/`npm test`
+        // child process runs on every retry anyway, so the on-disk transform cache only risks
+        // staleness, and under N parallel fix workers many concurrent jest processes contend on
+        // the SAME cache directory (a demonstrably-correct patch can then verify against a stale,
+        // pre-fix compiled artifact for that file).
+        // --forceExit (jest): without it, a test file that leaves a real handle open (an interval/
+        // connection a module starts on import and never clears) doesn't just warn — Jest hangs
+        // indefinitely (verified empirically), silently burning the full runCommand timeout on every
+        // retry of that file. See detectOpenHandleLeak in validate.ts.
+        const extraFlag = fileEnv.testRunner === 'vitest' ? ' --coverage.enabled=false' : fileEnv.testRunner === 'jest' ? ' --no-cache --forceExit' : '';
+        return { command: `npm test -- ${npmTestArg(fileEnv, rel)}${extraFlag}`, cwd: root.cwd };
     }
     return { command: fileTestCommand(fileEnv, rel), cwd: root.cwd };
 }
@@ -148,8 +157,14 @@ export async function resolveScopeTestRun(env, absDir, repoRoot) {
     const root = await findTestRoot(absDir, repoRoot, env.testRunner);
     const fileEnv = await envForRoot(env, root);
     const rel = relative(root.cwd, absDir);
-    if (root.npmTest)
+    if (root.npmTest) {
+        // --forceExit (jest): see resolveFileTestRun — avoids an indefinite hang on a file that leaks
+        // a real handle (interval/connection) rather than just failing.
+        if (fileEnv.testRunner === 'jest') {
+            return { command: rel ? `npm test -- ${npmTestArg(fileEnv, rel)} --forceExit` : 'npm test -- --forceExit', cwd: root.cwd };
+        }
         return { command: rel ? `npm test -- ${npmTestArg(fileEnv, rel)}` : 'npm test', cwd: root.cwd };
+    }
     return { command: (rel && scopedTestCommand(fileEnv, rel)) || fileEnv.testCommand, cwd: root.cwd };
 }
 // Incremental patch-coverage run for `generate --file <src> @diff`: run the ONE new test file
@@ -176,7 +191,7 @@ export async function resolveIncrementalCoverageRun(env, absTestFile, absSourceF
     }
     else {
         covFlags = `--coverage --collectCoverageFrom=${sq(relSrc)} --coverageReporters=lcov --coverageDirectory=${sq(outDir)}`;
-        bareRun = `npx jest ${sq(relTest)}`;
+        bareRun = `npx jest --forceExit ${sq(relTest)}`;
     }
     const command = root.npmTest ? `npm test -- ${npmTestArg(fileEnv, relTest)} ${covFlags}` : `${bareRun} ${covFlags}`;
     return { command, cwd: root.cwd };

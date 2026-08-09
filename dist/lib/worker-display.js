@@ -1,6 +1,6 @@
 import chalk from 'chalk';
 const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-const ACTIVE = new Set(['waiting', 'generating', 'writing', 'running', 'retrying', 'regenerating']);
+const ACTIVE = new Set(['waiting', 'generating', 'writing', 'running', 'retrying', 'regenerating', 'fixing']);
 // tip rotates every ~5 seconds at 80ms tick interval
 const TIP_TICKS = 62;
 export class WorkerDisplay {
@@ -50,9 +50,10 @@ export class WorkerDisplay {
     update(workerId, state) {
         const prev = this.states[workerId];
         this.states[workerId] = state;
-        if (state.phase === 'regenerating') {
-            // Fix failed — now trying regeneration. Undo the failed count so the regen's
-            // final phase (passed/failed) is the single counted outcome for this file.
+        if (state.phase === 'regenerating' || state.phase === 'fixing') {
+            // Fix failed — now trying regeneration (or: generate exhausted retries — now trying the
+            // fix specialist). Undo the failed count so the subsequent final phase (passed/failed) is
+            // the single counted outcome for this file.
             if (prev.phase === 'failed') {
                 this.done--;
                 this.failedCount--;
@@ -184,6 +185,11 @@ export class WorkerDisplay {
                 label = chalk.blueBright('regen     ');
                 file = state.file;
                 break;
+            case 'fixing':
+                icon = chalk.magenta('⚒');
+                label = chalk.magenta('fixing    ');
+                file = state.file;
+                break;
             case 'passed':
                 icon = chalk.green('✓');
                 label = chalk.green('passed    ');
@@ -213,6 +219,7 @@ export class WorkerDisplay {
             case 'running': return `running     ${state.file}`;
             case 'retrying': return `retry ${state.attempt}/${state.max}  ${state.file}`;
             case 'regenerating': return `↻ regen      ${state.file}`;
+            case 'fixing': return `⚒ fixing     ${state.file}`;
             case 'passed': return `✓ passed    ${state.file}`;
             case 'failed': return `✗ failed    ${state.file}`;
         }

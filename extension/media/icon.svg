@@ -1,0 +1,33 @@
+<svg width="128" height="128" viewBox="0 0 128 128" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="128" y2="128" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4C1D95"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <linearGradient id="spark" x1="78" y1="40" x2="104" y2="66" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FDE68A"/>
+      <stop offset="1" stop-color="#F59E0B"/>
+    </linearGradient>
+  </defs>
+
+  <!-- app-icon rounded square -->
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+
+  <!-- coverage rows: full bars = covered lines -->
+  <g fill="#EDE9FE">
+    <rect x="30" y="34" width="52" height="9" rx="4.5"/>
+    <rect x="30" y="52" width="40" height="9" rx="4.5"/>
+    <rect x="30" y="88" width="68" height="9" rx="4.5"/>
+  </g>
+
+  <!-- the lacuna: an unfilled gap row (dashed outline) being filled -->
+  <rect x="30" y="70" width="68" height="9" rx="4.5" fill="#EDE9FE" fill-opacity="0.16"
+        stroke="#EDE9FE" stroke-opacity="0.5" stroke-width="1.5" stroke-dasharray="4 4"/>
+  <!-- the filled portion: the gap being closed, in accent -->
+  <rect x="30" y="70" width="30" height="9" rx="4.5" fill="url(#spark)"/>
+
+  <!-- spark: the AI filling the gap -->
+  <g transform="translate(92 40)" fill="url(#spark)">
+    <path d="M8 0 L10 6 L16 8 L10 10 L8 16 L6 10 L0 8 L6 6 Z"/>
+  </g>
+</svg>

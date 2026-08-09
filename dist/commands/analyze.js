@@ -5,7 +5,7 @@ import chalk from 'chalk';
 import { loadConfig } from '../lib/config.js';
 import { detectEnvironment, scopedCoverageCommand } from '../lib/detector.js';
 import { runCommand } from '../lib/runner.js';
-import { parsePassCount } from '../lib/validate.js';
+import { parsePassCount, detectJestConfigConflict, detectJestValidationError } from '../lib/validate.js';
 import { startCoverageSpinner } from '../lib/coverage-spinner.js';
 import { loadCoverage, extractGaps, filterTestableGaps, findUncoveredFiles, findTestFiles, isWithinDir, narrowGapsToDiff, computePatchCoverage, missingChangedFileGaps } from '../lib/coverage/index.js';
 import { resolveDiffScope, countChangedLines, scopeDiffToDir, GitDiffError } from '../lib/git-diff.js';
@@ -155,7 +155,7 @@ export default class Analyze extends Command {
                 : '  Running test suite to collect coverage...';
             const spinner = startCoverageSpinner(chalk.dim(runLabel), env.testRunner);
             const result = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine);
-            spinner.stop();
+            spinner.stop(result.stdout + result.stderr);
             if (result.timedOut) {
                 this.log(chalk.red(`\nTest suite timed out after ${config.coverageTimeout}s.`));
                 this.log(chalk.yellow('\nThis usually means a test has an open handle (unclosed server, timer, or connection).'));
@@ -164,6 +164,17 @@ export default class Analyze extends Command {
             }
             // bail if suites crashed on load (test files exist but zero tests ran)
             const combined = result.stdout + result.stderr;
+            const configConflict = detectJestConfigConflict(combined);
+            if (configConflict) {
+                this.log(chalk.red('\nJest never ran any tests — no coverage report exists to read.\n'));
+                this.log(chalk.yellow(configConflict));
+                this.exit(2);
+            }
+            const validationError = detectJestValidationError(combined);
+            if (validationError) {
+                this.log(chalk.yellow(`\n${validationError}`));
+                this.exit(2);
+            }
             if (/Tests:\s+0 total/i.test(combined)) {
                 this.log(chalk.red('\nYour test suites are failing before any tests run.'));
                 this.log(chalk.yellow('\nThis usually means:'));
@@ -199,9 +210,17 @@ export default class Analyze extends Command {
             }
             catch {
                 this.log(chalk.red(`Could not read coverage report from ./${config.coverageDir}/\n`));
-                this.log(chalk.yellow('Make sure your vitest config has coverage enabled:'));
-                this.log(chalk.dim('  // vitest.config.ts'));
-                this.log(chalk.dim('  test: { coverage: { reporter: ["lcov", "text-summary"] } }'));
+                if (env.testRunner === 'jest') {
+                    this.log(chalk.yellow('Make sure your jest config has coverage enabled:'));
+                    this.log(chalk.dim('  // jest.config.ts'));
+                    this.log(chalk.dim(`  coverageReporters: ['lcov', 'text-summary'],`));
+                    this.log(chalk.dim(`  coverageDirectory: '${config.coverageDir}',`));
+                }
+                else {
+                    this.log(chalk.yellow('Make sure your vitest config has coverage enabled:'));
+                    this.log(chalk.dim('  // vitest.config.ts'));
+                    this.log(chalk.dim(`  test: { coverage: { reporter: ["lcov", "text-summary"], reportsDirectory: '${config.coverageDir}' } }`));
+                }
                 this.exit(2);
             }
         }
@@ -209,7 +228,7 @@ export default class Analyze extends Command {
         // every gap in the folder (partially-covered files too), not just files with no test at all.
         // Diff mode ignores the per-file threshold (101 keeps every file with any uncovered line):
         // a 94%-covered file can still have uncovered CHANGED lines — the patch-coverage case.
-        const rawGaps = await filterTestableGaps(extractGaps(report, diffScope ? 101 : threshold), config.ignore, { includeExisting: !!scopeDir || !!diffScope });
+        const rawGaps = await filterTestableGaps(extractGaps(report, diffScope ? 101 : threshold), config.ignore, { includeExisting: !!scopeDir || !!diffScope, cwd });
         let gaps = scopeDir
             ? rawGaps.filter((g) => isWithinDir(g.filePath.startsWith('/') ? g.filePath : join(cwd, g.filePath), scopeDir))
             : rawGaps;

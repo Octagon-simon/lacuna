@@ -12,6 +12,10 @@ export declare function buildGeneratePrompt(args: {
     sourceImportPath?: string | null;
     mocksCode?: string | null;
     mocksImportPath?: string | null;
+    extraMocks?: {
+        importPath: string;
+        code: string | null;
+    }[] | null;
     setupFileCode?: string | null;
     packageDeps?: string | null;
     tsconfigPaths?: string | null;
@@ -20,6 +24,7 @@ export declare function buildGeneratePrompt(args: {
     localImportContents?: string | null;
     reactMajorVersion?: number | null;
     projectMemory?: string | null;
+    memoryContext?: string | null;
     existingTestLineCount?: number;
 }): string;
 export declare function buildFixPrompt(args: {
@@ -32,6 +37,10 @@ export declare function buildFixPrompt(args: {
     env: DetectedEnvironment;
     mocksCode?: string | null;
     mocksImportPath?: string | null;
+    extraMocks?: {
+        importPath: string;
+        code: string | null;
+    }[] | null;
     setupFileCode?: string | null;
     packageDeps?: string | null;
     tsconfigPaths?: string | null;
@@ -39,7 +48,9 @@ export declare function buildFixPrompt(args: {
     localImportPaths?: string[] | null;
     reactMajorVersion?: number | null;
     projectMemory?: string | null;
+    memoryContext?: string | null;
     existingTestLineCount?: number;
+    coveredPatterns?: string[];
 }): string;
 export declare function buildPollutionFixPrompt(args: {
     pollutorFile: string;
@@ -54,5 +65,5 @@ export interface FailedAttempt {
     hypothesis: string;
     failureReason: string;
 }
-export declare function buildRetryPrompt(failureOutput: string, failedAttempts?: FailedAttempt[], patchMode?: boolean, reactish?: boolean): string;
+export declare function buildRetryPrompt(failureOutput: string, failedAttempts?: FailedAttempt[], patchMode?: boolean, reactish?: boolean, coveredPatterns?: string[], mockApi?: 'vi' | 'jest', hasFnStyleMockApi?: boolean): string;
 //# sourceMappingURL=index.d.ts.map

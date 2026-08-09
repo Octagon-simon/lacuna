@@ -18,6 +18,13 @@ export interface FilterGapsOptions {
   // improve an existing below-threshold test) instead of skipped. Used by scoped/`--improve`
   // generate. Default (false) preserves the suite-wide "new files only" behavior.
   includeExisting?: boolean
+  // Base directory for resolving RELATIVE gap paths before reading them. extractGaps returns the
+  // lcov `SF:` paths verbatim, which for jest are relative to the project root — so reading them
+  // depends on the process CWD. The CLI is always invoked from the project root so this was
+  // invisible, but an embedding host (the VS Code extension) runs from a different CWD, where the
+  // reads silently fail → every gap looks like it "has no testable code" → zero gaps found.
+  // Pass the project root here to make discovery CWD-independent. Defaults to process.cwd().
+  cwd?: string
 }
 
 // Filters out gaps where the source file contains only types, interfaces, enums, or constants,
@@ -27,12 +34,16 @@ export async function filterTestableGaps(
   userIgnore: string[] = [],
   opts: FilterGapsOptions = {},
 ): Promise<CoverageGap[]> {
+  const base = opts.cwd ?? process.cwd()
   const results: CoverageGap[] = []
   for (const gap of gaps) {
     if (userIgnore.some((p) => gap.filePath.includes(p))) continue
     if (shouldIgnore(gap.filePath, [])) continue
-    if (!opts.includeExisting && await testFileExists(gap.filePath)) continue
-    const source = await readFile(gap.filePath, 'utf-8').catch(() => '')
+    // Resolve relative lcv paths against the explicit project root — NOT the process CWD, which
+    // differs for an embedding host (see FilterGapsOptions.cwd).
+    const abs = gap.filePath.startsWith('/') ? gap.filePath : join(base, gap.filePath)
+    if (!opts.includeExisting && await testFileExists(abs)) continue
+    const source = await readFile(abs, 'utf-8').catch(() => '')
     if (hasTestableCode(source)) results.push(gap)
   }
   return results
@@ -72,6 +83,14 @@ function hasTestableCode(source: string): boolean {
   // which (with index files) was a big reason scoped generate skipped real files. Keyed on
   // `export … const … =>` so pure type files (`export type F = () => void`) are NOT matched.
   if (/\bexport\s+(?:default\s+)?const\s+[\w$]+[^\n]*=>/.test(stripped)) return true
+  // object / class METHOD shorthand: `foo() {`, `async foo() {`, `get foo() {`, `foo(): T {`.
+  // A service written as an object of methods — `export const WalletService = { async getWallet():
+  // Promise<Data> { … } }` — has NO `function` keyword, NO top-level `=> {`, and NO class, so every
+  // pattern above missed it and the whole (very real, very testable) file was dropped from gap
+  // discovery. The identifier is guarded against control-flow keywords so `if (x) {` / `for (…) {` /
+  // `switch (…) {` never match; an overload/interface signature (`foo(): void;`, no body) doesn't
+  // either (it ends in `;`, not `{`).
+  if (/(?:^|[\n;{,])\s*(?:public\s+|private\s+|protected\s+|static\s+|readonly\s+|async\s+|get\s+|set\s+|\*\s*)*(?!(?:if|for|while|switch|catch|return|do|else|function|with|await|yield|new)\b)[A-Za-z_$][\w$]*\s*\([^)]*\)\s*(?::\s*[^{;=]+)?\{/.test(stripped)) return true
 
   return false
 }

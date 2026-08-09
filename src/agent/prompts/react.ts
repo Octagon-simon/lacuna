@@ -1,6 +1,12 @@
 // React web component testing guidance (non-RN, non-Next.js)
-export function buildReactCauses(isJSRunner: boolean, mockApi: string): string {
+export function buildReactCauses(isJSRunner: boolean, mockApi: string, hasFnStyleMockApi = true): string {
   if (!isJSRunner) return ''
+  const mockCleanupLine = hasFnStyleMockApi
+    ? `\n      - afterEach(() => ${mockApi}.clearAllMocks())\n      - afterEach(() => ${mockApi}.useRealTimers() if timers are used)`
+    : ''
+  const timerDeterminismLine = hasFnStyleMockApi
+    ? `\n\n    - Timer determinism: when using fake timers (${mockApi}.useFakeTimers()), always advance explicitly with ${mockApi}.advanceTimersByTime(ms) — never rely on real delays or setTimeout chains. Always restore with ${mockApi}.useRealTimers() in afterEach; fake timers that leak between tests cause unrelated tests to hang or fire callbacks at wrong times.`
+    : ''
 
   return `
     - "renders without crashing" tests: NEVER write \`expect(true).toBe(true)\` as a render smoke-test. It proves nothing and will be rejected. Instead, assert on at least one element that must be visible: \`expect(screen.getByText('Some Heading')).toBeTruthy()\` or \`expect(screen.getByTestId('...')).toBeDefined()\`. Read the component's JSX to find a reliable element — a title, a label, a button text.
@@ -52,12 +58,8 @@ export function buildReactCauses(isJSRunner: boolean, mockApi: string): string {
     - Mock lifecycle rule: prefer mockResolvedValueOnce / mockImplementationOnce for per-test isolation. Always reset mocks in afterEach to prevent leakage.
 
     - Test isolation rule: assume global state leakage unless explicitly cleaned.
-      - afterEach(() => cleanup())
-      - afterEach(() => ${mockApi}.clearAllMocks())
-      - afterEach(() => ${mockApi}.useRealTimers() if timers are used)
-      - never use shared mutable module-level variables between tests without resetting them in beforeEach/afterEach — tests must not depend on mutations from a previous test.
-
-    - Timer determinism: when using fake timers (${mockApi}.useFakeTimers()), always advance explicitly with ${mockApi}.advanceTimersByTime(ms) — never rely on real delays or setTimeout chains. Always restore with ${mockApi}.useRealTimers() in afterEach; fake timers that leak between tests cause unrelated tests to hang or fire callbacks at wrong times.
+      - afterEach(() => cleanup())${mockCleanupLine}
+      - never use shared mutable module-level variables between tests without resetting them in beforeEach/afterEach — tests must not depend on mutations from a previous test.${timerDeterminismLine}
 
     - Infinite retry guard: never generate recursive waitFor → trigger → waitFor chains. If a condition does not resolve within a single waitFor block, fail explicitly.
 

@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
-import { ModelStallError } from './types.js';
+import { ModelStallError, ModelRateLimitError, ModelCancelledError } from './types.js';
 const FIRST_TOKEN_TIMEOUT_MS = 30_000;
 const STALL_TIMEOUT_MS = 60_000;
 export class AnthropicProvider {
@@ -9,7 +9,7 @@ export class AnthropicProvider {
         this.client = new Anthropic({ apiKey });
         this.model = model;
     }
-    async generate(messages, system, onToken, maxTokens = 16000, temperature) {
+    async generate(messages, system, onToken, maxTokens = 16000, temperature, signal) {
         let content = '';
         // Mark the first user message as cacheable — it holds the large initial context
         // (source file, existing test, mocks, type definitions) that stays identical
@@ -23,7 +23,13 @@ export class AnthropicProvider {
             }
             return { role: msg.role, content: msg.content };
         });
+        if (signal?.aborted)
+            throw new ModelCancelledError();
         const controller = new AbortController();
+        // Bridge an external cancel (embedder "Stop") into our internal controller — see the
+        // openai-compatible provider's identical bridge.
+        if (signal)
+            signal.addEventListener('abort', () => controller.abort('user-cancel'), { once: true });
         let firstTokenReceived = false;
         let lastTokenAt = 0;
         const firstTokenTimer = setTimeout(() => {
@@ -62,6 +68,8 @@ export class AnthropicProvider {
         }
         catch (err) {
             if (controller.signal.aborted) {
+                if (controller.signal.reason === 'user-cancel')
+                    throw new ModelCancelledError();
                 const reason = controller.signal.reason === 'first-token-timeout' ? 'first-token-timeout' : 'stream-stall';
                 throw new ModelStallError(reason, reason === 'first-token-timeout' ? FIRST_TOKEN_TIMEOUT_MS : STALL_TIMEOUT_MS);
             }
@@ -72,12 +80,18 @@ export class AnthropicProvider {
                     `Try: lower maxTokens in .lacuna.json, or use --file to target a smaller source file.`);
             }
             if (/rate.?limit|429|output tokens per minute|request.*exceed.*limit/i.test(msg)) {
-                throw new Error(`Anthropic rate limit hit — your account has a low output-token-per-minute cap (Tier 1: 8k TPM).\n` +
+                throw new ModelRateLimitError(`Anthropic rate limit hit — your account has a low output-token-per-minute cap (Tier 1: 8k TPM).\n` +
                     `Options:\n` +
                     `  1. Lower maxTokens in .lacuna.json (e.g. "maxTokens": 4000) to reduce output per request.\n` +
                     `  2. Use --workers 1 (default) to avoid parallel requests consuming your quota.\n` +
                     `  3. Switch to a cheaper/higher-limit provider: lacuna generate -m deepseek\n` +
                     `  4. Upgrade your Anthropic account tier: https://console.anthropic.com/settings/billing`);
+            }
+            // Anthropic returns 529 "Overloaded" when their infrastructure is at capacity — a
+            // transient "too much load right now" signal, worth a short backoff-and-retry rather
+            // than failing the file outright.
+            if (/overloaded|529/i.test(msg)) {
+                throw new ModelRateLimitError(`${this.model} is overloaded: ${msg}\nlacuna will back off and retry.`);
             }
             throw err;
         }

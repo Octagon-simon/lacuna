@@ -87,6 +87,9 @@ export function reportTerminal(input: ReportInput): void {
     console.log(chalk.bold('\n─── Results ───────────────────────────────'))
     console.log(`  Files processed : ${r.filesProcessed}`)
     console.log(`  Tests written   : ${r.testsWritten}`)
+    if (r.fixHandoffs) {
+      console.log(`  Fix specialist  : ${r.fixHandoffRecovered}/${r.fixHandoffs} exhausted file(s) recovered`)
+    }
 
     if (r.hasCoverage) {
       const delta = r.coverageAfter - r.coverageBefore
@@ -155,6 +158,10 @@ export interface JsonReport {
   }
   filesProcessed?: number
   testsWritten?: number
+  // generate only: how many files exhausted generate's own retries and were handed to the fix
+  // specialist (fixOnFailure), and how many of those it actually recovered.
+  fixHandoffs?: number
+  fixHandoffRecovered?: number
   gaps?: Array<{ file: string; uncoveredFunctions: string[]; uncoveredLines: number[] }>
   errors?: string[]
 }
@@ -202,6 +209,7 @@ export function buildJsonReport(input: ReportInput): JsonReport {
       : {}),
     filesProcessed: r.filesProcessed,
     testsWritten: r.testsWritten,
+    ...(r.fixHandoffs ? { fixHandoffs: r.fixHandoffs, fixHandoffRecovered: r.fixHandoffRecovered } : {}),
     errors: r.errors,
   }
 }
@@ -255,6 +263,7 @@ export function buildMarkdownReport(input: ReportInput): string {
     lines.push(`| Threshold | ${threshold}% |`)
     lines.push(`| Files processed | ${r.filesProcessed} |`)
     lines.push(`| Tests written | ${r.testsWritten} |`)
+    if (r.fixHandoffs) lines.push(`| Fix specialist recovered | ${r.fixHandoffRecovered}/${r.fixHandoffs} |`)
     lines.push(`| Status | ${status} |`)
 
     if (r.errors.length > 0) {

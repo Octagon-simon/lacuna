@@ -3,7 +3,10 @@ export function detectVue(packageDeps) {
         return false;
     return /\bvue\b/.test(packageDeps);
 }
-export function buildVueGuidance() {
+export function buildVueGuidance(mockApi = 'vi', hasFnStyleMockApi = true) {
+    const timerLine = hasFnStyleMockApi
+        ? [`Prefer ${mockApi}.advanceTimersByTime() over runAllTimers() when fake timers are used.`]
+        : [];
     return [
         'VUE PROJECT — use @testing-library/vue for component tests.',
         "Import render, screen, fireEvent, waitFor from '@testing-library/vue'",
@@ -22,7 +25,7 @@ export function buildVueGuidance() {
         'Do not perform real HTTP requests.',
         'Mock vue-router when testing isolated components.',
         'Mock Pinia stores when testing isolated components.',
-        'Prefer jest.advanceTimersByTime() over runAllTimers() when fake timers are used.',
+        ...timerLine,
         'Avoid unnecessary cleanup() calls.',
     ].join('\n');
 }

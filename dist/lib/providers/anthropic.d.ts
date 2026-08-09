@@ -3,6 +3,6 @@ export declare class AnthropicProvider implements ModelProvider {
     private client;
     private model;
     constructor(model: string, apiKey: string);
-    generate(messages: ChatMessage[], system: string, onToken?: (token: string) => void, maxTokens?: number, temperature?: number): Promise<string>;
+    generate(messages: ChatMessage[], system: string, onToken?: (token: string) => void, maxTokens?: number, temperature?: number, signal?: AbortSignal): Promise<string>;
 }
 //# sourceMappingURL=anthropic.d.ts.map

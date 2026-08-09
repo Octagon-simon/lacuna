@@ -164,6 +164,24 @@
       "type": "boolean",
       "default": true,
       "description": "For DOM-free generated tests (services, utils, validators) in a jsdom project, add a `@vitest-environment node` / `@jest-environment node` docblock so the file skips jsdom startup and runs much faster. Verified per-file (reverted if it breaks the test). Set false to disable."
+    },
+    "memory": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Retrieve and persist learned rules (framework conventions, mock patterns, error→fix mappings) in a structured memory store, so prompts pull in only what's relevant instead of static \"just in case\" context. Set false to disable."
+        },
+        "distill": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a fix is learned for the first time, make one small model call to turn it into a cleaner rule than the raw mechanical diff. Set false to skip the extra call and keep the mechanical version."
+        }
+      },
+      "additionalProperties": false,
+      "default": {},
+      "description": "Structured memory store (~/.lacuna/memory, shared across every project on this machine) for learned test-generation/fix rules — retrieved per file/error instead of statically stuffing every prompt with the same rules."
     }
   },
   "additionalProperties": false

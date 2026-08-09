@@ -1,4 +1,17 @@
-export function buildJsCauses(mockApi: string): string {
+// jest and vitest both provide a global `.fn()` stub factory AND `.mock()` module-level
+// auto-mocking with hoisting semantics. Mocha has NEITHER built in — projects bring their own
+// mocking library (most commonly sinon), whose API (`.stub()`/`.returns()`/`.resolves()`, no
+// module-auto-mock/hoisting concept at all) is structurally different, not a drop-in rename.
+// Emitting jest.fn()/jest.mock()-shaped guidance unconditionally for mocha asserted an API that
+// doesn't exist there. Rather than invent unverified sinon-native phrasing, every jest/vitest-
+// specific mock instruction block is replaced with this one honest disclaimer for any other
+// JS-family runner (currently just mocha).
+export function nonStandardMockApiNote(): string {
+  return "This project's test runner has no standardized, autodetectable mocking API — lacuna's mock-shape guidance assumes jest's or vitest's jest.fn()/jest.mock() (or vi.fn()/vi.mock()). Mock dependencies using whatever mocking library this project already uses (e.g. sinon), matching the exact shape the source code actually calls."
+}
+
+export function buildJsCauses(mockApi: string, hasFnStyleMockApi = true): string {
+  if (!hasFnStyleMockApi) return `\n- ${nonStandardMockApiNote()}`
   return `
 - NEVER write require() anywhere in test files — @typescript-eslint/no-require-imports flags it everywhere, including inside test() and beforeEach() callbacks. Use ES import statements instead. To access real module values inside ${mockApi}.mock() factories, use ${mockApi}.requireActual() — it is a method on the ${mockApi} global (always in scope) and is never flagged.
 - FILE STRUCTURE — strict ordering to avoid import/first ESLint errors: (1) ALL import statements at the very top; (2) ALL ${mockApi}.mock() calls below all imports; (3) test code (describe/it/beforeEach). NEVER add an import statement after any ${mockApi}.mock() call — this triggers import/first even if earlier imports exist. Plan all imports before writing any mock call.
