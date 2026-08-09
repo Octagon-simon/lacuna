@@ -2,6 +2,7 @@ import type { CoverageReport, CoverageGap } from './types.js';
 export declare function extractGaps(report: CoverageReport, threshold: number): CoverageGap[];
 export interface FilterGapsOptions {
     includeExisting?: boolean;
+    cwd?: string;
 }
 export declare function filterTestableGaps(gaps: CoverageGap[], userIgnore?: string[], opts?: FilterGapsOptions): Promise<CoverageGap[]>;
 export declare function isWithinDir(absPath: string, absDir: string): boolean;

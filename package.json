@@ -23,14 +23,16 @@
     "/lacuna.schema.json"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json && node scripts/generate-schema.mjs",
+    "build": "tsc -p tsconfig.json && node scripts/generate-schema.mjs && oclif manifest .",
     "watch": "tsc -p tsconfig.json --watch",
     "lint": "eslint src --ext .ts",
     "format": "prettier --write 'src/**/*.ts'",
-    "test": "node --loader ts-node/esm --test src/**/*.test.ts",
+    "test": "node --loader ts-node/esm --test $(find src -name '*.test.ts')",
     "prepack": "npm run build",
     "dev": "ts-node --esm src/index.ts",
-    "release": "bash scripts/release.sh"
+    "release": "bash scripts/release.sh",
+    "release:ext": "bash extension/scripts/release.sh",
+    "release:all": "bash scripts/release-all.sh"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
@@ -47,6 +49,7 @@
     "@oclif/test": "^4",
     "@types/node": "^22",
     "eslint": "^9",
+    "oclif": "^4",
     "prettier": "^3",
     "ts-node": "^10",
     "typescript": "^5",

@@ -1,1 +1,1 @@
-{"version":3,"file":"typescript.js","sourceRoot":"","sources":["../../../../src/agent/prompts/runners/typescript.ts"],"names":[],"mappings":"AAAA,MAAM,UAAU,WAAW,CAAC,OAAe;IACzC,OAAO;;;;;WAKE,OAAO,mFAAmF,OAAO;;;;qdAIyW,CAAA;AACrd,CAAC"}
+{"version":3,"file":"typescript.js","sourceRoot":"","sources":["../../../../src/agent/prompts/runners/typescript.ts"],"names":[],"mappings":"AAAA,MAAM,UAAU,WAAW,CAAC,OAAe,EAAE,iBAAiB,GAAG,IAAI;IACnE,MAAM,cAAc,GAAG,iBAAiB;QACtC,CAAC,CAAC,cAAc,OAAO,mFAAmF,OAAO,sDAAsD;QACvK,CAAC,CAAC,EAAE,CAAA;IACN,OAAO;;;;uFAI8E,cAAc;;;;qdAIgX,CAAA;AACrd,CAAC"}

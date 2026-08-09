@@ -1,0 +1,46 @@
+// Single import surface for the embedded lacuna core. Everything the extension uses from lacuna
+// flows through here (imported by the stable name `lacuna-cli`, aliased to ../dist by tsconfig +
+// esbuild), so if the core's API shifts there is exactly one file to update.
+export {
+  runAgentLoop,
+  runFixLoop,
+  discoverFailingTests,
+  DiscoverFailingError,
+  loadConfig,
+  ConfigSchema,
+  mocksFileList,
+  applyModelOverride,
+  iterationCeiling,
+  detectEnvironment,
+  resolveDebugBase,
+  perFileDebugPath,
+  loadCoverage,
+  filterTestableGaps,
+  findUncoveredFiles,
+  findTestFiles,
+  extractGaps,
+  discoverScopeGaps,
+  DiscoverGapsError,
+  readIndex,
+  readEntry,
+  deleteEntry,
+  globalMemoryRoot,
+  MEMORY_CATEGORIES,
+} from 'lacuna-cli'
+
+export type {
+  LacunaConfig,
+  LoopOptions,
+  LoopResult,
+  FixOptions,
+  FixResult,
+  WorkerState,
+  LacunaEvent,
+  DetectedEnvironment,
+  CoverageReport,
+  CoverageGap,
+  FileCoverage,
+  MemoryEntry,
+  MemoryIndex,
+  MemoryCategory,
+} from 'lacuna-cli'

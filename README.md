@@ -1,6 +1,10 @@
-# lacuna
+<p align="center">
+  <img src="docs/lacuna-logo.png" alt="lacuna" width="96" height="96" />
+</p>
 
-> Find untested code, write tests for it, and verify they pass, in one command.
+<h1 align="center">lacuna</h1>
+
+> Find untested code, write tests for it, and verify they pass — in one command, or right inside VS Code.
 
 [![npm version](https://img.shields.io/npm/v/lacuna-cli.svg)](https://www.npmjs.com/package/lacuna-cli)
 [![npm downloads](https://img.shields.io/npm/dm/lacuna-cli.svg)](https://www.npmjs.com/package/lacuna-cli)
@@ -102,6 +106,27 @@ Two rules hold throughout: lacuna never leaves a half-written file behind, and i
 
 ---
 
+## VS Code extension
+
+The same agent, embedded directly in your editor — no shelling out to the CLI. Works in VS Code and the Open VSX editors (Cursor, Windsurf, VSCodium).
+
+- **Right-click to generate or fix** — right-click a source file → **Generate Tests**, or a failing test → **Fix Failing Tests**. Right-click a **folder** to fill every gap in it, with parallel workers processing files concurrently (not one by one).
+- **Live progress panel** — a legible, append-only log of every phase (generating → running → retrying), streamed tokens, request count, and which learned rules were used. A **Stop** button aborts the in-flight run instantly.
+- **Review before anything is kept** — every generated/fixed file opens in a diff you accept or reject. The shared **mocks file** is always reviewed separately — a run never silently rewrites what the whole suite imports.
+- **Coverage Gaps sidebar** — every file below threshold or with no test, one click to generate; uncovered lines are painted in the editor gutter.
+- **Memory sidebar** — browse the confidence-weighted learned rules, sort by confidence/hit count, and flag one that stops helping.
+- **Secure keys** — your API key lives in the OS keychain (VS Code SecretStorage), never in `.lacuna.json`. Every run is confirmed and metered up front; an opt-in **Auto Mode** (per workspace) skips the per-run prompt while still guarding mocks-file and environment changes.
+
+**Getting started in the editor:**
+
+1. Install **Lacuna** from the Marketplace (or the `.vsix`).
+2. Run **Lacuna: Set Up** to create `.lacuna.json`, then **Lacuna: Set API Key**.
+3. Right-click a source file or folder → **Generate Tests**, watch the panel, accept the diff.
+
+It reads the same `.lacuna.json` and uses the same models as the CLI. A few editor-only preferences live under `lacuna.*` in VS Code settings (`lacuna.workers`, `lacuna.alwaysVerbose`, `lacuna.confirmBeforeRun`). The extension source lives in [`extension/`](extension/) — see [`extension/PUBLISHING.md`](extension/PUBLISHING.md) to build or publish it.
+
+---
+
 ## Commands
 
 ### `lacuna init`
@@ -137,10 +162,13 @@ lacuna generate --dry-run                   # preview, write nothing
 lacuna generate --verbose                   # live panel as the model writes
 lacuna generate --workers 4                  # process 4 files in parallel
 lacuna generate --fresh                      # ignore the cached coverage report
+lacuna generate --no-fix-on-failure          # don't hand exhausted files to the fix specialist
 lacuna generate --format json --output report.json
 ```
 
-If you ran `analyze` in the last 10 minutes, `generate` reuses that report instead of running the suite again (`--fresh` forces a new run). When retries are exhausted, lacuna keeps the best attempt **only if it adds passing tests** and points you to `lacuna fix` for the rest; otherwise it restores the original. If the model produces the same output twice, the loop stops early instead of wasting iterations.
+If you ran `analyze` in the last 10 minutes, `generate` reuses that report instead of running the suite again (`--fresh` forces a new run). If the model produces the same output twice, the loop stops early instead of wasting iterations.
+
+**When generate's own retries are exhausted, it hands the best attempt to the fix specialist before giving up** (default on — `--no-fix-on-failure` to disable). `lacuna fix`'s prompt carries a fuller set of mock-shape/hook/service hints than generate's own retry prompt does, so a file that's merely hard — not impossible — can pass under the fix specialist even after generate's own attempts ran out, with no separate manual `lacuna fix` pass required. It's a second opinion, not an independent attempt, so it gets half of your configured `maxIterations` (minimum 1) rather than a full fresh budget. Under `--workers N` this interleaves with other files' generation instead of running as a later serial pass. If the fix specialist also can't land it, lacuna keeps whichever attempt collected the most passing tests (never worse than what generate handed off) and tells you to run `lacuna fix --file` yourself.
 
 #### Patch coverage (`@diff`) — close a Codecov gap on a PR
 
@@ -200,7 +228,7 @@ lacuna fix --fix-polluters                   # handle tests that pass alone but 
 
 A few behaviors worth knowing:
 
-- **Regeneration fallback (on by default).** If repair is exhausted on a *genuinely broken* file (one with no passing tests to lose), lacuna deletes it and regenerates from source, since a clean start beats more patching. A file that already has passing tests is never deleted, and a regeneration that would lower the passing count is discarded. Turn it off with `--no-regenerate-on-failure`.
+- **Regeneration fallback (on by default).** If repair is exhausted on a *genuinely broken* file (one with no passing tests to lose), lacuna deletes it and regenerates from source, since a clean start beats more patching. A file that already has passing tests is never deleted, and a regeneration that would lower the passing count is discarded. The rewrite gets half of your configured `maxIterations` (minimum 1), not a full fresh budget — it's a second opinion after repair already spent its whole allowance, not an independent attempt. Turn it off with `--no-regenerate-on-failure`.
 - **Type errors (`--types`).** Selects files by TypeScript errors instead of test failures, finding every test file that fails type-checking even if its tests pass. Type-checking runs against each file's **governing `tsconfig`** (the nearest one walking up), not the repo root — so in a monorepo a package's `@/` path aliases, `jsx`, and `moduleResolution` resolve correctly and a clean file isn't flagged with false `Cannot find module`/`Cannot use JSX` errors. It also respects that config's rules: if the nearest one disables `noImplicitAny` (common in monorepo packages), implicit-`any` isn't treated as an error. Files are grouped by config and checked one scoped `tsc` run per package.
 - **Polluters (`--fix-polluters`).** For tests that pass alone but fail in the full suite, lacuna bisects the suite to find the file leaking state and fixes it; if none can be isolated, it regenerates the affected test.
 
@@ -440,6 +468,12 @@ Lacuna writes one log per target file, named after its path: `src/queue/processo
 
 Filing a bug? Attach the debug file; it has the exact prompt and raw response, which is what makes an issue reproducible.
 
+**Jest-specific diagnostics.** Two failure modes are common enough on real Jest projects that lacuna detects and names them directly instead of showing a generic error:
+
+- **Config conflict** — if a project has both a `jest.config.js`/`.ts` *and* a `"jest"` key in `package.json`, Jest refuses to run at all ("Multiple configurations found") and exits before a single test runs. lacuna surfaces this by name (naming both conflicting sources) instead of the misleading "coverage isn't configured" message you'd otherwise see — the coverage config is often fine, Jest just never got to use it. Fix: delete or merge one of the two sources.
+- **Any other fatal Jest crash before tests run** (a missing/moved preset, a malformed config, etc.) — Jest wraps all of these in the same generic "Validation Error" envelope. Rather than guessing "check your coverage config" for every possible crash shape, lacuna recognizes the envelope and shows Jest's own error verbatim, so you see the real fix (e.g. "install `@react-native/jest-preset`") instead of an unrelated coverage hint.
+- **Leaked handle** — a test can pass while still leaking a real async handle (a `setInterval`/open connection a module starts on import and never clears), which is invisible to pass/fail results. lacuna passes `--forceExit` on every Jest invocation it runs (so a leak can't silently hang lacuna itself for the full run timeout) and watches for Jest's own "Force exiting Jest" warning; on a hit it nudges the model once to add cleanup, then keeps the passing file and warns rather than looping forever on it.
+
 ---
 
 ## Reference
@@ -484,15 +518,17 @@ Add your own with `ignore` in `.lacuna.json`. Entries match as path substrings.
 ```
 lacuna/
 ├── src/
+│   ├── index.ts           # library barrel — the embed surface (used by the extension)
 │   ├── commands/          # CLI commands: analyze, generate, fix, run, init
 │   ├── agent/
-│   │   ├── loop.ts        # generate → run → retry loop
+│   │   ├── loop.ts        # generate → run → retry loop (onStatus/onEvent/cancel hooks)
 │   │   ├── fix-loop.ts    # fix → run → retry loop
 │   │   ├── context.ts     # builds model context (source, tests, mocks, types)
 │   │   ├── generator.ts   # calls the model, manages conversation history
 │   │   └── prompts/       # prompt builders, split by framework and runner
 │   ├── lib/
 │   │   ├── config.ts      # config loader + zod schema
+│   │   ├── events.ts      # structured event stream (memory-used) for embedders
 │   │   ├── detector.ts    # detects test runner and language
 │   │   ├── runner.ts      # spawns test commands, captures output
 │   │   ├── reporter.ts    # terminal / JSON / markdown output
@@ -501,6 +537,7 @@ lacuna/
 │   │   ├── providers/     # model provider abstraction (anthropic, openai-compatible)
 │   │   └── coverage/      # lcov / json parsers, gap extraction
 │   └── ci/                # PR comment + GitHub Actions outputs
+├── extension/             # VS Code / Open VSX extension (embeds the core — see PUBLISHING.md)
 ├── action.yml             # GitHub Action definition
 └── .github/workflows/     # example workflow + release pipeline
 ```

@@ -1,0 +1,65 @@
+name: Release Extension
+
+# Fires on the namespaced extension tag pushed by extension/scripts/release.sh (npm run release:ext).
+# The CLI's own Release workflow triggers on `v*` tags; the two never overlap.
+on:
+  push:
+    tags:
+      - 'ext-v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+jobs:
+  publish-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # The extension bundles the CLI core (esbuild aliases lacuna-cli/lacuna-scaffold → ../dist) and
+      # copies ../lacuna.schema.json, so the core MUST be built first.
+      - name: Build CLI core
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build + package extension
+        working-directory: extension
+        run: |
+          npm ci
+          npm run build
+          VERSION="${GITHUB_REF_NAME#ext-v}"
+          npx @vscode/vsce package --no-dependencies -o "lacuna-vscode-${VERSION}.vsix"
+
+      - name: Publish to VS Code Marketplace
+        working-directory: extension
+        run: npx @vscode/vsce publish --packagePath "lacuna-vscode-${GITHUB_REF_NAME#ext-v}.vsix" -p "$VSCE_PAT"
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+
+      # Open VSX (Cursor / Windsurf / VSCodium) — disabled until the Open VSX account is approved.
+      # To enable: add an OVSX_TOKEN repo secret and uncomment. The attached .vsix (below) lets those
+      # editors install manually in the meantime.
+      # - name: Publish to Open VSX
+      #   working-directory: extension
+      #   run: npx ovsx publish "lacuna-vscode-${GITHUB_REF_NAME#ext-v}.vsix" -p "$OVSX_TOKEN"
+      #   env:
+      #     OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+
+      # A GitHub release with the .vsix attached — for manual install on editors we don't publish to
+      # yet. NOT marked --latest (that belongs to the CLI's `v*` releases).
+      - name: GitHub release (attach .vsix)
+        working-directory: extension
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" ./lacuna-vscode-*.vsix \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

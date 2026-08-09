@@ -1,7 +1,7 @@
 import { writeFile, appendFile, mkdir } from 'fs/promises';
-import { extname, dirname } from 'path';
+import { extname, dirname, isAbsolute, join } from 'path';
 import { createProvider } from '../lib/providers/index.js';
-export { ModelStallError } from '../lib/providers/types.js';
+export { ModelStallError, ModelRateLimitError, ModelCancelledError } from '../lib/providers/types.js';
 import { buildSystemPrompt, buildGeneratePrompt, buildFixPrompt, buildRetryPrompt, buildPollutionFixPrompt, PATCH_MODE_LINE_THRESHOLD } from './prompts/index.js';
 // When debug is enabled (config `debug: true` or the LACUNA_DEBUG env var), every raw model
 // exchange is written to a per-file log. Each target file gets its own log (e.g.
@@ -14,7 +14,7 @@ const DEFAULT_DEBUG_BASE = 'lacuna-debug.txt';
 // Resolves the debug base path, or null when disabled. Debug is a simple on/off switch.
 // Env var wins: any LACUNA_DEBUG value enables it (default base) except an explicit off
 // (0/false/no/off). Otherwise config `debug: true` enables it; false/absent → off.
-function resolveDebugBase(configDebug) {
+export function resolveDebugBase(configDebug) {
     const env = process.env.LACUNA_DEBUG;
     if (env != null && env !== '')
         return /^(0|false|no|off)$/i.test(env) ? null : DEFAULT_DEBUG_BASE;
@@ -37,7 +37,7 @@ const SEP = '═'.repeat(72);
 // while staying unique: projects with many identically-named files (route.ts, index.ts,
 // page.tsx) would otherwise all slug to the same basename and clobber each other's logs, since
 // each run clears its own file. Returns null when debug is disabled.
-function perFileDebugPath(base, filePath) {
+export function perFileDebugPath(base, filePath) {
     if (!base)
         return null;
     const slug = filePath
@@ -51,7 +51,7 @@ function perFileDebugPath(base, filePath) {
     const baseNoExt = ext ? base.slice(0, -ext.length) : base;
     return `${baseNoExt}.${slug}${ext}`;
 }
-async function debugWrite(file, label, content, clear = false) {
+export async function debugWrite(file, label, content, clear = false) {
     if (!file)
         return;
     const header = `\n${SEP}\n${label} — ${new Date().toISOString()}\n${SEP}\n`;
@@ -114,6 +114,21 @@ function estimateMaxTokens(sourceCode, configMax, reasoningModel = false) {
         return configMax;
     const lines = (sourceCode.match(/\n/g) ?? []).length + 1;
     return Math.min(configMax, Math.max(4000, 2000 + lines * 40));
+}
+// A patch-failure escalation (consecutivePatchFailures tripping in loop.ts/fix-loop.ts) forces
+// the model into <code_output>, which must reproduce the ENTIRE existing test file verbatim plus
+// the fix — a fundamentally bigger output than a patch's delta. this.maxTokens (the flat config
+// ceiling used for every retry today) was never scaled to the TEST file's own size the way
+// estimateMaxTokens scales the initial fix()/generate() call to the SOURCE file's size — for a
+// 1000+ line test file, the flat ceiling can run out before the model finishes, even when its
+// diagnosis was already correct (observed directly: a correct fix, truncated mid-<code_output>
+// before the closing tag, discarding a genuinely working answer). Only ever used once already
+// forced out of patch mode — see retry()'s Math.max, which never LOWERS the configured ceiling.
+const MAX_ESCALATED_REWRITE_TOKENS = 32_000; // generous soft ceiling, not a hard model/provider limit
+function estimateFullRewriteTokens(lineCount) {
+    // ~18 tokens/line covers typical TS test code (mock setup + assertions), +1500 for the
+    // <thinking> block and structural tags.
+    return Math.min(MAX_ESCALATED_REWRITE_TOKENS, lineCount * 18 + 1500);
 }
 // Wraps a token callback so that <thinking> content is suppressed.
 // Buffers silently until <code_output> or <code_patch> is seen, then streams from there.
@@ -222,7 +237,17 @@ function stripCodeFences(code) {
 // Patch-operation header anchored at line start. Used to recognize patch output
 // regardless of whether the model wrapped it in <code_patch> or — when nudged by the
 // truncation retry message ("Use <code_output> tags") — inside <code_output>.
-const PATCH_OP_RE = /^\/\/ @@@ (?:REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):/m;
+//
+// Also matches the bare WITH/END delimiters, not just the opening TYPE headers. A weak
+// model sometimes emits a garbled patch — e.g. it writes `// @@@ WITH:` mid-response but
+// drops the preceding `// @@@ REPLACE:` header and/or the trailing `// @@@ END` — and a
+// header-only check would then classify that as ordinary "full file" code, so the raw
+// text (both the old and new blocks, with the literal marker comment still embedded)
+// gets written straight to disk as the complete file. Recognizing the stray markers
+// routes this content into the patch-apply path instead, where parsePatch parses zero
+// valid ops and the caller correctly treats it as a failed patch (retry with guidance)
+// rather than a real file rewrite.
+const PATCH_OP_RE = /^\/\/ @@@ (?:REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE|WITH):|^\/\/ @@@ END\s*$/m;
 function parseStructuredResponse(raw) {
     const thinkingMatch = raw.match(/<(?:thinking|think)>([\s\S]*?)<\/(?:thinking|think)>/i);
     const hypothesis = thinkingMatch ? thinkingMatch[1].trim() : '';
@@ -299,7 +324,7 @@ function parseStructuredResponse(raw) {
     // inside it without a <code_patch> delimiter.  stripThinkingBleed strips everything
     // after the opening tag, leaving an empty string.  Recover by scanning the raw
     // response for the first patch-op header and using everything from there onward.
-    const PATCH_HEADER_RE = /\/\/ @@@ (?:REPLACE_TEST|DELETE_TEST|ADD_AFTER_DESCRIBE|ADD_IMPORT|ADD_AFTER_IMPORTS|REPLACE):/m;
+    const PATCH_HEADER_RE = PATCH_OP_RE;
     if (!code.trim() && PATCH_HEADER_RE.test(raw)) {
         const idx = raw.search(PATCH_HEADER_RE);
         code = raw.slice(idx).trim();
@@ -313,6 +338,7 @@ export class TestGenerator {
     env;
     rawOnToken; // unwrapped callback; filter recreated per call
     rawFirstTokenCallback;
+    abortSignal; // external "Stop" — forwarded to every provider.generate call
     maxTokens;
     reasoningModel;
     history = [];
@@ -321,7 +347,9 @@ export class TestGenerator {
     previousCodes = []; // normalized codes from all attempts, for oscillation detection
     lastIsPatch = false;
     patchMode = false; // file is large enough to require <code_patch> mode — retries must stay in it
+    testLineCount = 0; // the CURRENT test file's own line count — used to scale maxTokens if a later escalation forces a full rewrite of it
     reactish = false; // React/RN project — gates React-specific retry guidance
+    coveredPatterns = []; // pattern tags memory has confirmed coverage for — gates detectTypeScriptErrors's own static guidance in retry()
     debugFile; // configured base path (or null)
     activeDebugFile = null; // per-file path for the file currently being processed
     constructor(options) {
@@ -330,14 +358,23 @@ export class TestGenerator {
         this.rawOnToken = options.onToken;
         this.maxTokens = options.config.maxTokens ?? 16000;
         this.reasoningModel = isReasoningModel(options.config.model);
-        // Resolve the debug base from config.debug (boolean | string) and LACUNA_DEBUG (env wins).
-        this.debugFile = resolveDebugBase(options.config.debug);
+        // Resolve the debug base from config.debug (boolean | string) and LACUNA_DEBUG (env wins), then
+        // anchor it to the project root so the logs are written where the user expects (next to the
+        // source), not relative to whatever process.cwd() the host happens to have.
+        const base = resolveDebugBase(options.config.debug);
+        this.debugFile = base && !isAbsolute(base) ? join(options.cwd ?? process.cwd(), base) : base;
     }
     // Swap the token callback between files (e.g. to attach a StreamingFileViewer per file).
     // A fresh codeOnlyStream filter is created on every generate/fix/retry call anyway,
     // so calling this resets streaming state automatically.
     setTokenCallback(cb) {
         this.rawOnToken = cb;
+    }
+    // External cancellation for the embedder's "Stop". Set before generate()/retry(); when it aborts,
+    // the in-flight provider request is aborted and the call throws ModelCancelledError. The CLI never
+    // sets it. The generator is reused across a worker's files, so callers refresh it per file.
+    setAbortSignal(signal) {
+        this.abortSignal = signal;
     }
     // A worker's TestGenerator is reused across every file it processes, but a monorepo can mix
     // runners per package — call this before generate()/fix() so prompt-building (mock API choice,
@@ -375,13 +412,35 @@ export class TestGenerator {
         this.previousCodes = [];
     }
     get isPatch() { return this.lastIsPatch; }
+    // Called by loop.ts once fixMemoryHint/coveredPatterns become known — only after attempt 1's
+    // own run fails, since the `generate` flow (unlike `fix`) has no args object to carry it in
+    // before then. See the defensive reset in generate() above for why this isn't the only guard.
+    setCoveredPatterns(patterns) {
+        this.coveredPatterns = patterns;
+    }
+    // Called by loop.ts/fix-loop.ts's patch-failure escalation once consecutivePatchFailures trips
+    // its threshold — forces buildRetryPrompt's trailing instruction (which reads this.patchMode
+    // directly) to actually say <code_output>/"do NOT use <code_patch>" instead of the opposite.
+    // Without this, an escalation message telling the model to switch modes would sit in the SAME
+    // prompt as a still-true patchMode flag whose own closing line says the opposite — a
+    // self-contradicting prompt, not a real escape from patch mode.
+    setPatchMode(v) {
+        this.patchMode = v;
+    }
     async generate(context, gap, projectMemory) {
         this.lastHypothesis = '';
         this.failedAttempts = [];
         this.previousCodes = [];
         // Mirrors buildGeneratePrompt's patch-mode decision so retries stay in the same mode.
-        this.patchMode = (context.existingTestCode?.split('\n').length ?? 0) > PATCH_MODE_LINE_THRESHOLD;
+        this.testLineCount = context.existingTestCode?.split('\n').length ?? 0;
+        this.patchMode = this.testLineCount > PATCH_MODE_LINE_THRESHOLD;
         this.reactish = context.reactMajorVersion != null;
+        // Defensive reset — a worker's generator is reused across files (see setEnv's comment above),
+        // and the REAL coveredPatterns value isn't known until after attempt 1 fails (loop.ts calls
+        // setCoveredPatterns() then). Resetting here unconditionally means a stale value from the
+        // PREVIOUS file can never leak into this file's retry prompt even if that later call is ever
+        // skipped by a future code path.
+        this.coveredPatterns = [];
         this.history = [
             {
                 role: 'user',
@@ -395,6 +454,7 @@ export class TestGenerator {
                     sourceImportPath: context.sourceImportPath,
                     mocksCode: context.mocksCode,
                     mocksImportPath: context.mocksImportPath,
+                    extraMocks: context.extraMocks,
                     setupFileCode: context.setupFileCode,
                     packageDeps: context.packageDeps,
                     tsconfigPaths: context.tsconfigPaths,
@@ -403,6 +463,7 @@ export class TestGenerator {
                     localImportContents: context.localImportContents,
                     reactMajorVersion: context.reactMajorVersion,
                     projectMemory,
+                    memoryContext: context.memoryContext,
                     existingTestLineCount: context.existingTestCode?.split('\n').length ?? 0,
                 }),
             },
@@ -410,7 +471,7 @@ export class TestGenerator {
         const prompt = this.history[this.history.length - 1].content;
         this.activeDebugFile = perFileDebugPath(this.debugFile, context.sourceFile);
         await debugWrite(this.activeDebugFile, 'PROMPT (generate)', prompt, /* clear= */ true);
-        const response = await this.provider.generate(this.history, buildSystemPrompt(this.env), this.buildOnToken(), estimateMaxTokens(context.sourceCode, this.maxTokens, this.reasoningModel), GENERATE_TEMPERATURE);
+        const response = await this.provider.generate(this.history, buildSystemPrompt(this.env), this.buildOnToken(), estimateMaxTokens(context.sourceCode, this.maxTokens, this.reasoningModel), GENERATE_TEMPERATURE, this.abortSignal);
         await debugWrite(this.activeDebugFile, 'RESPONSE (generate)', response);
         const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response);
         this.lastHypothesis = hypothesis;
@@ -426,12 +487,14 @@ export class TestGenerator {
         this.failedAttempts = [];
         this.previousCodes = [];
         // Mirrors buildFixPrompt's patch-mode decision so retries stay in the same mode.
-        this.patchMode = (args.existingTestLineCount ?? 0) > PATCH_MODE_LINE_THRESHOLD;
+        this.testLineCount = args.existingTestLineCount ?? 0;
+        this.patchMode = this.testLineCount > PATCH_MODE_LINE_THRESHOLD;
         this.reactish = args.reactMajorVersion != null;
+        this.coveredPatterns = args.coveredPatterns ?? [];
         this.history = [{ role: 'user', content: buildFixPrompt(args) }];
         this.activeDebugFile = perFileDebugPath(this.debugFile, args.testFile);
         await debugWrite(this.activeDebugFile, 'PROMPT (fix)', this.history[0].content, /* clear= */ true);
-        const response = await this.provider.generate(this.history, buildSystemPrompt(this.env), this.buildOnToken(), estimateMaxTokens(args.sourceCode, this.maxTokens, this.reasoningModel), GENERATE_TEMPERATURE);
+        const response = await this.provider.generate(this.history, buildSystemPrompt(this.env), this.buildOnToken(), estimateMaxTokens(args.sourceCode, this.maxTokens, this.reasoningModel), GENERATE_TEMPERATURE, this.abortSignal);
         await debugWrite(this.activeDebugFile, 'RESPONSE (fix)', response);
         const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response);
         this.lastHypothesis = hypothesis;
@@ -447,7 +510,7 @@ export class TestGenerator {
         this.failedAttempts = [];
         this.previousCodes = [];
         this.history = [{ role: 'user', content: buildPollutionFixPrompt(args) }];
-        const response = await this.provider.generate(this.history, buildSystemPrompt(this.env), this.buildOnToken(), this.maxTokens, RETRY_TEMPERATURE);
+        const response = await this.provider.generate(this.history, buildSystemPrompt(this.env), this.buildOnToken(), this.maxTokens, RETRY_TEMPERATURE, this.abortSignal);
         const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response);
         this.lastHypothesis = hypothesis;
         this.lastIsPatch = isPatch;
@@ -457,12 +520,19 @@ export class TestGenerator {
             throw new TruncatedOutputError(code);
         return code;
     }
-    async retry(failureOutput) {
+    // rawFailureOutput: the pre-enrichment error text (no mocksFileBanner/memory hint appended),
+    // when the caller has it — used ONLY for what gets stored into failedAttempts, never for the
+    // live prompt. Without this, failedAttempts stores the ALREADY-enriched failureOutput (memory
+    // hint included), which then gets echoed back verbatim on the NEXT retry's "you already tried
+    // this" block — compounding with a FRESH copy of the same hint appended to that retry's own
+    // failureOutput, so the same memory section appears twice in one prompt by retry 2+. Falls back
+    // to failureOutput when the caller has nothing more raw to offer.
+    async retry(failureOutput, rawFailureOutput) {
         // Record what the previous attempt planned and why it failed
         this.failedAttempts.push({
             attemptNumber: this.failedAttempts.length + 1,
             hypothesis: this.lastHypothesis,
-            failureReason: failureOutput,
+            failureReason: rawFailureOutput ?? failureOutput,
         });
         // Trim history to: original prompt + latest code + new retry message
         // This keeps memory flat regardless of iteration count.
@@ -479,10 +549,14 @@ export class TestGenerator {
             : [original];
         this.history.push({
             role: 'user',
-            content: buildRetryPrompt(failureOutput, this.failedAttempts, this.patchMode, this.reactish),
+            content: buildRetryPrompt(failureOutput, this.failedAttempts, this.patchMode, this.reactish, this.coveredPatterns, this.env.testRunner === 'vitest' ? 'vi' : 'jest', this.env.testRunner === 'jest' || this.env.testRunner === 'vitest'),
         });
         await debugWrite(this.activeDebugFile, `PROMPT (retry ${this.failedAttempts.length})`, this.history[this.history.length - 1].content);
-        const response = await this.provider.generate(this.history, buildSystemPrompt(this.env), this.buildOnToken(), this.maxTokens, RETRY_TEMPERATURE);
+        // Only scaled UP past the configured ceiling once forced out of patch mode (an escalated
+        // full rewrite must reproduce the whole file) — a no-op Math.max for every file that never
+        // escalated, so ordinary retries keep the user's configured budget exactly as before.
+        const retryMaxTokens = this.patchMode ? this.maxTokens : Math.max(this.maxTokens, estimateFullRewriteTokens(this.testLineCount));
+        const response = await this.provider.generate(this.history, buildSystemPrompt(this.env), this.buildOnToken(), retryMaxTokens, RETRY_TEMPERATURE, this.abortSignal);
         await debugWrite(this.activeDebugFile, `RESPONSE (retry ${this.failedAttempts.length})`, response);
         const { hypothesis, code, truncated, isPatch } = parseStructuredResponse(response);
         this.lastHypothesis = hypothesis;

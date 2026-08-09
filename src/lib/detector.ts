@@ -167,7 +167,9 @@ export function multiFileTestCommand(env: DetectedEnvironment, files: string[]):
       return `npx vitest run --poolOptions.threads.singleThread=true --no-isolate --coverage.enabled=false ${fileList}`
     }
     case 'jest':
-      return `npx jest --runInBand ${files.map(jestPath).join(' ')}`
+      // --no-cache: see fileTestCommand — avoids a stale/contended ts-jest transform cache
+      // under concurrent per-file verify runs. --forceExit: see fileTestCommand.
+      return `npx jest --runInBand --no-cache --forceExit ${files.map(jestPath).join(' ')}`
     case 'mocha':
       return `npx mocha ${files.map(sq).join(' ')}`
     default:
@@ -187,7 +189,7 @@ export function scopedCoverageCommand(env: DetectedEnvironment, relDir: string):
       // positional narrows which test files run; --coverage.include narrows instrumentation.
       return `npx vitest run ${q} --coverage --coverage.include=${sq(dir + '/**')}`
     case 'jest':
-      return `npx jest --coverage ${env.jestTestPathFlag}=${jestPath(dir)} --collectCoverageFrom=${sq(dir + '/**/*.{js,jsx,ts,tsx}')}`
+      return `npx jest --coverage --forceExit ${env.jestTestPathFlag}=${jestPath(dir)} --collectCoverageFrom=${sq(dir + '/**/*.{js,jsx,ts,tsx}')}`
     default:
       return null
   }
@@ -202,7 +204,7 @@ export function relatedCoverageCommand(env: DetectedEnvironment, relFile: string
     case 'vitest':
       return `npx vitest related ${sq(relFile)} --run --coverage --coverage.include=${sq(relFile)}`
     case 'jest':
-      return `npx jest --findRelatedTests ${sq(relFile)} --coverage --collectCoverageFrom=${sq(relFile)}`
+      return `npx jest --findRelatedTests ${sq(relFile)} --coverage --forceExit --collectCoverageFrom=${sq(relFile)}`
     default:
       return null
   }
@@ -215,7 +217,10 @@ export function scopedTestCommand(env: DetectedEnvironment, relDir: string): str
   const dir = relDir.replace(/\/+$/, '')
   switch (env.testRunner) {
     case 'vitest': return `npx vitest run ${sq(dir)}`
-    case 'jest':   return `npx jest ${env.jestTestPathFlag}=${jestPath(dir)}`
+    // --no-cache: failing-test discovery must reflect the CURRENT files on disk. Without it, jest's
+    // transform cache can serve a prior run's result, so a file fixed in an earlier session is still
+    // reported as failing until something invalidates the cache. Matches fileTestCommand.
+    case 'jest':   return `npx jest --forceExit --no-cache ${env.jestTestPathFlag}=${jestPath(dir)}`
     default:       return null
   }
 }
@@ -228,7 +233,20 @@ export function fileTestCommand(env: DetectedEnvironment, testFilePath: string):
     // shared coverage tmp dir (ENOENT lstat '<reportsDir>/.tmp'). Disabling it avoids the race
     // and skips needless instrumentation.
     case 'vitest': return `npx vitest run ${q} --coverage.enabled=false`
-    case 'jest':   return `npx jest ${env.jestTestPathFlag}=${jestPath(testFilePath)}`
+    // --no-cache: this runs as a fresh `npx jest` child process on every single retry anyway (no
+    // long-lived process to benefit from a warm cache within one lacuna run), so the cache only
+    // risks staleness — and under N parallel fix workers, many concurrent `npx jest <file>`
+    // processes contend on the SAME on-disk ts-jest/transform cache directory. A patch that
+    // correctly fixes a TS error can then be verified against a cached (pre-fix) compiled
+    // artifact for that file, making a demonstrably-correct fix look like it "didn't take" and
+    // burning the fix loop's retries/oscillation budget on a false negative.
+    // --forceExit: a test file can leave a real handle open (an interval/connection a module
+    // starts on import and never clears) — without forceExit, Jest doesn't just print a warning,
+    // it hangs indefinitely (verified empirically), silently burning the full runCommand timeout
+    // on every retry of that file. forceExit guarantees the child process actually exits, and
+    // still prints a distinctive "Force exiting Jest" line when it had to — see
+    // detectOpenHandleLeak in validate.ts, which keys off exactly that line.
+    case 'jest':   return `npx jest --no-cache --forceExit ${env.jestTestPathFlag}=${jestPath(testFilePath)}`
     case 'mocha':  return `npx mocha ${q}`
     case 'pytest': return `python -m pytest ${q} -v`
     case 'go-test': {

@@ -9,6 +9,6 @@ export declare class OpenAICompatibleProvider implements ModelProvider {
         apiKey?: string;
         isLocal?: boolean;
     });
-    generate(messages: ChatMessage[], system: string, onToken?: (token: string) => void, maxTokens?: number, temperature?: number, _attempt?: number): Promise<string>;
+    generate(messages: ChatMessage[], system: string, onToken?: (token: string) => void, maxTokens?: number, temperature?: number, signal?: AbortSignal, _attempt?: number): Promise<string>;
 }
 //# sourceMappingURL=openai-compatible.d.ts.map

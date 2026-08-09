@@ -14,6 +14,8 @@ export class StreamingFileViewer {
   private tick = 0
   private timer: ReturnType<typeof setInterval> | null = null
   readonly isTTY: boolean
+  private lastRenderedText = ''
+  private winchHandler: (() => void) | null = null
 
   constructor(private readonly filename: string) {
     this.isTTY = Boolean(process.stdout.isTTY)
@@ -26,6 +28,17 @@ export class StreamingFileViewer {
     }
     this.render()
     this.timer = setInterval(() => { this.tick++; this.render() }, 80)
+
+    // On resize, recompute how many visual rows the last frame occupies at the NEW width before
+    // the next redraw's cursor-up — otherwise the stale `rendered` (old width) under/over-counts
+    // wrapped rows and the redraw corrupts. Mirrors WorkerDisplay's SIGWINCH handling.
+    this.winchHandler = () => {
+      if (this.lastRenderedText) {
+        const newCols = Math.max(1, process.stdout.columns || 80)
+        this.rendered = this.countVisualLines(this.lastRenderedText, newCols)
+      }
+    }
+    process.on('SIGWINCH', this.winchHandler)
   }
 
   append(token: string) {
@@ -36,10 +49,12 @@ export class StreamingFileViewer {
 
   stop() {
     if (this.timer) { clearInterval(this.timer); this.timer = null }
+    if (this.winchHandler) { process.off('SIGWINCH', this.winchHandler); this.winchHandler = null }
     if (this.isTTY && this.rendered > 0) {
       process.stdout.write(`\x1B[${this.rendered}A\x1B[0J`)
       this.rendered = 0
     }
+    this.lastRenderedText = ''
     this.content = ''
   }
 
@@ -47,7 +62,10 @@ export class StreamingFileViewer {
     if (!this.isTTY) return
     if (this.rendered > 0) process.stdout.write(`\x1B[${this.rendered}A\x1B[0J`)
 
-    const cols = Math.max(60, process.stdout.columns ?? 80)
+    // `cols` (min 60) governs the panel width; `realCols` is the actual terminal width and MUST
+    // drive the wrapped-row count below.
+    const realCols = Math.max(1, process.stdout.columns || 80)
+    const cols = Math.max(60, realCols)
     const panelWidth = Math.min(cols - 4, 82)
     const innerWidth = panelWidth - 4   // space between "│ " and " │"
 
@@ -80,7 +98,22 @@ export class StreamingFileViewer {
 
     const out = lines.join('\n')
     process.stdout.write(out)
-    // Count \n chars — NOT lines.length (same rule as WorkerDisplay and coverage-spinner)
-    this.rendered = (out.match(/\n/g) ?? []).length
+    this.lastRenderedText = out
+    // Count VISUAL rows (a panel row wider than the terminal wraps to several), not '\n' chars —
+    // counting newlines under-counts wrapped rows on a terminal narrower than the panel (~84 cols),
+    // so the next redraw's cursor-up moves up too few rows and leaves stale copies stacking down
+    // the screen. Same accounting as WorkerDisplay.countVisualLines.
+    this.rendered = this.countVisualLines(out, realCols)
+  }
+
+  private countVisualLines(text: string, cols: number): number {
+    const lines = text.split('\n')
+    const countTo = text.endsWith('\n') ? lines.length - 1 : lines.length
+    let total = 0
+    for (let i = 0; i < countTo; i++) {
+      const visLen = lines[i].replace(/\x1B\[[0-9;]*[\p{L}]/gu, '').length
+      total += Math.max(1, Math.ceil(visLen / cols))
+    }
+    return total
   }
 }

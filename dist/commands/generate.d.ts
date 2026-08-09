@@ -17,6 +17,7 @@ export default class Generate extends Command {
         workers: import("@oclif/core/interfaces").OptionFlag<number, import("@oclif/core/interfaces").CustomOptions>;
         fresh: import("@oclif/core/interfaces").BooleanFlag<boolean>;
         improve: import("@oclif/core/interfaces").BooleanFlag<boolean>;
+        'fix-on-failure': import("@oclif/core/interfaces").BooleanFlag<boolean>;
     };
     run(): Promise<void>;
 }

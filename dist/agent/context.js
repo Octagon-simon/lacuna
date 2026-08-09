@@ -1,5 +1,18 @@
 import { readFile, access, mkdir, readdir } from 'fs/promises';
 import { join, dirname, basename, extname, relative } from 'path';
+import { mocksFileList } from '../lib/config.js';
+import { retrieveMemory, renderMemorySection } from '../lib/memory/index.js';
+// Retrieves once and derives both the rendered prompt section AND the raw entry list from the
+// SAME call — write-back (loop.ts/fix-loop.ts) needs the entries themselves to bump/decay
+// confidence on exactly what was shown, not a re-derived guess; calling retrieveMemory a second
+// time later would risk the store having changed in between (a decay/write-back from a
+// concurrent worker) and bumping the WRONG snapshot of entries.
+async function buildMemoryContextWithEntries(config, ctx) {
+    if (!config.memory.enabled)
+        return { context: null, entries: [] };
+    const entries = await retrieveMemory(config, { ...ctx, errorSignature: null });
+    return { context: renderMemorySection(entries), entries };
+}
 // Compute the relative import path from one file to another, stripping the extension.
 export function computeRelativeImport(fromFile, toFile) {
     const rel = relative(dirname(fromFile), toFile);
@@ -1003,17 +1016,30 @@ async function readTsconfigPaths(cwd) {
 // Lightweight context for fix-loop: reads mocks/setup/deps/tsconfig relative to
 // the actual test file path. Does NOT call inferTestFilePath or findExistingTestFile
 // (which would compute wrong paths and create spurious __tests__/ directories).
-export async function buildFixFileContext(absTestPath, cwd, config) {
+export async function buildFixFileContext(absTestPath, cwd, config, 
+// Only the test runner, NOT a full DetectedEnvironment — this function deliberately has no
+// `env` param (see the comment above) so it can't accidentally trigger findExistingTestFile/
+// inferTestFilePath side effects. The caller (fix-loop.ts) already resolves the file's own
+// package runner (fileEnv.testRunner) before calling this, so passing just the string here
+// preserves that no-side-effects contract while still letting tag-based memory retrieval work.
+testRunner) {
+    const mocksPaths = config ? mocksFileList(config) : [];
     let mocksCode = null;
     let mocksImportPath = null;
-    if (config?.mocksFile) {
-        const absoluteMocks = join(cwd, config.mocksFile);
+    if (mocksPaths[0]) {
+        const absoluteMocks = join(cwd, mocksPaths[0]);
         mocksImportPath = relativeMockPath(absTestPath, absoluteMocks);
         try {
             mocksCode = await readFile(absoluteMocks, 'utf-8');
         }
         catch { /* mocks file not created yet — AI will create it */ }
     }
+    const extraMocks = await Promise.all(mocksPaths.slice(1).map(async (p) => {
+        const absoluteMocks = join(cwd, p);
+        const importPath = relativeMockPath(absTestPath, absoluteMocks);
+        const code = await readFile(absoluteMocks, 'utf-8').catch(() => null);
+        return { importPath, code };
+    }));
     let setupFileCode = null;
     if (config?.setupFile) {
         try {
@@ -1021,11 +1047,12 @@ export async function buildFixFileContext(absTestPath, cwd, config) {
         }
         catch { /* setup file not found */ }
     }
-    const [packageDeps, tsconfigPaths] = await Promise.all([
+    const [packageDeps, tsconfigPaths, memory] = await Promise.all([
         readPackageDeps(cwd),
         readTsconfigPaths(cwd),
+        config && testRunner ? buildMemoryContextWithEntries(config, { testRunner }) : Promise.resolve({ context: null, entries: [] }),
     ]);
-    return { mocksCode, mocksImportPath, setupFileCode, packageDeps, tsconfigPaths };
+    return { mocksCode, mocksImportPath, extraMocks, setupFileCode, packageDeps, tsconfigPaths, memoryContext: memory.context, memoryEntries: memory.entries };
 }
 export async function buildFileContext(sourceFilePath, cwd, env, config) {
     const absoluteSource = join(cwd, sourceFilePath);
@@ -1035,10 +1062,11 @@ export async function buildFileContext(sourceFilePath, cwd, env, config) {
     const existingTestCode = existingTestFile ? await readFile(existingTestFile, 'utf-8') : null;
     const suggestedTestFile = existingTestFile ?? join(cwd, await inferTestFilePath(sourceFilePath, cwd, env, srcDirs));
     const sourceImportPath = computeRelativeImport(suggestedTestFile, absoluteSource);
+    const mocksPaths = config ? mocksFileList(config) : [];
     let mocksCode = null;
     let mocksImportPath = null;
-    if (config?.mocksFile) {
-        const absoluteMocks = join(cwd, config.mocksFile);
+    if (mocksPaths[0]) {
+        const absoluteMocks = join(cwd, mocksPaths[0]);
         // Always compute the import path — even if the file doesn't exist yet,
         // the AI needs to know where to create/import it from.
         mocksImportPath = relativeMockPath(suggestedTestFile, absoluteMocks);
@@ -1047,6 +1075,12 @@ export async function buildFileContext(sourceFilePath, cwd, env, config) {
         }
         catch { /* file not created yet — AI will create it */ }
     }
+    const extraMocks = await Promise.all(mocksPaths.slice(1).map(async (p) => {
+        const absoluteMocks = join(cwd, p);
+        const importPath = relativeMockPath(suggestedTestFile, absoluteMocks);
+        const code = await readFile(absoluteMocks, 'utf-8').catch(() => null);
+        return { importPath, code };
+    }));
     let setupFileCode = null;
     if (config?.setupFile) {
         try {
@@ -1054,13 +1088,25 @@ export async function buildFileContext(sourceFilePath, cwd, env, config) {
         }
         catch { /* setup file not found — skip */ }
     }
-    const [packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, localImportContents, reactMajorVersion] = await Promise.all([
+    // Bare (non-relative) top-level import specifiers double as retrieval tags for the memory
+    // store below — e.g. 'react-router-dom', 'next' — reusing the same specifier extraction
+    // collectTypeDefinitions already does, no new source-parsing needed. A cheap synchronous
+    // 'react' framework tag comes straight from that same list — no need to wait on the async
+    // detectReactMajorVersion() result (computed independently below) just to tag the retrieval.
+    const dependencies = extractModuleSpecifiersWithNames(sourceCode)
+        .map(s => s.path)
+        .filter(p => !p.startsWith('.') && !p.startsWith('/'));
+    const framework = dependencies.some(d => d === 'react' || d.startsWith('react-')) ? 'react' : null;
+    const [packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, localImportContents, reactMajorVersion, memory] = await Promise.all([
         readPackageDeps(cwd),
         readTsconfigPaths(cwd),
         collectTypeDefinitions(sourceCode, absoluteSource, cwd),
         collectLocalImportPaths(sourceCode, absoluteSource, suggestedTestFile, cwd),
         collectUsedSymbolsContext(sourceCode, absoluteSource, cwd),
         detectReactMajorVersion(cwd),
+        config
+            ? buildMemoryContextWithEntries(config, { testRunner: env.testRunner, framework, dependencies })
+            : Promise.resolve({ context: null, entries: [] }),
     ]);
     return {
         sourceFile: sourceFilePath,
@@ -1071,6 +1117,7 @@ export async function buildFileContext(sourceFilePath, cwd, env, config) {
         sourceImportPath,
         mocksCode,
         mocksImportPath,
+        extraMocks,
         setupFileCode,
         packageDeps,
         tsconfigPaths,
@@ -1078,6 +1125,8 @@ export async function buildFileContext(sourceFilePath, cwd, env, config) {
         localImportPaths,
         localImportContents,
         reactMajorVersion,
+        memoryContext: memory.context,
+        memoryEntries: memory.entries,
     };
 }
 //# sourceMappingURL=context.js.map

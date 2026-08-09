@@ -10,6 +10,9 @@ export interface ModelProvider {
     onToken?: (token: string) => void,
     maxTokens?: number,
     temperature?: number,
+    // External cancellation (embedder "Stop"). When it aborts, the in-flight streaming request is
+    // aborted and generate() throws ModelCancelledError. Unused by the CLI. See generator.setAbortSignal.
+    signal?: AbortSignal,
   ): Promise<string>
 }
 
@@ -44,6 +47,16 @@ export class ModelRateLimitError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'ModelRateLimitError'
+  }
+}
+
+// The caller aborted the request via an external AbortSignal (embedder "Stop"). Distinct from
+// ModelStallError (a timeout, which the loop RETRIES) — a cancel must NOT be retried; the loop
+// treats it as an immediate, intentional stop for that file.
+export class ModelCancelledError extends Error {
+  constructor() {
+    super('Generation cancelled by user.')
+    this.name = 'ModelCancelledError'
   }
 }
 

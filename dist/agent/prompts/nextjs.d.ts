@@ -7,6 +7,6 @@ export interface NextJsAnalysis {
     sessionProviders: string[];
 }
 export declare function analyzeNextJs(sourceCode: string): NextJsAnalysis;
-export declare function buildNextJsGuidance(a: NextJsAnalysis, mockApi: string): string | null;
-export declare function detectNextJsImportError(errorOutput: string, mockApi?: string): string | null;
+export declare function buildNextJsGuidance(a: NextJsAnalysis, mockApi: string, hasFnStyleMockApi?: boolean): string | null;
+export declare function detectNextJsImportError(errorOutput: string, mockApi?: string, hasFnStyleMockApi?: boolean): string | null;
 //# sourceMappingURL=nextjs.d.ts.map

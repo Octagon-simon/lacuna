@@ -1,7 +1,7 @@
 import { gunzipSync } from 'node:zlib'
 import OpenAI from 'openai'
 import type { ModelProvider, ChatMessage } from './types.js'
-import { ModelStallError, ModelRateLimitError } from './types.js'
+import { ModelStallError, ModelRateLimitError, ModelCancelledError } from './types.js'
 
 const FIRST_TOKEN_TIMEOUT_MS = 30_000
 const STALL_TIMEOUT_MS = 60_000
@@ -16,6 +16,15 @@ const STALL_TIMEOUT_MS = 60_000
 // generous: 10 minutes of total silence (across content AND reasoning_content) before giving up.
 const LOCAL_FIRST_TOKEN_TIMEOUT_MS = 600_000
 const LOCAL_STALL_TIMEOUT_MS = 600_000
+
+// TEMPORARY diagnostic (LACUNA_DIAGNOSE_TOKENS=1) — added to confirm/rule out a specific
+// hypothesis: a model returning an empty `content` string with NO error thrown (as observed on a
+// real project using deepseek-v4-flash from retry 2 onward) could mean the model burned its
+// entire max_tokens budget on `reasoning_content` and never reached real `content` — the same
+// failure mode isReasoningModel()/estimateMaxTokens (generator.ts) already exist to prevent, but
+// only for models whose NAME matches a known reasoning pattern. Logs one line per call to stderr
+// so it doesn't interleave with the WorkerDisplay TUI's stdout redraws; remove once confirmed.
+const DIAGNOSE_TOKENS = process.env.LACUNA_DIAGNOSE_TOKENS === '1'
 
 export class OpenAICompatibleProvider implements ModelProvider {
   private client: OpenAI
@@ -84,11 +93,22 @@ export class OpenAICompatibleProvider implements ModelProvider {
     onToken?: (token: string) => void,
     maxTokens = 16000,
     temperature?: number,
+    signal?: AbortSignal,
     _attempt = 0,           // internal retry counter for transient network errors
   ): Promise<string> {
     let content = ''
+    let reasoningChars = 0
+    let contentChars = 0
+    let lastFinishReason: string | null = null
+
+    // Already cancelled before we even start — don't open a request. (Defensive: the loop's
+    // per-attempt check normally returns before calling generate.)
+    if (signal?.aborted) throw new ModelCancelledError()
 
     const controller = new AbortController()
+    // Bridge an external cancel into our internal controller so the in-flight fetch aborts. Reason
+    // 'user-cancel' distinguishes it from the timeout aborts below.
+    if (signal) signal.addEventListener('abort', () => controller.abort('user-cancel'), { once: true })
     let firstTokenReceived = false
     let lastTokenAt = 0
 
@@ -128,6 +148,7 @@ export class OpenAICompatibleProvider implements ModelProvider {
         const delta = chunk.choices[0]?.delta as { content?: string | null; reasoning_content?: string | null } | undefined
         const token = delta?.content ?? ''
         const reasoningToken = delta?.reasoning_content ?? ''
+        if (chunk.choices[0]?.finish_reason) lastFinishReason = chunk.choices[0].finish_reason
         if (token || reasoningToken) {
           if (!firstTokenReceived) {
             firstTokenReceived = true
@@ -135,8 +156,10 @@ export class OpenAICompatibleProvider implements ModelProvider {
           }
           lastTokenAt = Date.now()
         }
+        if (reasoningToken) reasoningChars += reasoningToken.length
         if (token) {
           content += token
+          contentChars += token.length
           onToken?.(token)
         }
       }
@@ -144,7 +167,12 @@ export class OpenAICompatibleProvider implements ModelProvider {
       if (controller.signal.aborted) {
         clearTimeout(firstTokenTimer)
         clearInterval(stallInterval)
+        // User cancel (external signal) — never retried, unlike a timeout stall.
+        if ((controller.signal.reason as string) === 'user-cancel') throw new ModelCancelledError()
         const reason = (controller.signal.reason as string) === 'first-token-timeout' ? 'first-token-timeout' : 'stream-stall'
+        if (DIAGNOSE_TOKENS) {
+          console.error(`[lacuna-diagnose] model=${this.model} maxTokens=${maxTokens} ABORTED(${reason}) reasoningChars=${reasoningChars} contentChars=${contentChars} finishReason=${lastFinishReason}`)
+        }
         throw new ModelStallError(reason, reason === 'first-token-timeout' ? this.firstTokenTimeoutMs : this.stallTimeoutMs)
       }
       if (err != null && typeof err === 'object' && 'status' in err) {
@@ -195,12 +223,16 @@ export class OpenAICompatibleProvider implements ModelProvider {
         clearTimeout(firstTokenTimer)
         clearInterval(stallInterval)
         await new Promise(r => setTimeout(r, 2000 + Math.random() * 1000))
-        return this.generate(messages, system, onToken, maxTokens, temperature, 1)
+        return this.generate(messages, system, onToken, maxTokens, temperature, signal, 1)
       }
       throw err
     } finally {
       clearTimeout(firstTokenTimer)
       clearInterval(stallInterval)
+    }
+
+    if (DIAGNOSE_TOKENS) {
+      console.error(`[lacuna-diagnose] model=${this.model} maxTokens=${maxTokens} reasoningChars=${reasoningChars} contentChars=${contentChars} finishReason=${lastFinishReason} resultEmpty=${content.trim().length === 0}`)
     }
 
     return content.trim()

@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { ModelProvider, ChatMessage } from './types.js'
-import { ModelStallError, ModelRateLimitError } from './types.js'
+import { ModelStallError, ModelRateLimitError, ModelCancelledError } from './types.js'
 
 const FIRST_TOKEN_TIMEOUT_MS = 30_000
 const STALL_TIMEOUT_MS = 60_000
@@ -20,6 +20,7 @@ export class AnthropicProvider implements ModelProvider {
     onToken?: (token: string) => void,
     maxTokens = 16000,
     temperature?: number,
+    signal?: AbortSignal,
   ): Promise<string> {
     let content = ''
 
@@ -36,7 +37,12 @@ export class AnthropicProvider implements ModelProvider {
       return { role: msg.role, content: msg.content }
     })
 
+    if (signal?.aborted) throw new ModelCancelledError()
+
     const controller = new AbortController()
+    // Bridge an external cancel (embedder "Stop") into our internal controller — see the
+    // openai-compatible provider's identical bridge.
+    if (signal) signal.addEventListener('abort', () => controller.abort('user-cancel'), { once: true })
     let firstTokenReceived = false
     let lastTokenAt = 0
 
@@ -80,6 +86,7 @@ export class AnthropicProvider implements ModelProvider {
       }
     } catch (err) {
       if (controller.signal.aborted) {
+        if ((controller.signal.reason as string) === 'user-cancel') throw new ModelCancelledError()
         const reason = (controller.signal.reason as string) === 'first-token-timeout' ? 'first-token-timeout' : 'stream-stall'
         throw new ModelStallError(reason, reason === 'first-token-timeout' ? FIRST_TOKEN_TIMEOUT_MS : STALL_TIMEOUT_MS)
       }

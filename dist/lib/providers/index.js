@@ -2,7 +2,10 @@ import { AnthropicProvider } from './anthropic.js';
 import { OpenAICompatibleProvider } from './openai-compatible.js';
 export { PRESETS } from './types.js';
 export function createProvider(config) {
-    const apiKey = config.apiKeyEnv ? (process.env[config.apiKeyEnv] ?? '') : '';
+    // Prefer a runtime key supplied by an embedding host (config.apiKey — e.g. the VS Code
+    // extension's SecretStorage value) over the env var. `||` (not `??`) so an empty/absent
+    // runtime key cleanly falls through to process.env, keeping the CLI path byte-identical.
+    const apiKey = config.apiKey || (config.apiKeyEnv ? (process.env[config.apiKeyEnv] ?? '') : '');
     if (config.provider === 'anthropic') {
         if (!apiKey) {
             throw new Error(`${config.apiKeyEnv} environment variable is not set.\nGet your key at https://console.anthropic.com`);

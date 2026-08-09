@@ -3,6 +3,19 @@ import { join, dirname, basename, extname, relative } from 'path'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import type { LacunaConfig } from '../lib/config.js'
 import { mocksFileList } from '../lib/config.js'
+import { retrieveMemory, renderMemorySection } from '../lib/memory/index.js'
+import type { MemoryEntry } from '../lib/memory/index.js'
+
+// Retrieves once and derives both the rendered prompt section AND the raw entry list from the
+// SAME call — write-back (loop.ts/fix-loop.ts) needs the entries themselves to bump/decay
+// confidence on exactly what was shown, not a re-derived guess; calling retrieveMemory a second
+// time later would risk the store having changed in between (a decay/write-back from a
+// concurrent worker) and bumping the WRONG snapshot of entries.
+async function buildMemoryContextWithEntries(config: LacunaConfig, ctx: Parameters<typeof retrieveMemory>[1]): Promise<{ context: string | null; entries: MemoryEntry[] }> {
+  if (!config.memory.enabled) return { context: null, entries: [] }
+  const entries = await retrieveMemory(config, { ...ctx, errorSignature: null })
+  return { context: renderMemorySection(entries), entries }
+}
 
 // A mocks file beyond the primary one (config.mocksFile[0]) — shown to the AI as read-only
 // reference so it imports from the RIGHT file instead of re-declaring mocks that already
@@ -30,6 +43,10 @@ export interface FileContext {
   localImportPaths: string[] | null  // pre-computed vi.mock() paths (relative from test file to each local dep)
   localImportContents: string | null // full content (capped) of directly imported local files — hook/service implementations
   reactMajorVersion: number | null   // major React version detected from package.json, or null
+  memoryContext: string | null       // retrieved learned rules relevant to this file's runner/framework/deps (src/lib/memory)
+  memoryEntries: MemoryEntry[]       // the entries memoryContext was rendered from — write-back needs the raw list to bump/decay
+                                     // confidence on the SAME entries that were actually shown (recordTagMatchOutcome), not a
+                                     // re-derived guess; a rendered string alone can't be reversed back into entry ids.
 }
 
 // Compute the relative import path from one file to another, stripping the extension.
@@ -1033,7 +1050,13 @@ export async function buildFixFileContext(
   absTestPath: string,
   cwd: string,
   config?: LacunaConfig,
-): Promise<Pick<FileContext, 'mocksCode' | 'mocksImportPath' | 'extraMocks' | 'setupFileCode' | 'packageDeps' | 'tsconfigPaths'>> {
+  // Only the test runner, NOT a full DetectedEnvironment — this function deliberately has no
+  // `env` param (see the comment above) so it can't accidentally trigger findExistingTestFile/
+  // inferTestFilePath side effects. The caller (fix-loop.ts) already resolves the file's own
+  // package runner (fileEnv.testRunner) before calling this, so passing just the string here
+  // preserves that no-side-effects contract while still letting tag-based memory retrieval work.
+  testRunner?: string,
+): Promise<Pick<FileContext, 'mocksCode' | 'mocksImportPath' | 'extraMocks' | 'setupFileCode' | 'packageDeps' | 'tsconfigPaths' | 'memoryContext' | 'memoryEntries'>> {
   const mocksPaths = config ? mocksFileList(config) : []
   let mocksCode: string | null = null
   let mocksImportPath: string | null = null
@@ -1058,12 +1081,13 @@ export async function buildFixFileContext(
     } catch { /* setup file not found */ }
   }
 
-  const [packageDeps, tsconfigPaths] = await Promise.all([
+  const [packageDeps, tsconfigPaths, memory] = await Promise.all([
     readPackageDeps(cwd),
     readTsconfigPaths(cwd),
+    config && testRunner ? buildMemoryContextWithEntries(config, { testRunner }) : Promise.resolve({ context: null, entries: [] }),
   ])
 
-  return { mocksCode, mocksImportPath, extraMocks, setupFileCode, packageDeps, tsconfigPaths }
+  return { mocksCode, mocksImportPath, extraMocks, setupFileCode, packageDeps, tsconfigPaths, memoryContext: memory.context, memoryEntries: memory.entries }
 }
 
 export async function buildFileContext(
@@ -1110,13 +1134,26 @@ export async function buildFileContext(
     } catch { /* setup file not found — skip */ }
   }
 
-  const [packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, localImportContents, reactMajorVersion] = await Promise.all([
+  // Bare (non-relative) top-level import specifiers double as retrieval tags for the memory
+  // store below — e.g. 'react-router-dom', 'next' — reusing the same specifier extraction
+  // collectTypeDefinitions already does, no new source-parsing needed. A cheap synchronous
+  // 'react' framework tag comes straight from that same list — no need to wait on the async
+  // detectReactMajorVersion() result (computed independently below) just to tag the retrieval.
+  const dependencies = extractModuleSpecifiersWithNames(sourceCode)
+    .map(s => s.path)
+    .filter(p => !p.startsWith('.') && !p.startsWith('/'))
+  const framework = dependencies.some(d => d === 'react' || d.startsWith('react-')) ? 'react' : null
+
+  const [packageDeps, tsconfigPaths, typeDefinitions, localImportPaths, localImportContents, reactMajorVersion, memory] = await Promise.all([
     readPackageDeps(cwd),
     readTsconfigPaths(cwd),
     collectTypeDefinitions(sourceCode, absoluteSource, cwd),
     collectLocalImportPaths(sourceCode, absoluteSource, suggestedTestFile, cwd),
     collectUsedSymbolsContext(sourceCode, absoluteSource, cwd),
     detectReactMajorVersion(cwd),
+    config
+      ? buildMemoryContextWithEntries(config, { testRunner: env.testRunner, framework, dependencies })
+      : Promise.resolve({ context: null, entries: [] }),
   ])
 
   return {
@@ -1136,5 +1173,7 @@ export async function buildFileContext(
     localImportPaths,
     localImportContents,
     reactMajorVersion,
+    memoryContext: memory.context,
+    memoryEntries: memory.entries,
   }
 }

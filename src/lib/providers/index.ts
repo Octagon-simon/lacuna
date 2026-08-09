@@ -7,7 +7,10 @@ export { PRESETS } from './types.js'
 export type { ModelProvider, ChatMessage, ProviderPreset } from './types.js'
 
 export function createProvider(config: LacunaConfig): ModelProvider {
-  const apiKey = config.apiKeyEnv ? (process.env[config.apiKeyEnv] ?? '') : ''
+  // Prefer a runtime key supplied by an embedding host (config.apiKey — e.g. the VS Code
+  // extension's SecretStorage value) over the env var. `||` (not `??`) so an empty/absent
+  // runtime key cleanly falls through to process.env, keeping the CLI path byte-identical.
+  const apiKey = config.apiKey || (config.apiKeyEnv ? (process.env[config.apiKeyEnv] ?? '') : '')
 
   if (config.provider === 'anthropic') {
     if (!apiKey) {

@@ -1,0 +1,30 @@
+{
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "target": "ES2022",
+    "lib": ["ES2022"],
+    "outDir": "out",
+    "rootDir": "src",
+    "baseUrl": ".",
+    "paths": {
+      // Import the embedded lacuna core by a stable name; it resolves to the sibling package's
+      // built output. esbuild.mjs mirrors this alias so the bundle picks up the same target.
+      // No npm install of the parent is needed (which would re-trigger its build) — we consume
+      // the committed dist directly.
+      "lacuna-cli": ["../dist/index.d.ts"],
+      // Direct path to the scaffold module for the standalone out/scaffold.js bundle (keeps it small).
+      "lacuna-scaffold": ["../dist/lib/scaffold.d.ts"]
+    },
+    "sourceMap": true,
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "out"]
+}

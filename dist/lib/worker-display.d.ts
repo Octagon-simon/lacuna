@@ -22,6 +22,9 @@ export type WorkerState = {
     phase: 'regenerating';
     file: string;
 } | {
+    phase: 'fixing';
+    file: string;
+} | {
     phase: 'passed';
     file: string;
 } | {

@@ -4,7 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>lacuna — AI-powered test coverage</title>
-  <meta name="description" content="Lacuna finds coverage gaps, writes tests with AI, runs them, and retries until they pass. Powered by DeepSeek by default — fast, cheap, and no rate-limit headaches. Also works with Claude, GPT-4o, Gemini, and any local model." />
+  <meta name="description" content="Lacuna finds coverage gaps, writes tests with AI, runs them, and retries until they pass — from the CLI or right inside VS Code. Powered by DeepSeek by default — fast, cheap, and no rate-limit headaches. Also works with Claude, GPT-4o, Gemini, and any local model." />
+  <link rel="icon" type="image/png" href="lacuna-logo-128.png" />
+  <link rel="apple-touch-icon" href="lacuna-logo.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
@@ -495,6 +497,18 @@
     .footer-copy { color: var(--text-3); font-size: 0.75rem; }
 
     /* ── RESPONSIVE ───────────────────────────────────── */
+    /* Two-column "get started in the editor" block — collapses to one column on narrow screens. */
+    .two-col-start {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 5rem;
+      align-items: start;
+      margin-top: 4rem;
+    }
+    @media (max-width: 800px) {
+      .two-col-start { grid-template-columns: 1fr; gap: 3rem; }
+    }
+
     @media (max-width: 640px) {
       nav { padding: 0 1.25rem; }
       .nav-links a:not(.btn-nav) { display: none; }
@@ -511,10 +525,11 @@
 
 <!-- ── NAV ─────────────────────────────────────────────── -->
 <nav>
-  <a href="/" class="nav-logo">la<span>cuna</span></a>
+  <a href="/" class="nav-logo"><img src="lacuna-logo-128.png" alt="" width="24" height="24" style="border-radius:6px;" />la<span>cuna</span></a>
   <div class="nav-links">
     <a href="#features">Features</a>
     <a href="#how">How it works</a>
+    <a href="#vscode">VS Code</a>
     <a href="#models">Models</a>
     <a href="https://github.com/Octagon-simon/lacuna" class="btn-nav" target="_blank" rel="noopener">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
@@ -528,7 +543,7 @@
 
   <h1>Stop writing tests.<br><span class="grad">Let AI cover the gaps.</span></h1>
 
-  <p>Lacuna finds your uncovered code, writes real tests with AI, runs them, and retries until they pass. Powered by DeepSeek by default — cheap enough to run on every PR.</p>
+  <p>Lacuna finds your uncovered code, writes real tests with AI, runs them, and retries until they pass — from the terminal or right inside <a href="#vscode" style="color:var(--purple);text-decoration:none;border-bottom:1px solid var(--border-2);">VS Code</a>. Powered by DeepSeek by default — cheap enough to run on every PR.</p>
 
   <div class="hero-actions">
     <div class="install-cmd" id="installCmd" onclick="copyInstall()">
@@ -798,6 +813,125 @@
 
 <hr class="divider" />
 
+<!-- ── VS CODE EXTENSION ─────────────────────────────────── -->
+<section id="vscode">
+  <div class="container">
+    <div style="display:flex;flex-direction:column;align-items:center;text-align:center;margin-bottom:3rem;">
+      <img src="lacuna-logo.png" alt="Lacuna extension" width="72" height="72" style="border-radius:18px;margin-bottom:1.25rem;box-shadow:0 8px 40px rgba(124,58,237,0.35);" />
+      <span class="model-badge badge-default" style="margin-bottom:1rem;">New</span>
+      <h2 class="section-title" style="margin-bottom:0.75rem;">Now inside your editor</h2>
+      <p class="section-sub" style="margin-bottom:0;">The same agent, embedded in VS Code (and Cursor, Windsurf, VSCodium). Right-click a file to generate or fix tests, watch a live progress panel, and review every change in a diff before it's kept — without ever leaving your editor.</p>
+    </div>
+
+    <div class="features-grid">
+      <div class="feature-card">
+        <div class="feature-icon icon-cyan">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        </div>
+        <h3>Right-click to generate or fix</h3>
+        <p>Right-click any source file → <strong>Generate Tests</strong>, or a failing test → <strong>Fix Tests</strong>. Run a whole folder at once, with parallel workers processing files concurrently.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-purple">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+        </div>
+        <h3>Live progress, with a real Stop</h3>
+        <p>A legible progress panel streams every phase — generating, running, retrying — plus request count and the learned rules in play. Hit <strong>Stop</strong> and the in-flight run aborts instantly.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-green">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="10"/></svg>
+        </div>
+        <h3>Nothing kept without review</h3>
+        <p>Every generated or fixed file opens in a diff you accept or reject. Shared mock files are always reviewed separately — a run never silently rewrites what the whole suite depends on.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-cyan">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+        </div>
+        <h3>Coverage gaps in the sidebar</h3>
+        <p>A sidebar tree lists every file below threshold or with no test — one click to generate. Uncovered lines are painted in the gutter of the file you're already looking at.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-purple">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 1 0 10 10H12V2z"/><path d="M12 2a10 10 0 0 1 10 10"/></svg>
+        </div>
+        <h3>Learned rules, browsable</h3>
+        <p>Lacuna's confidence-weighted memory of framework quirks and mock patterns is browsable in its own view — sort by confidence, and flag a rule that stops helping.</p>
+      </div>
+
+      <div class="feature-card">
+        <div class="feature-icon icon-green">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        </div>
+        <h3>Your key stays yours</h3>
+        <p>Your API key is stored in the OS keychain (VS Code SecretStorage), never written to <code style="font-family:'JetBrains Mono',monospace;color:var(--cyan);font-size:0.8em">.lacuna.json</code>. Every run is confirmed and metered up front.</p>
+      </div>
+    </div>
+
+    <div class="two-col-start">
+      <div>
+        <h2 class="section-title" style="font-size:1.6rem;">Get started in the editor</h2>
+        <p class="section-sub" style="margin-bottom:2rem;">Same <code style="font-family:'JetBrains Mono',monospace;color:var(--cyan);font-size:0.85em">.lacuna.json</code>, same models — a UI instead of a terminal.</p>
+        <div class="steps">
+          <div class="step">
+            <div class="step-num">1</div>
+            <div class="step-content">
+              <h3>Install from the Marketplace</h3>
+              <p>Search <strong>“Lacuna”</strong> in the Extensions view, or install the <code style="font-family:'JetBrains Mono',monospace;color:var(--cyan);font-size:0.8em">.vsix</code>. Works in VS Code and the Open VSX editors (Cursor, Windsurf, VSCodium).</p>
+            </div>
+          </div>
+          <div class="step-connector"></div>
+          <div class="step">
+            <div class="step-num">2</div>
+            <div class="step-content">
+              <h3>Set up &amp; add your key</h3>
+              <p>Run <strong>Lacuna: Set Up</strong> to create <code style="font-family:'JetBrains Mono',monospace;color:var(--cyan);font-size:0.8em">.lacuna.json</code>, then <strong>Lacuna: Set API Key</strong> — stored securely in your OS keychain.</p>
+            </div>
+          </div>
+          <div class="step-connector"></div>
+          <div class="step">
+            <div class="step-num">3</div>
+            <div class="step-content">
+              <h3>Right-click → Generate</h3>
+              <p>Pick a source file or a whole folder. Watch the live panel, then accept the diff. Below-threshold files show up in the Coverage Gaps sidebar too.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="code-block">
+          <div><span class="cm"># the extension embeds the same core —</span></div>
+          <div><span class="cm"># nothing to install globally, no shelling out</span></div>
+          <div>&nbsp;</div>
+          <div><span class="cm"># from the Command Palette (⌘⇧P):</span></div>
+          <div><span class="kw">Lacuna:</span> Set Up</div>
+          <div><span class="kw">Lacuna:</span> Set API Key</div>
+          <div><span class="kw">Lacuna:</span> Generate Tests</div>
+          <div><span class="kw">Lacuna:</span> Fix Failing Tests</div>
+          <div><span class="kw">Lacuna:</span> Toggle Auto Mode</div>
+          <div>&nbsp;</div>
+          <div><span class="cm"># or just right-click a file / folder</span></div>
+          <div>&nbsp;</div>
+          <div><span class="cm"># editor-only settings (VS Code settings)</span></div>
+          <div>{</div>
+          <div style="padding-left:1rem;"><span class="str">"lacuna.workers"</span>: <span class="kw">4</span>,&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <span class="cm">// parallel folder runs</span></div>
+          <div style="padding-left:1rem;"><span class="str">"lacuna.alwaysVerbose"</span>: <span class="kw">true</span>,</div>
+          <div style="padding-left:1rem;"><span class="str">"lacuna.confirmBeforeRun"</span>: <span class="kw">true</span></div>
+          <div>}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<hr class="divider" />
+
 <!-- ── CTA ───────────────────────────────────────────────── -->
 <section id="cta">
   <div class="cta-inner">
@@ -814,8 +948,9 @@
 
 <!-- ── FOOTER ─────────────────────────────────────────────── -->
 <footer>
-  <a href="/" class="footer-logo">la<span>cuna</span></a>
+  <a href="/" class="footer-logo"><img src="lacuna-logo-128.png" alt="" width="22" height="22" style="border-radius:6px;vertical-align:middle;margin-right:6px;" />la<span>cuna</span></a>
   <div class="footer-links">
+    <a href="#vscode">VS Code</a>
     <a href="https://github.com/Octagon-simon/lacuna" target="_blank" rel="noopener">GitHub</a>
     <a href="https://github.com/Octagon-simon/lacuna#readme" target="_blank" rel="noopener">Docs</a>
     <a href="https://www.npmjs.com/package/lacuna-cli" target="_blank" rel="noopener">npm</a>

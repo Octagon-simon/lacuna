@@ -24,14 +24,14 @@ export const ConfigSchema = z.object({
         .describe('Optional explicit test directory. Rarely needed — test locations are auto-detected.'),
     ignore: z.array(z.string()).default([])
         .describe('Path substrings to exclude from gap detection, e.g. ["src/graphql/", "src/theme/"].'),
-    mocksFile: z.string().optional()
-        .describe('Path to a shared mock file every generated test imports from, e.g. "src/test/mocks.ts".'),
+    mocksFile: z.union([z.string(), z.array(z.string())]).optional()
+        .describe('Path to a shared mock file every generated test imports from, e.g. "src/test/mocks.ts". Pass an array to split mocks across multiple files, e.g. ["src/test/mocks.ts", "src/test/mocks.external.ts"] — the FIRST entry is the primary file (the AI creates/patches new mocks there); the rest are shown read-only as additional import sources.'),
     setupFile: z.string().optional()
         .describe('Path to your test setup file. Its contents are shown to the AI so it knows which globals/matchers exist.'),
     provider: z.enum(['anthropic', 'openai-compatible']).default('openai-compatible')
         .describe('AI provider. "anthropic" uses the Anthropic SDK; "openai-compatible" covers DeepSeek, OpenAI, Groq, OpenRouter, Ollama, etc.'),
-    model: z.string().default('deepseek-chat')
-        .describe('Model name, e.g. "deepseek-chat", "claude-sonnet-4-6", "gpt-4o".'),
+    model: z.string().default('deepseek-v4-flash')
+        .describe('Model name, e.g. "deepseek-v4-flash", "claude-sonnet-4-6", "gpt-4o".'),
     baseURL: z.string().default('https://api.deepseek.com/v1')
         .describe('API base URL. Required for the "openai-compatible" provider.'),
     apiKeyEnv: z.string().default('DEEPSEEK_API_KEY')
@@ -48,7 +48,29 @@ export const ConfigSchema = z.object({
         .describe('Run the project\'s local eslint --fix and prettier on each generated/fixed test file before declaring success, so output matches your repo style and passes lint. Best-effort; set false to disable.'),
     nodeEnvRouting: z.boolean().default(true)
         .describe('For DOM-free generated tests (services, utils, validators) in a jsdom project, add a `@vitest-environment node` / `@jest-environment node` docblock so the file skips jsdom startup and runs much faster. Verified per-file (reverted if it breaks the test). Set false to disable.'),
+    memory: z.object({
+        enabled: z.boolean().default(true)
+            .describe('Retrieve and persist learned rules (framework conventions, mock patterns, error→fix mappings) in a structured memory store, so prompts pull in only what\'s relevant instead of static "just in case" context. Set false to disable.'),
+        distill: z.boolean().default(true)
+            .describe('When a fix is learned for the first time, make one small model call to turn it into a cleaner rule than the raw mechanical diff. Set false to skip the extra call and keep the mechanical version.'),
+    }).default({})
+        .describe('Structured memory store (~/.lacuna/memory, shared across every project on this machine) for learned test-generation/fix rules — retrieved per file/error instead of statically stuffing every prompt with the same rules.'),
 });
+// The hard upper bound on attempts per file. The loops start at config.maxIterations but extend up
+// to this ceiling while each attempt keeps fixing a distinct new error (convergence-based budget —
+// see loop.ts/fix-loop.ts). Single source of truth so the CLI, both loops, and the extension's
+// worst-case cost disclosure all agree.
+export function iterationCeiling(maxIterations) {
+    return maxIterations * 2;
+}
+// Normalizes config.mocksFile (string | string[] | undefined) to an array. The first entry
+// is always the primary/writable mocks file; any further entries are read-only reference
+// files shown to the AI so it can import from them without a way to accidentally patch them.
+export function mocksFileList(config) {
+    if (!config.mocksFile)
+        return [];
+    return Array.isArray(config.mocksFile) ? config.mocksFile : [config.mocksFile];
+}
 const explorer = cosmiconfig('lacuna', {
     searchPlaces: [
         'package.json',
@@ -60,6 +82,12 @@ const explorer = cosmiconfig('lacuna', {
         'lacuna.config.js',
         'lacuna.config.cjs',
     ],
+    // Disable cosmiconfig's default result cache. The CLI is a fresh process per invocation so caching
+    // never mattered there, but an EMBEDDER (the VS Code extension) is long-lived: with the cache on,
+    // the first loadConfig(cwd) result is pinned for the life of the extension host, so every later run
+    // reuses a stale config — edits to .lacuna.json (model, provider, threshold, anything) are ignored
+    // until a window reload. cache:false makes each loadConfig re-read the file from disk.
+    cache: false,
 });
 // Applies a -m / --model flag to the config. If the value matches a preset key
 // (e.g. "gemini") or a preset model name (e.g. "gemini-2.5-pro"), the full preset

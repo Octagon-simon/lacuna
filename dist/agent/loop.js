@@ -2,6 +2,7 @@ import { writeFile, mkdir, readFile, unlink, mkdtemp, rm } from 'fs/promises';
 import { tmpdir } from 'os';
 import { dirname, join, isAbsolute, relative } from 'path';
 import chalk from 'chalk';
+import { mocksFileList, iterationCeiling } from '../lib/config.js';
 import { scopedCoverageCommand, relatedCoverageCommand } from '../lib/detector.js';
 import { resolveFileTestRun, resolveIncrementalCoverageRun, resolveEnvForFile, resolveEnvForDir } from '../lib/test-run.js';
 import { runCommand } from '../lib/runner.js';
@@ -10,16 +11,19 @@ import { resolveDiffScope, scopeDiffToDir } from '../lib/git-diff.js';
 import { WorkerDisplay } from '../lib/worker-display.js';
 import { startCoverageSpinner } from '../lib/coverage-spinner.js';
 import { buildFileContext, findExistingTestFile } from './context.js';
-import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js';
+import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, ModelRateLimitError, ModelCancelledError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE } from './generator.js';
 import { ProjectMemory } from './project-memory.js';
+import { buildFixMemoryHint, recordFixOutcome, recordTagMatchOutcome, normalizeErrorSignature, errorSignatureHash } from '../lib/memory/index.js';
+import { fixMocksFilesUpfront } from './mocks-fix.js';
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js';
 import { typeCheckFile, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js';
 import { formatFile } from '../lib/format.js';
 import { routeTestToNodeEnv } from '../lib/env-route.js';
 import { detectWeakAsyncWait } from './prompts/index.js';
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, processExitLeakGuidance, sanitizeMocksContent, stripLeadingProse, mergeMocksContent, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, dedupeImports, dedupeTestBlocks, replaceUnsafeFunctionType, tryApplyPatchWithDiag, tryApplyMocksPatch } from '../lib/validate.js';
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, buildStructureBrokenMessage, buildRegressionMessage, processExitLeakGuidance, sanitizeMocksContent, detectUnbalancedMocksSyntax, stripLeadingProse, mergeMocksContent, dedupeMockExports, countTestCases, withMocksLock, detectMocksFileError, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, fixNeverTypedAsyncMocks, dedupeImports, dedupeTestBlocks, replaceUnsafeFunctionType, tryApplyPatchWithDiag, tryApplyMocksPatch, detectProcessCrash, buildProcessCrashMessage, detectUnrelatedFileCrash, buildPatchEscalationMessage, buildFailingTestChecklist, detectStrayPatchMarkers, detectOpenHandleLeak, buildOpenHandleLeakMessage, detectJestConfigConflict, detectJestValidationError, subjectFromTestPath, referencesSubject } from '../lib/validate.js';
 import { extractTestFailure } from '../lib/extract-error.js';
 import { StreamingFileViewer } from '../lib/streaming-viewer.js';
+import { fixFile } from './fix-loop.js';
 async function getCoverageRate(config, cwd) {
     try {
         const report = await loadCoverage(config, cwd);
@@ -30,7 +34,7 @@ async function getCoverageRate(config, cwd) {
     }
 }
 export async function processGap(gap, options, generator, parallel, onStatus, projectMemory, overrideTestFile) {
-    const { config, env, cwd, dryRun, verbose, log } = options;
+    const { config, env, cwd, dryRun, verbose, log, fixOnFailure = true } = options;
     const shortPath = gap.filePath.replace(cwd + '/', '');
     if (!onStatus) {
         log(chalk.bold(`\n  Processing: ${chalk.cyan(shortPath)}`));
@@ -57,6 +61,13 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
         context.existingTestCode = null;
         context.existingTestFile = null;
     }
+    // Surface the learned rules this file's prompt was enriched with (proactive tag-matched
+    // memory) as a structured event — otherwise which rules were in play is invisible outside
+    // the raw debug log. Inert for the CLI (options.onEvent unset); no-op when memory retrieved
+    // nothing.
+    if (context.memoryEntries.length > 0) {
+        options.onEvent?.({ type: 'memory-used', file: shortPath, entries: context.memoryEntries.map((e) => e.id) });
+    }
     if (!onStatus) {
         log(chalk.dim(`  ${context.existingTestFile ? 'Updating' : 'Creating'}: ${context.suggestedTestFile.replace(cwd + '/', '')}`));
     }
@@ -69,6 +80,9 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
     // whatever runner actually executes this file, not the repo-wide default the generator/worker
     // was constructed with.
     generator.setEnv(await resolveEnvForFile(env, context.suggestedTestFile, cwd));
+    // Forward the embedder "Stop" signal so an in-flight generation is aborted, not just halted
+    // between attempts.
+    generator.setAbortSignal(options.abortSignal);
     // Capture pre-existing test file so we can restore on failure
     let originalTestContent = null;
     if (!dryRun) {
@@ -77,22 +91,68 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
         }
         catch { /* new file */ }
     }
+    // Two separate write-backs, both no-op (never throw) when memory is disabled:
+    // 1. The "fixes" category only makes sense once there was a REAL failure to key it against
+    //    (firstError, set on attempt 1) — a file whose first attempt just passed outright has no
+    //    error signature to record a fix for.
+    // 2. The tag-matched (mocks/frameworks) entries shown proactively via context.memoryEntries —
+    //    these get their confidence bumped/decayed on the file's overall outcome regardless of
+    //    whether a "fixes" entry also applies, since they were shown on attempt 1 either way.
+    const recordFixMemory = async (outcome, finalCode) => {
+        if (!config.memory.enabled)
+            return;
+        await Promise.all([
+            firstError !== null
+                ? recordFixOutcome(config, {
+                    errorSignature: firstError,
+                    tags: [env.testRunner, ...(context.reactMajorVersion !== null ? ['react'] : [])],
+                    outcome,
+                    diffBefore: originalTestContent,
+                    diffAfter: finalCode,
+                }).catch(() => { })
+                : Promise.resolve(),
+            context.memoryEntries.length > 0
+                ? recordTagMatchOutcome(config, context.memoryEntries, firstError, outcome === 'success' ? null : lastError).catch(() => { })
+                : Promise.resolve(),
+        ]);
+    };
     let generatedCode = null;
     let lastError = null;
     // One-shot: a green-but-racy "weak wait" test is invisible to the run-loop, so we nudge the
     // model to strengthen it once. If it still trips after the nudge we accept the file rather than
     // burn every iteration on a heuristic that might be a false positive.
     let weakWaitNudged = false;
+    // One-shot: a leaked timer/handle still lets tests pass (invisible to pass/fail classification)
+    // but makes Jest force-exit — nudge the model to add cleanup once, then accept-with-warning.
+    let openHandleNudged = false;
     let firstError = null; // error from attempt 1, kept as anchor for regressions
     let firstPassCount = 0; // passing tests on attempt 1
+    // Retrieved memory for the attempt-1 failure, computed ONCE (not per retry — see fix-loop.ts's
+    // identical fixMemoryHint for why) and reused verbatim on every subsequent retry.
+    let fixMemoryHint = null;
     let stallRetries = 0;
     const MAX_STALL_RETRIES = 2;
+    let rateLimitRetries = 0;
+    const MAX_RATE_LIMIT_RETRIES = 4;
     let consecutivePatchFailures = 0;
+    // Live-observed on kabocash-mobile-RN-expo: an infrastructure-level crash (Expo's
+    // ExpoFetchModule polyfill, no native runtime under Jest) hit 53/66 files identically, and
+    // this loop burned its FULL config.maxIterations on every single one — no test-file edit could
+    // ever fix a crash that happens before any test runs. Mirrors the identical guard added to
+    // fix-loop.ts's retry loop; needed HERE too since this loop is shared by both `generate` and
+    // regenerateFile()'s fallback (fix.ts's second-opinion rewrite also runs through here).
+    let consecutiveUnrelatedFileCrashes = 0;
     // Best collecting attempt seen so far — used on failure to keep a net-improving partial
     // result (which `lacuna fix` can finish) instead of discarding work. Only attempts that
     // actually collected tests qualify, so a fence-broken / 0-test file is never kept.
     let bestCode = null;
     let bestPassCount = -1;
+    // Mirror bestCode/lastCode's own run results, so a fixOnFailure handoff can hand fixFile the
+    // EXACT result for whatever content is actually on disk right now, instead of fixFile blindly
+    // re-running a test we just ran ourselves seconds ago (a real, avoidable duplicate execution
+    // on every handoff — see fixFile's precomputedFirstRun doc comment).
+    let bestRunResult = null;
+    let lastRunResult = null;
     // The most recent attempt whose TESTS PASSED but left TypeScript type errors (which is why the
     // loop kept going). generate's contract is green tests, so this file is a keeper — if the loop
     // then oscillates or exhausts retries on the type-only repair, we keep THIS instead of deleting
@@ -103,14 +163,44 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
     // earlier attempt anchors against the current file — not the frozen original (which would
     // fail with "anchor not found").
     let patchBase = context.existingTestCode;
-    for (let attempt = 1; attempt <= config.maxIterations; attempt++) {
+    // Convergence-based iteration budget — see fixFile's identical block for the full rationale. As
+    // long as each attempt resolves its problem and surfaces a genuinely NEW one (a new normalized
+    // error signature, not a repeat/oscillation), extend the budget one attempt at a time up to
+    // ITERATION_CEILING; the moment an error repeats, growth stops and the flat cap resumes.
+    let effectiveMax = config.maxIterations;
+    const ITERATION_CEILING = iterationCeiling(config.maxIterations);
+    const seenErrorSigs = new Set();
+    for (let attempt = 1; attempt <= effectiveMax; attempt++) {
+        // Cancellation (embedder "Stop"): checked before every attempt so a stop lands within the
+        // current attempt rather than only between files — a single-file run has no between-files
+        // boundary, which is why Stop appeared to do nothing. Breaks out with the best kept so far.
+        if (options.shouldContinue && !options.shouldContinue()) {
+            onStatus?.({ phase: 'failed', file: shortPath });
+            return { success: false, error: 'Stopped by user.' };
+        }
+        // Progress check: `lastError` is the problem THIS attempt will fix (the previous attempt's
+        // result). A new signature means the last attempt made forward progress — keep the budget one
+        // ahead of the current attempt (never below the base cap, never above the ceiling).
+        if (attempt > 1 && lastError) {
+            const sig = errorSignatureHash(normalizeErrorSignature(lastError));
+            if (!seenErrorSigs.has(sig)) {
+                seenErrorSigs.add(sig);
+                if (effectiveMax < ITERATION_CEILING) {
+                    const extended = Math.min(ITERATION_CEILING, Math.max(effectiveMax, attempt + 1));
+                    if (extended > effectiveMax && !onStatus) {
+                        log(chalk.dim(`  Still making progress (new issue each pass) — extending to attempt ${extended}/${ITERATION_CEILING}.`));
+                    }
+                    effectiveMax = extended;
+                }
+            }
+        }
         if (!onStatus) {
             if (attempt > 1) {
                 // Word the header by the actual reason for this retry. After a type-check
                 // failure the tests already PASS — calling it "fixing failures" is misleading.
                 const fixingTypes = lastError?.startsWith('Tests passed but TypeScript type errors');
                 const what = fixingTypes ? 'fixing type errors (tests pass)' : 'fixing failures';
-                log(chalk.yellow(`\n  Retry ${attempt}/${config.maxIterations} — ${what}...`));
+                log(chalk.yellow(`\n  Retry ${attempt}/${effectiveMax} — ${what}...`));
             }
         }
         // Show waiting phase before the model call; transition to generating/retrying on first token
@@ -120,7 +210,7 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
             onStatus?.({
                 phase: currentAttempt === 1 ? 'generating' : 'retrying',
                 file: shortPath,
-                ...(currentAttempt > 1 ? { attempt: currentAttempt, max: config.maxIterations } : {}),
+                ...(currentAttempt > 1 ? { attempt: currentAttempt, max: effectiveMax } : {}),
             });
         });
         if (!onStatus)
@@ -131,15 +221,28 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
             generator.setTokenCallback(t => viewer.append(t));
             viewer.start();
         }
+        // If the diagnostic actually points at the shared mocks file rather than this test file,
+        // rewriting the test file can never fix it — say so explicitly rather than let the model
+        // burn every retry re-editing a file that was never broken. See fix-loop.ts's identical
+        // guard for the fuller rationale.
+        const mocksFileBanner = lastError ? detectMocksFileError(lastError, mocksFileList(config)) : null;
+        const promptLastError = lastError == null
+            ? null
+            : [lastError, mocksFileBanner, fixMemoryHint ? `\n\n${fixMemoryHint}` : null].filter(Boolean).join('');
         try {
             generatedCode = attempt === 1
                 ? await generator.generate(context, gap, projectMemory)
-                : await generator.retry(lastError ?? '');
+                : await generator.retry(promptLastError ?? '', lastError ?? '');
         }
         catch (err) {
             viewer?.stop();
             generator.setTokenCallback(undefined);
             generator.setFirstTokenCallback(undefined);
+            // User pressed Stop mid-generation — abort immediately, no retry.
+            if (err instanceof ModelCancelledError) {
+                onStatus?.({ phase: 'failed', file: shortPath });
+                return { success: false, error: 'Stopped by user.' };
+            }
             if (err instanceof ModelStallError) {
                 if (stallRetries < MAX_STALL_RETRIES) {
                     stallRetries++;
@@ -151,18 +254,32 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
                     continue;
                 }
             }
+            // See fix-loop.ts's identical branch: a capacity rejection (429/5xx/"overloaded") isn't
+            // this file's fault, so back off with jitter and retry instead of failing it outright.
+            if (err instanceof ModelRateLimitError) {
+                if (rateLimitRetries < MAX_RATE_LIMIT_RETRIES) {
+                    rateLimitRetries++;
+                    const delayMs = 2000 * 2 ** (rateLimitRetries - 1) + Math.floor(Math.random() * 1000);
+                    if (!onStatus)
+                        log(chalk.yellow(`\n  ⌛ Provider is rate-limited/overloaded — backing off ${Math.round(delayMs / 1000)}s (${rateLimitRetries}/${MAX_RATE_LIMIT_RETRIES})...`));
+                    onStatus?.({ phase: 'waiting', file: shortPath, since: Date.now() });
+                    await new Promise(r => setTimeout(r, delayMs));
+                    attempt--; // don't consume an AI iteration for a capacity rejection
+                    continue;
+                }
+            }
             if (err instanceof TruncatedOutputError) {
                 lastError = TRUNCATION_RETRY_MESSAGE;
                 if (!onStatus)
                     log(chalk.yellow(`\n  Output truncated — retrying with shorter output request...`));
-                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
                 continue;
             }
             if (err instanceof OscillationError) {
-                if (attempt < config.maxIterations) {
+                if (attempt < effectiveMax) {
                     if (!onStatus)
                         log(chalk.yellow(`\n  ⚠ Agent loop detected — retrying with different strategy...`));
-                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
                     generator.resetOscillationState();
                     lastError = OSCILLATION_ESCAPE_MESSAGE;
                     continue;
@@ -180,6 +297,7 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
                     if (!onStatus)
                         log(chalk.yellow(`  ⚠ Type errors remain — tests pass. Kept the file; run ${chalk.cyan(`lacuna fix --file ${relTest}`)} to clean up types.`));
                     onStatus?.({ phase: 'passed', file: shortPath });
+                    await recordFixMemory('success', acceptedPassingCode);
                     return { success: true, testCode: acceptedPassingCode };
                 }
                 // No green attempt — fall through to the keep-best finalization, which preserves a new
@@ -190,8 +308,12 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
             const msg = err instanceof Error ? err.message : String(err);
             if (!onStatus)
                 log(chalk.red(`\n  API error: ${msg}`));
-            onStatus?.({ phase: 'failed', file: shortPath });
-            return { success: false, error: msg };
+            // Fall through to the keep-best finalization (and fix-specialist handoff) instead of an
+            // immediate return — a prior iteration may have already collected passing tests (bestCode)
+            // before THIS iteration's raw API error, and that's still worth keeping/handing off rather
+            // than discarding outright. Mirrors the identical OscillationError fall-through above.
+            lastError = msg;
+            break;
         }
         viewer?.stop();
         generator.setTokenCallback(undefined);
@@ -206,12 +328,57 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
             onStatus?.({ phase: 'passed', file: shortPath });
             return { success: true, testCode: generatedCode };
         }
-        // Patch mode: model returned surgical edits — apply them to get the complete file
-        if (generator.isPatch && patchBase) {
+        // Patch mode: model returned surgical edits — apply them to get the complete file.
+        // patchBase is null on the very first attempt at a BRAND-NEW test file (nothing exists yet
+        // to patch against) — if the model still emits patch-op syntax there, that's always a model
+        // error, never a legitimate patch. Route it into the same failure path as an unresolved
+        // anchor (bump consecutivePatchFailures, retry with guidance) instead of silently falling
+        // through: skipping validation here let raw, un-applied patch text — including a garbled
+        // patch missing its // @@@ REPLACE: header, just a stray // @@@ WITH: marker sandwiched
+        // between the old and new blocks — get written to disk verbatim as the "generated" file.
+        if (generator.isPatch && !patchBase) {
+            consecutivePatchFailures++;
+            lastError =
+                `PATCH APPLICATION FAILED: you used a // @@@ patch (REPLACE_TEST/DELETE_TEST/ADD_AFTER_DESCRIBE/REPLACE) but this test file does not exist yet — there is nothing to patch.\n` +
+                    `Use <code_output> (NOT <code_patch>) and write the COMPLETE new test file from scratch.`;
+            if (!onStatus)
+                log(chalk.yellow(`  Patch mode used for a new file — retrying with full-file output...`));
+            onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
+            continue;
+        }
+        else if (generator.isPatch && patchBase) {
             const patchResult = tryApplyPatchWithDiag(patchBase, generatedCode);
             if (patchResult.ok) {
+                const baseTestCount = countTestCases(patchBase);
+                const resultTestCount = countTestCases(patchResult.result);
+                if (resultTestCount < baseTestCount) {
+                    // The patch applied cleanly but net-deletes tests — DELETE_TEST is for genuinely
+                    // obsolete tests, not an anchor-mismatch escape hatch (observed: a model stuck on
+                    // repeated "anchor not found" reaching for DELETE_TEST on ~18 valid tests just to get
+                    // SOME op in its patch to succeed). Reject and retry rather than silently shipping a
+                    // file with fewer tests than it started with.
+                    consecutivePatchFailures++;
+                    if (consecutivePatchFailures >= 2) {
+                        lastError = buildPatchEscalationMessage(consecutivePatchFailures, 'repeatedly deleting tests instead of fixing the anchor');
+                        generator.setPatchMode(false);
+                    }
+                    else {
+                        lastError =
+                            `PATCH REJECTED: this patch removes ${baseTestCount - resultTestCount} test case(s) (${baseTestCount} → ${resultTestCount}) without adding replacements.\n` +
+                                `DELETE_TEST is only for tests that are genuinely obsolete (e.g. testing removed behavior) — never use it to work around a REPLACE/anchor mismatch.\n` +
+                                `Re-read the test file and fix the actual anchor problem, or add new tests covering what you removed.`;
+                    }
+                    if (!onStatus)
+                        log(chalk.yellow(`  ⚠ Patch deletes ${baseTestCount - resultTestCount} test(s) — rejecting and retrying...`));
+                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
+                    continue;
+                }
+                // NOTE: consecutivePatchFailures is NOT reset here — a clean anchor application only
+                // means the patch STRUCTURALLY applied, not that the resulting code actually compiles or
+                // collects tests. It's reset below, in the post-run classification, only once the test
+                // run itself confirms the file is structurally intact (not 0-tests-collected) — see the
+                // identical reasoning where that reset now lives.
                 generatedCode = patchResult.result;
-                consecutivePatchFailures = 0;
             }
             else {
                 consecutivePatchFailures++;
@@ -241,11 +408,25 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
                 }
                 if (!onStatus)
                     log(chalk.yellow(`  Patch anchors not found — retrying...`));
-                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
                 continue;
             }
         }
         else if (!generator.isPatch) {
+            // A full <code_output> rewrite should never contain lacuna's OWN internal <code_patch>
+            // delimiter syntax — found leaking into a real full-file response (the model's own prior
+            // patch attempt, still sitting in conversation history, got copied verbatim into a later
+            // full rewrite). Reject and retry rather than silently write corrupted content to disk.
+            if (detectStrayPatchMarkers(generatedCode)) {
+                consecutivePatchFailures++;
+                lastError =
+                    'STRAY PATCH-FORMAT MARKERS DETECTED in your full-file output — this response contains literal "// @@@ REPLACE:"/"// @@@ WITH:"/"// @@@ END" text, which is lacuna\'s internal <code_patch> syntax, not valid code.\n' +
+                        'Do NOT copy patch-format text from an earlier attempt into a full <code_output> rewrite — write ONLY real, complete TypeScript, with no "// @@@" markers anywhere.';
+                if (!onStatus)
+                    log(chalk.yellow(`  ⚠ Stray patch-format markers found in full-file output — rejecting and retrying...`));
+                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
+                continue;
+            }
             // Model switched to (or stayed in) full-file mode — reset patch failure counter
             consecutivePatchFailures = 0;
         }
@@ -260,36 +441,58 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
         const MOCKS_SEPARATOR = '// ---MOCKS_FILE---';
         const MOCKS_PATCH_SEPARATOR = '// ---MOCKS_PATCH---';
         let testCode = generatedCode;
-        if (generatedCode.includes(MOCKS_PATCH_SEPARATOR) && config.mocksFile) {
+        // Set when a mocks patch fails to apply — appended to whatever lastError the test-file run
+        // itself produces below, rather than discarding the whole attempt via `continue`. See the
+        // identical note in fix-loop.ts for the full rationale: the test-file fix and the mocks-file
+        // patch are independent changes bundled into one response, and a stale anchor (common under
+        // `-w N` parallel workers, whose prompt was built from an earlier read of the shared file)
+        // shouldn't throw away a genuinely correct test-file fix sitting right next to it.
+        let mocksPatchFailureNote = null;
+        const primaryMocksFile = mocksFileList(config)[0];
+        if (generatedCode.includes(MOCKS_PATCH_SEPARATOR) && primaryMocksFile) {
             // Surgical patch mode: model only emits the changed sections
             const [newTestCode, patchContent] = generatedCode.split(MOCKS_PATCH_SEPARATOR);
             testCode = newTestCode.trim();
             if (patchContent?.trim()) {
-                const absoluteMocksFile = join(cwd, config.mocksFile);
-                let existing = '';
-                try {
-                    existing = await readFile(absoluteMocksFile, 'utf-8');
-                }
-                catch { /* new file — patch can't apply */ }
-                if (existing) {
-                    const applied = tryApplyMocksPatch(existing, patchContent.trim());
-                    if (applied) {
-                        if (applied.failedOps.length > 0) {
-                            const anchors = applied.failedOps.map(op => `"${op.oldText.slice(0, 60).replace(/\n/g, '↵')}"`).join(', ');
-                            lastError = `MOCKS PATCH FAILED: the following REPLACE anchor(s) were not found in the mock file:\n${anchors}\nAnchors must be copied character-for-character from the SHARED MOCK FILE shown above. Re-read it and rewrite your ---MOCKS_PATCH--- block.`;
-                            if (!onStatus)
-                                log(chalk.yellow(`  ⚠ Mock patch anchors not found — retrying...`));
-                            onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
-                            continue;
-                        }
-                        await writeFile(absoluteMocksFile, applied.result, 'utf-8');
+                const absoluteMocksFile = join(cwd, primaryMocksFile);
+                // Read + apply + write must be one atomic section under parallel workers — see
+                // withMocksLock.
+                const applied = await withMocksLock(async () => {
+                    let existing = '';
+                    try {
+                        existing = await readFile(absoluteMocksFile, 'utf-8');
+                    }
+                    catch { /* new file — patch can't apply */ }
+                    if (!existing)
+                        return null;
+                    const result = tryApplyMocksPatch(existing, patchContent.trim());
+                    if (result && result.failedOps.length === 0) {
+                        if (detectUnbalancedMocksSyntax(result.result))
+                            return { ...result, unbalanced: true };
+                        await writeFile(absoluteMocksFile, result.result, 'utf-8');
+                    }
+                    return result;
+                });
+                if (applied) {
+                    if ('unbalanced' in applied && applied.unbalanced) {
+                        mocksPatchFailureNote = `MOCKS PATCH REJECTED: applying it left the shared mock file with unbalanced braces/parens/brackets — it was NOT written to disk (this would have broken every test that imports it). Your patch content is likely truncated or incomplete. Re-emit the full, complete ---MOCKS_PATCH--- (or ---MOCKS_FILE--- for a full rewrite) with matching braces.`;
                         if (!onStatus)
-                            log(chalk.dim(`  Patched mocks file: ${config.mocksFile}`));
+                            log(chalk.red(`  ⚠ Mock patch would leave the shared file unbalanced — rejected, not written.`));
+                    }
+                    else if (applied.failedOps.length > 0) {
+                        const anchors = applied.failedOps.map(op => `"${op.oldText.slice(0, 60).replace(/\n/g, '↵')}"`).join(', ');
+                        mocksPatchFailureNote = `MOCKS PATCH FAILED: the following REPLACE anchor(s) were not found in the mock file:\n${anchors}\nAnchors must be copied character-for-character from the SHARED MOCK FILE shown above (re-read it — under parallel workers it may have changed since you last saw it). Re-read it and rewrite your ---MOCKS_PATCH--- block.`;
+                        if (!onStatus)
+                            log(chalk.yellow(`  ⚠ Mock patch anchors not found — proceeding with the test-file fix alone, will retry the mocks patch...`));
+                    }
+                    else {
+                        if (!onStatus)
+                            log(chalk.dim(`  Patched mocks file: ${primaryMocksFile}`));
                     }
                 }
             }
         }
-        else if (generatedCode.includes(MOCKS_SEPARATOR) && config.mocksFile) {
+        else if (generatedCode.includes(MOCKS_SEPARATOR) && primaryMocksFile) {
             // Full-rewrite mode (new mock file or explicit full replacement)
             const [newTestCode, newMocksCode] = generatedCode.split(MOCKS_SEPARATOR);
             testCode = newTestCode.trim();
@@ -298,23 +501,39 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
                 if (stripped && !onStatus)
                     log(chalk.yellow(`  ⚠ Mocks file contained test blocks — stripped before writing`));
                 if (safeMocks) {
-                    const absoluteMocksFile = join(cwd, config.mocksFile);
+                    const absoluteMocksFile = join(cwd, primaryMocksFile);
                     await mkdir(dirname(absoluteMocksFile), { recursive: true });
-                    let existing = '';
-                    try {
-                        existing = await readFile(absoluteMocksFile, 'utf-8');
+                    // Read + merge + dedupe + write as one atomic section — under parallel workers, two
+                    // workers reading the same pre-write content would otherwise each compute their own
+                    // merge and the second writer would silently discard the first worker's addition.
+                    const wasUnbalanced = await withMocksLock(async () => {
+                        let existing = '';
+                        try {
+                            existing = await readFile(absoluteMocksFile, 'utf-8');
+                        }
+                        catch { /* new file */ }
+                        const merged = dedupeMockExports(existing ? mergeMocksContent(existing, safeMocks) : safeMocks);
+                        if (detectUnbalancedMocksSyntax(merged))
+                            return true;
+                        await writeFile(absoluteMocksFile, merged, 'utf-8');
+                        return false;
+                    });
+                    if (wasUnbalanced) {
+                        mocksPatchFailureNote = `MOCKS FILE REJECTED: the rewritten mock file has unbalanced braces/parens/brackets — it was NOT written to disk (this would have broken every test that imports it). Your response is likely truncated (hit a length limit mid-function) or incomplete. Re-emit the complete mock file with every function body closed, or use ---MOCKS_PATCH--- for a smaller, surgical change instead of a full rewrite.`;
+                        if (!onStatus)
+                            log(chalk.red(`  ⚠ Mocks file rewrite would leave it unbalanced — rejected, not written.`));
                     }
-                    catch { /* new file */ }
-                    const merged = existing ? mergeMocksContent(existing, safeMocks) : safeMocks;
-                    await writeFile(absoluteMocksFile, merged, 'utf-8');
-                    if (!onStatus)
-                        log(chalk.dim(`  Updated mocks file: ${config.mocksFile}`));
+                    else {
+                        if (!onStatus)
+                            log(chalk.dim(`  Updated mocks file: ${primaryMocksFile}`));
+                    }
                 }
             }
         }
         testCode = deduplicateViMocks(testCode);
         testCode = typeImportOriginalCalls(testCode);
         testCode = ensureMockedImports(testCode);
+        testCode = fixNeverTypedAsyncMocks(testCode);
         testCode = dedupeImports(testCode);
         testCode = dedupeTestBlocks(testCode);
         testCode = replaceUnsafeFunctionType(testCode);
@@ -327,7 +546,24 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
                     'Rewrite the file and include real test cases.';
             if (!onStatus)
                 log(chalk.yellow(`  Generated file has no tests — retrying...`));
-            onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+            onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
+            continue;
+        }
+        // Subject-integrity: the generated test must actually test THIS source file (import + exercise
+        // it), not an easy imported utility. Without this a hard-to-mock hook/component gets "tested" by
+        // trivially testing a dependency (e.g. useForcedUpdate → compareVersions), which passes and gets
+        // kept. Gated on a specific (non-generic) subject name; the test's own import path from the
+        // source satisfies the reference, so ordinary multi-export util files are unaffected.
+        const genSubject = subjectFromTestPath(context.suggestedTestFile);
+        if (genSubject && !referencesSubject(testCode, genSubject)) {
+            lastError =
+                `ERROR: This test must test \`${genSubject}\` (the source file it is for), but your test never ` +
+                    `imports or references \`${genSubject}\` — you tested a DIFFERENT module (likely an imported ` +
+                    `dependency). Import \`${genSubject}\` from its source file and write tests that exercise IT. Do ` +
+                    `not test an imported helper as a substitute for the file under test.`;
+            if (!onStatus)
+                log(chalk.red(`  ⚠ Test doesn't test its subject (${genSubject}) — rejected, retrying...`));
+            onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
             continue;
         }
         onStatus?.({ phase: 'writing', file: shortPath });
@@ -340,6 +576,8 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
             log(chalk.dim(`  Written. Running tests...`));
         onStatus?.({ phase: 'running', file: shortPath });
         const runResult = await runCommand(testRun.command, testRun.cwd);
+        lastRunResult = runResult;
+        const rawRunOutput = runResult.stdout + '\n' + runResult.stderr;
         if (runResult.success) {
             // Reject placeholder test bodies — `{ // body }` passes vitest (no assertions)
             // but produces zero coverage value. Force a retry with an explicit error.
@@ -354,35 +592,48 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
                         'Replace every `// body` placeholder with real arrange-act-assert code.';
                 if (!onStatus)
                     log(chalk.yellow(`  Placeholder test bodies detected — retrying...`));
-                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
                 continue;
             }
             // Tests pass — but a "weak wait" (assert state right after a call-only waitFor) passes
             // locally and fails in slow CI. The run-loop can't see it (it's green), so scan statically
             // and nudge once. One-shot to bound the cost of a false positive.
-            if (!weakWaitNudged && attempt < config.maxIterations) {
+            if (!weakWaitNudged && attempt < effectiveMax) {
                 const weakWait = detectWeakAsyncWait(testCode);
                 if (weakWait) {
                     weakWaitNudged = true;
                     lastError = weakWait;
                     if (!onStatus)
                         log(chalk.yellow(`  Tests pass but an async wait looks racy — strengthening it (retrying)...`));
-                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
                     continue;
                 }
+            }
+            // Tests pass — but Jest had to force-exit on a leaked handle (interval/connection never
+            // cleared). Invisible to pass/fail classification (still green), so nudge once like the
+            // weak-wait check above, then accept-with-warning rather than loop on a possible false positive.
+            const openHandleLeak = detectOpenHandleLeak(rawRunOutput);
+            if (openHandleLeak && !openHandleNudged && attempt < effectiveMax) {
+                openHandleNudged = true;
+                acceptedPassingCode = testCode;
+                lastError = buildOpenHandleLeakMessage();
+                if (!onStatus)
+                    log(chalk.yellow(`  Tests pass but Jest force-exited on a leaked handle — fixing (retrying)...`));
+                onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
+                continue;
             }
             const typeErrors = await typeCheckFile(context.suggestedTestFile, cwd, env);
             // Inconclusive (tsc timed out/crashed) is not an actionable type error — the tests pass,
             // which is generate's contract, so don't burn a retry feeding the model a non-error.
             if (typeErrors && typeErrors !== TYPECHECK_INCONCLUSIVE) {
-                if (attempt < config.maxIterations) {
+                if (attempt < effectiveMax) {
                     // Green tests, only type errors remain — remember this file so an oscillation/exhaustion
                     // on the type repair keeps it rather than discarding a passing test.
                     acceptedPassingCode = testCode;
                     lastError = `Tests passed but TypeScript type errors were found in the generated file:\n${typeErrors}\n\nFix ALL type errors. Do not use 'as any' or '@ts-ignore'.`;
                     if (!onStatus)
                         log(chalk.yellow(`  Tests pass — fixing type errors (retrying)...`));
-                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: config.maxIterations });
+                    onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax });
                     continue;
                 }
                 // Last attempt — tests pass even though type errors remain.
@@ -395,6 +646,12 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
                 if (!onStatus)
                     log(chalk.green(`  Tests passed.`));
             }
+            if (openHandleLeak && !onStatus) {
+                log(chalk.yellow(`  ⚠ Jest had to force-exit due to a leaked timer/handle in this test file — tests pass but consider adding cleanup.`));
+            }
+            if (mocksPatchFailureNote && !onStatus) {
+                log(chalk.yellow(`  ⚠ Note: this file's tests pass without it, but the accompanying mocks-file patch in this response did NOT apply (anchor not found) — ${primaryMocksFile} was left unchanged.`));
+            }
             // Format the accepted file with the repo's own eslint/prettier so it matches local style
             // and clears the lint gate (best-effort, behavior-preserving — no re-run needed).
             if (!dryRun) {
@@ -406,58 +663,134 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
                     log(chalk.dim(`  ↳ DOM-free — routed to the node environment (skips jsdom startup).`));
             }
             onStatus?.({ phase: 'passed', file: shortPath });
+            await recordFixMemory('success', testCode);
             return { success: true, testCode };
         }
-        const rawRunOutput = runResult.stdout + '\n' + runResult.stderr;
         const rawExtracted = extractTestFailure(rawRunOutput);
         const leakGuidance = processExitLeakGuidance(rawRunOutput);
         const extracted = leakGuidance
             ? `${leakGuidance}\n\n${enrichNoTestsError(rawExtracted, rawRunOutput, env.testRunner)}`
             : enrichNoTestsError(rawExtracted, rawRunOutput, env.testRunner);
         const passCount = parsePassCount(rawRunOutput);
+        // A hard process crash (OOM/segfault) can otherwise get sorted into either "0 tests
+        // collected" (crash before any test starts) or "regression" (crash partway through, killing
+        // the process before a summary line prints — passCount reads 0, satisfying "fewer than
+        // before") — checked first so it always gets its own, correct guidance instead.
+        const crashSignature = detectProcessCrash(rawRunOutput);
+        let unrelatedFileNote = null;
         if (!isZeroTestsOutput(rawRunOutput) && passCount > bestPassCount) {
             bestPassCount = passCount;
             bestCode = testCode;
+            bestRunResult = runResult;
         }
         if (attempt === 1) {
             firstError = extracted;
             firstPassCount = passCount;
-            lastError = extracted;
+            lastError = crashSignature ? buildProcessCrashMessage(crashSignature, extracted) : extracted;
+            if (config.memory.enabled) {
+                const hint = await buildFixMemoryHint(config, extracted, {
+                    testRunner: env.testRunner,
+                    dependencies: context.reactMajorVersion !== null ? ['react'] : [],
+                }).catch(() => ({ text: null, coveredPatterns: [] }));
+                fixMemoryHint = hint.text;
+                generator.setCoveredPatterns(hint.coveredPatterns);
+            }
+            // Match attempt 2+'s more specific classification below — a generic "Tests failed" on
+            // attempt 1 read as "assertions failed, tests were at least collected" even when the
+            // model's first attempt was ALSO structurally broken (0 tests collected / a hard crash),
+            // which silently meant bestCode never qualified and fixOnFailure correctly never had
+            // anything to hand off — but nothing in the log said so, reading as a mysterious no-op.
+            if (!onStatus) {
+                const what = crashSignature ? 'Test process CRASHED' : isZeroTestsOutput(rawRunOutput) ? '0 tests collected — file structure broken' : 'Tests failed';
+                log(chalk.red(`  ${what} (attempt ${attempt}/${effectiveMax})`));
+            }
+        }
+        else if (crashSignature) {
+            lastError = buildProcessCrashMessage(crashSignature, extracted);
             if (!onStatus)
-                log(chalk.red(`  Tests failed (attempt ${attempt}/${config.maxIterations})`));
+                log(chalk.red(`  Test process CRASHED (attempt ${attempt}/${effectiveMax})`));
         }
         else if (isZeroTestsOutput(rawRunOutput)) {
-            lastError = buildStructureBrokenMessage(firstError, rawExtracted);
+            unrelatedFileNote = detectUnrelatedFileCrash(rawExtracted, shortPath, context.sourceFile, mocksFileList(config));
+            if (generator.isPatch) {
+                consecutivePatchFailures++;
+                if (consecutivePatchFailures >= 2) {
+                    lastError = buildPatchEscalationMessage(consecutivePatchFailures, 'the patch keeps breaking the file structure — 0 tests collected');
+                    generator.setPatchMode(false);
+                }
+                else {
+                    lastError = buildStructureBrokenMessage(firstError, rawExtracted) + (unrelatedFileNote ?? '');
+                }
+            }
+            else {
+                lastError = buildStructureBrokenMessage(firstError, rawExtracted) + (unrelatedFileNote ?? '');
+            }
             if (!onStatus)
-                log(chalk.red(`  Fix broke file structure — 0 tests collected (attempt ${attempt}/${config.maxIterations})`));
+                log(chalk.red(`  Fix broke file structure — 0 tests collected (attempt ${attempt}/${effectiveMax})`));
         }
         else if (passCount < firstPassCount) {
-            lastError = buildRegressionMessage(firstError, extracted, firstPassCount, passCount);
+            // Reached here means the file collected tests fine this attempt — patch mode is
+            // structurally working again, regardless of the assertion-level regression itself.
+            consecutivePatchFailures = 0;
+            lastError = buildRegressionMessage(firstError, extracted, firstPassCount, passCount) + (buildFailingTestChecklist(rawRunOutput) ?? '');
             if (!onStatus)
-                log(chalk.red(`  Fix caused regression: ${firstPassCount} → ${passCount} passing (attempt ${attempt}/${config.maxIterations})`));
+                log(chalk.red(`  Fix caused regression: ${firstPassCount} → ${passCount} passing (attempt ${attempt}/${effectiveMax})`));
         }
         else {
-            lastError = extracted;
+            consecutivePatchFailures = 0;
+            lastError = extracted + (buildFailingTestChecklist(rawRunOutput) ?? '');
             if (!onStatus)
-                log(chalk.red(`  Tests failed (attempt ${attempt}/${config.maxIterations})`));
+                log(chalk.red(`  Tests failed (attempt ${attempt}/${effectiveMax})`));
         }
+        // Surface the mocks-patch failure alongside whatever the test run itself reported — see the
+        // identical note in fix-loop.ts.
+        if (mocksPatchFailureNote)
+            lastError = `${lastError}\n\n${mocksPatchFailureNote}`;
         if (!onStatus && verbose)
             log(chalk.dim(lastError.split('\n').slice(0, 20).join('\n')));
+        // Same reasoning as fix-loop.ts's identical guard: an unrelated-file crash is, by
+        // definition, not something any test-file edit can fix — if it's identical two attempts in a
+        // row, further attempts are pure wasted budget (confirmed live: 53/66 files on one project
+        // burned their full maxIterations here on the exact same node_modules crash before this
+        // guard existed).
+        consecutiveUnrelatedFileCrashes = unrelatedFileNote ? consecutiveUnrelatedFileCrashes + 1 : 0;
+        if (consecutiveUnrelatedFileCrashes >= 2 && attempt < effectiveMax) {
+            if (!onStatus) {
+                log(chalk.red(`  ⚠ Same unrelated-file crash on ${consecutiveUnrelatedFileCrashes} attempts in a row — no test-file edit can fix this. Stopping early instead of burning the remaining budget.`));
+            }
+            break;
+        }
     }
     onStatus?.({ phase: 'failed', file: shortPath });
+    await recordFixMemory('failure', bestCode ?? originalTestContent ?? '');
     const rel = context.suggestedTestFile.replace(cwd + '/', '');
     const keepHint = () => {
         if (!onStatus)
             log(chalk.yellow(`\n  Kept ${bestPassCount} passing test(s) at ${rel} — run ${chalk.cyan(`lacuna fix --file ${rel}`)} to repair the remaining failures`));
     };
+    // Tracks whether the file on disk right now is a genuinely collecting (bestCode) attempt —
+    // vs. the restored original or a non-collecting last attempt — since only a collecting
+    // attempt is worth handing to the fix specialist below.
+    let keptBestOnDisk = false;
+    // Separate, narrower flag: a NEW file where EVERY attempt was structurally broken (0 tests
+    // collected every time — e.g. a jest.mock() scope violation) still has the last attempt's
+    // (non-collecting) code sitting on disk. That's exactly the failure class the fix specialist's
+    // hook/service/mock-call hints are built to diagnose, so it's still worth ONE handoff attempt
+    // even though there's no bestCode to fall back to if the specialist also can't fix it — unlike
+    // an EXISTING file, which always has a known-good original to restore to instead.
+    let hasBrokenNewFileOnDisk = false;
     if (originalTestContent === null) {
         // New file — keep the best collecting attempt so `lacuna fix` can repair it.
         if (bestCode !== null) {
             await writeFile(context.suggestedTestFile, bestCode, 'utf-8');
             keepHint();
+            keptBestOnDisk = true;
         }
-        else if (!onStatus)
-            log(chalk.yellow(`\n  Last attempt kept at ${rel} — run ${chalk.cyan(`lacuna fix --file ${rel}`)} to repair it`));
+        else {
+            hasBrokenNewFileOnDisk = true;
+            if (!onStatus)
+                log(chalk.yellow(`\n  Last attempt kept at ${rel} — run ${chalk.cyan(`lacuna fix --file ${rel}`)} to repair it`));
+        }
     }
     else if (parallel && bestCode !== null) {
         // Existing file with a clean, collecting attempt. Keep it ONLY if it adds net-new passing
@@ -470,6 +803,7 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
         if (bestPassCount > baselinePassCount) {
             await writeFile(context.suggestedTestFile, bestCode, 'utf-8');
             keepHint();
+            keptBestOnDisk = true;
         }
         else if (!onStatus) {
             log(chalk.dim(`\n  Generated tests didn't improve on the existing file (${baselinePassCount} passing) — restored the original.`));
@@ -479,6 +813,78 @@ export async function processGap(gap, options, generator, parallel, onStatus, pr
         // Existing file under a full-suite run (per-file pass count not measurable) or no clean
         // attempt — restore the original so the workspace stays coherent.
         await restoreTestFile(context.suggestedTestFile, originalTestContent);
+    }
+    // Explain the skip explicitly when fix-on-failure is enabled but has nothing to work with at
+    // all — an EXISTING file that got restored to its (already-passing) original, since there's no
+    // new broken content worth handing off. Without this line, an absent handoff for that case
+    // silently reads as "fix-on-failure didn't work" rather than "correctly declined — nothing new
+    // to fix; the original was already fine."
+    if (fixOnFailure && !dryRun && !keptBestOnDisk && !hasBrokenNewFileOnDisk && !onStatus) {
+        log(chalk.dim(`  (fix-on-failure skipped: the existing file was restored to its already-passing original — nothing new to fix)`));
+    }
+    // Hand off to the fix specialist: buildFixPrompt gets the exact runtime error, the real mocks
+    // file, and the full hook/service/mock-call hint suite that generate's own buildRetryPrompt
+    // does not carry to the same degree — a second, differently-equipped attempt at the SAME file
+    // before giving up, using the same worker slot (so under --workers N it interleaves with other
+    // files' generation rather than requiring a separate later `lacuna fix` pass). Also covers a
+    // NEW file where every attempt was structurally broken (hasBrokenNewFileOnDisk) — the fix
+    // specialist's mock-shape hints are often exactly what a 0-tests-collected scope/import error
+    // needs, and there's no downside if it also fails (fixFile has its own never-regress guarantee).
+    if (fixOnFailure && !dryRun && (keptBestOnDisk || hasBrokenNewFileOnDisk)) {
+        onStatus?.({ phase: 'fixing', file: shortPath });
+        if (!onStatus)
+            log(chalk.magenta(`\n  Handing off to the fix specialist (${rel})...`));
+        // Bounded budget: this is a second opinion on a file generate already spent its FULL budget
+        // on, not an independent fresh attempt — giving it another complete maxIterations would
+        // silently double the worst-case cost of every exhausted file now that this handoff is
+        // default-on. If the specialist's better-equipped prompt hasn't turned it around in half the
+        // budget, a full second budget rarely does either.
+        const fixOptions = { config: { ...config, maxIterations: Math.max(1, Math.ceil(config.maxIterations / 2)) }, env, cwd, dryRun, verbose, log };
+        // Skip fixFile's own from-scratch re-run: we just ran this EXACT content (bestCode or the
+        // last attempt, matching whichever branch above actually wrote it to disk) seconds ago and
+        // already have the result — see fixFile's precomputedFirstRun doc comment. ONLY valid when
+        // `parallel` was true for this gap: that's what made `testRun` file-scoped (via
+        // resolveFileTestRun), matching fixFile's OWN file-scoped `fileRun` resolution. When
+        // `parallel` is false, `testRun` ran the FULL SUITE command instead (see its definition
+        // above) — a full-suite result handed to fixFile as if it were file-scoped would carry the
+        // wrong error text and pass-count semantics, so the optimization simply doesn't apply there
+        // and fixFile falls back to its own (correct, file-scoped) from-scratch run.
+        const precomputedFirstRun = parallel ? ((keptBestOnDisk ? bestRunResult : lastRunResult) ?? undefined) : undefined;
+        // Keep the display pinned on 'fixing' for every intermediate phase (waiting/running/writing/
+        // retrying) instead of letting fixFile's own onStatus stream through raw — otherwise the
+        // worker row flips to showing the TEST file path under a generic-looking label (fixFile
+        // computes ITS OWN shortPath from the test file, since that's what it operates on), which
+        // reads as "a completely different, unrelated file is now being processed" rather than "the
+        // fix specialist is working on the same file." Mirrors regenerateFile's identical
+        // regenOnStatus wrapper (fix-loop.ts) for the exact same brief-flash/wrong-file-shown problem.
+        const fixOnStatus = onStatus
+            ? (state) => {
+                if (state.phase === 'passed' || state.phase === 'failed') {
+                    onStatus('file' in state ? { ...state, file: shortPath } : state);
+                }
+                else {
+                    onStatus({ phase: 'fixing', file: shortPath });
+                }
+            }
+            : undefined;
+        const fixResult = await fixFile(context.suggestedTestFile, fixOptions, generator, fixOnStatus, projectMemory, precomputedFirstRun);
+        if (fixResult.success) {
+            const finalCode = await readFile(context.suggestedTestFile, 'utf-8');
+            await recordFixMemory('success', finalCode);
+            if (!onStatus)
+                log(chalk.green(`  ✓ Fix specialist recovered ${rel}.`));
+            return { success: true, testCode: finalCode, fixHandoffAttempted: true };
+        }
+        // fixFile already wrote back its own best-effort attempt (never worse than what we handed
+        // it — see fixFile's own keep-best logic) and emitted its own 'failed' onStatus; fall
+        // through to the standard failure return below.
+        if (!onStatus)
+            log(chalk.yellow(`  Fix specialist could not recover ${rel} either.`));
+        return {
+            success: false,
+            error: `Tests still failing after generate's ${config.maxIterations} attempts AND a fix-specialist handoff. Last error:\n${lastError?.slice(0, 1500)}`,
+            fixHandoffAttempted: true,
+        };
     }
     return {
         success: false,
@@ -519,21 +925,31 @@ async function runWorkerPool(gaps, options, workerCount, projectMemory) {
     const queue = [...gaps];
     let filesProcessed = 0;
     let testsWritten = 0;
+    let fixHandoffs = 0;
+    let fixHandoffRecovered = 0;
     const errors = [];
     display.start();
     const workers = Array.from({ length: workerCount }, async (_, wi) => {
         const generator = new TestGenerator({
             config: options.config,
             env: options.env,
+            cwd: options.cwd,
             // suppress token streaming in parallel mode — display is the UI
         });
         while (true) {
+            if (options.shouldContinue && !options.shouldContinue())
+                break;
             const gap = queue.shift();
             if (!gap)
                 break;
-            const onStatus = (state) => display.update(wi, state);
+            const onStatus = (state) => { display.update(wi, state); options.onStatus?.(state); };
             const result = await processGap(gap, { ...options, log: () => { }, verbose: false }, generator, true, onStatus, projectMemory);
             filesProcessed++;
+            if (result.fixHandoffAttempted) {
+                fixHandoffs++;
+                if (result.success)
+                    fixHandoffRecovered++;
+            }
             if (result.success)
                 testsWritten++;
             else if (result.error)
@@ -542,7 +958,7 @@ async function runWorkerPool(gaps, options, workerCount, projectMemory) {
     });
     await Promise.all(workers);
     display.finish();
-    return { filesProcessed, testsWritten, errors };
+    return { filesProcessed, testsWritten, errors, fixHandoffs, fixHandoffRecovered };
 }
 // Coverage report is considered fresh for 10 minutes — lets `analyze` then `generate` share one run.
 const COVERAGE_CACHE_TTL_S = 600;
@@ -550,6 +966,9 @@ export async function runAgentLoop(options) {
     const { config, env, cwd, log } = options;
     const workerCount = Math.max(1, Math.min(options.workers ?? 1, 10));
     const parallel = workerCount > 1;
+    // Proactively check + fix the shared mocks file(s) before generating/verifying any test file —
+    // see mocks-fix.ts for the rationale (same reasoning as fix-loop.ts's identical call).
+    await fixMocksFilesUpfront(config, env, cwd, { dryRun: options.dryRun, log });
     // ─── Single-file fast path ────────────────────────────────────────────────────
     // Skip the coverage suite entirely. Build a synthetic gap that treats the whole
     // file as uncovered — the AI reads the source and writes comprehensive tests.
@@ -578,8 +997,8 @@ export async function runAgentLoop(options) {
             };
             const memory = new ProjectMemory();
             await memory.initialize(cwd, env, config);
-            const generator = new TestGenerator({ config, env });
-            const result = await processGap(gap, options, generator, true, undefined, memory.toPromptSection());
+            const generator = new TestGenerator({ config, env, cwd });
+            const result = await processGap(gap, options, generator, true, options.onStatus, memory.toPromptSection());
             return {
                 filesProcessed: 1,
                 testsWritten: result.success ? 1 : 0,
@@ -587,6 +1006,7 @@ export async function runAgentLoop(options) {
                 coverageAfter: 0,
                 hasCoverage: false,
                 errors: result.error ? [result.error] : [],
+                ...(result.fixHandoffAttempted ? { fixHandoffs: 1, fixHandoffRecovered: result.success ? 1 : 0 } : {}),
             };
         }
     }
@@ -686,7 +1106,7 @@ export async function runAgentLoop(options) {
                 : '  Running test suite to collect coverage...';
             const spinner = startCoverageSpinner(chalk.dim(label), scopeEnv.testRunner);
             const coverageResult = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine);
-            spinner.stop();
+            spinner.stop(coverageResult.stdout + coverageResult.stderr);
             if (coverageResult.timedOut) {
                 throw new Error(`Test suite timed out after ${config.coverageTimeout}s.\n\n` +
                     `This usually means a test has an open handle (unclosed server, timer, or connection).\n` +
@@ -694,6 +1114,14 @@ export async function runAgentLoop(options) {
                     `Or increase the timeout in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`);
             }
             const coverageOutput = coverageResult.stdout + coverageResult.stderr;
+            const configConflict = detectJestConfigConflict(coverageOutput);
+            if (configConflict) {
+                throw new Error(`Jest never ran any tests — no coverage report exists to read.\n\n${configConflict}`);
+            }
+            const validationError = detectJestValidationError(coverageOutput);
+            if (validationError) {
+                throw new Error(validationError);
+            }
             if (/Tests:\s+0 total/i.test(coverageOutput)) {
                 throw new Error(`Your test suites are failing before any tests run.\n\n` +
                     `This usually means a missing environment variable, broken import, or setup file error.\n` +
@@ -741,7 +1169,7 @@ export async function runAgentLoop(options) {
     // Diff mode ignores the per-file threshold entirely (101 keeps every file with any uncovered
     // line): a file at 94% overall can still have uncovered CHANGED lines — that's the exact
     // patch-coverage case this mode exists for.
-    const gaps = await filterTestableGaps(extractGaps(report, diffMode ? 101 : config.threshold), config.ignore, { includeExisting: improveExisting });
+    const gaps = await filterTestableGaps(extractGaps(report, diffMode ? 101 : config.threshold), config.ignore, { includeExisting: improveExisting, cwd });
     const untouchedFiles = await findUncoveredFiles(report, config.sourceDir, cwd, config.ignore, scopeDir);
     const existingPaths = new Set(gaps.map((g) => g.filePath));
     for (const g of untouchedFiles) {
@@ -786,8 +1214,19 @@ export async function runAgentLoop(options) {
             log(chalk.dim('  Every source file already has a test file, so there is nothing new to generate.'));
             log(chalk.dim('  Run `lacuna fix` to repair the failing tests and raise coverage.'));
         }
+        else if (scopeRel) {
+            // Scoped run: coverageBefore is the WHOLE-project total, not this folder — so never claim
+            // the folder "meets the threshold" off it (that reads as false when the global number is
+            // low, exactly the confusing case). Per the coverage report, every file here is either
+            // already at/above threshold or already has a test. If gaps were expected, the report's
+            // file paths may not line up with this folder (monorepo/base-path mismatch) — `--verbose`
+            // or the raw log shows which coverage command ran and what it reported.
+            log(chalk.green(`\nNo files under ${scopeRel} need tests generated.`));
+            log(chalk.dim(`  Per the coverage report, they already meet ${config.threshold}% or already have tests.`));
+            log(chalk.dim(`  (Project-wide coverage is ${coverageBefore.toFixed(1)}% — that total spans the whole repo, not just ${scopeRel}.)`));
+        }
         else {
-            log(chalk.green(`\nAll files${where} already meet the ${config.threshold}% threshold.`));
+            log(chalk.green(`\nAll files already meet the ${config.threshold}% threshold.`));
         }
         return { filesProcessed: 0, testsWritten: 0, coverageBefore, coverageAfter: coverageBefore, hasCoverage: true, errors: [] };
     }
@@ -813,15 +1252,17 @@ export async function runAgentLoop(options) {
     let filesProcessed;
     let testsWritten;
     let errors;
+    let fixHandoffs = 0;
+    let fixHandoffRecovered = 0;
     if (parallel) {
         ;
-        ({ filesProcessed, testsWritten, errors } = await runWorkerPool(scopedGaps, options, workerCount, memorySnapshot));
+        ({ filesProcessed, testsWritten, errors, fixHandoffs, fixHandoffRecovered } = await runWorkerPool(scopedGaps, options, workerCount, memorySnapshot));
     }
     else {
         filesProcessed = 0;
         testsWritten = 0;
         errors = [];
-        const generator = new TestGenerator({ config, env });
+        const generator = new TestGenerator({ config, env, cwd });
         const tips = getActiveTips({
             workers: 1,
             targetFile: options.targetFile,
@@ -836,11 +1277,18 @@ export async function runAgentLoop(options) {
         });
         const nextTip = createTipRotator(tips);
         for (const gap of scopedGaps) {
+            if (options.shouldContinue && !options.shouldContinue())
+                break;
             const tip = nextTip();
             if (tip)
                 log(formatTip(tip));
-            const result = await processGap(gap, options, generator, perFileVerify, undefined, memory.toPromptSection());
+            const result = await processGap(gap, options, generator, perFileVerify, options.onStatus, memory.toPromptSection());
             filesProcessed++;
+            if (result.fixHandoffAttempted) {
+                fixHandoffs++;
+                if (result.success)
+                    fixHandoffRecovered++;
+            }
             if (result.success) {
                 testsWritten++;
                 // Update memory so subsequent files learn from patterns in this one
@@ -863,8 +1311,8 @@ export async function runAgentLoop(options) {
             ? `\n  Measuring coverage under ${scopeRel}...`
             : '\n  Running full suite for final coverage measurement...';
         const finalSpinner = startCoverageSpinner(chalk.dim(measureLabel), env.testRunner);
-        await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, finalSpinner.onLine);
-        finalSpinner.stop();
+        const finalCoverageResult = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, finalSpinner.onLine);
+        finalSpinner.stop(finalCoverageResult.stdout + finalCoverageResult.stderr);
     }
     // Only measure coverage after if at least one test was written — otherwise the failing
     // generated files execute source code and report misleading 100% coverage. (Diff mode keeps
@@ -901,16 +1349,16 @@ export async function runAgentLoop(options) {
                 : '\n  Measuring new patch coverage...'), env.testRunner);
             let incremental;
             if (covRun && tmpCovDir) {
-                await runCommand(covRun.command, covRun.cwd, config.coverageTimeout * 1000, spin.onLine);
-                spin.stop();
+                const covRunResult = await runCommand(covRun.command, covRun.cwd, config.coverageTimeout * 1000, spin.onLine);
+                spin.stop(covRunResult.stdout + covRunResult.stderr);
                 incremental = await parseLcov(tmpCovDir, '');
             }
             else {
                 const afterCmd = relTargetFile
                     ? (relatedCoverageCommand(env, relTargetFile) ?? env.coverageCommand)
                     : env.coverageCommand;
-                await runCommand(afterCmd, cwd, config.coverageTimeout * 1000, spin.onLine);
-                spin.stop();
+                const afterResult = await runCommand(afterCmd, cwd, config.coverageTimeout * 1000, spin.onLine);
+                spin.stop(afterResult.stdout + afterResult.stderr);
                 incremental = await loadCoverage(config, cwd);
             }
             // Monorepo/workspace reports key files by the PACKAGE-relative path while the git diff keys
@@ -933,10 +1381,15 @@ export async function runAgentLoop(options) {
     if (!options.dryRun && testsWritten > 0 && improveExisting && !diffMode && coverageAfter < config.threshold) {
         log(chalk.dim(`\n  Note: coverage is ${coverageAfter.toFixed(1)}% (under the ${config.threshold}% threshold). The remaining uncovered lines are defensive/edge branches left uncovered by design — a contrived test there (impossible inputs, quirk assertions) would be worse than the gap. This is expected, not a failure.`));
     }
+    if (fixHandoffs > 0) {
+        log(chalk.dim(`\n  Fix specialist: ${fixHandoffRecovered}/${fixHandoffs} exhausted file(s) recovered after generate gave up.`));
+    }
     return {
         filesProcessed, testsWritten, coverageBefore, coverageAfter, hasCoverage: true,
         ...(diffScope ? { patchCoverageBefore, patchCoverageAfter, diffBase: diffScope.baseRef } : {}),
         errors,
+        fixHandoffs,
+        fixHandoffRecovered,
     };
 }
 // Unions two coverage reports at the line level: a line is covered in the result if it was

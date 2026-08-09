@@ -1,3 +1,150 @@
+// The identifier a test file is named for — `useForcedUpdate.test.ts` → `useForcedUpdate`. Used to
+// guard against a fix/regen QUIETLY changing WHAT the test tests: a model that can't get a hard
+// hook/component mock right will sometimes rewrite the file to test an easy imported utility
+// instead (observed: `useForcedUpdate.test.ts` rewritten to test `compareVersions`), and because
+// keep-best ranks by PASS COUNT, those trivial-but-passing tests beat the real ones and get kept —
+// silently destroying coverage of the actual subject. Returns null for generic/aggregate names
+// where the guard would false-positive.
+export function subjectFromTestPath(testPath) {
+    const base = (testPath.replace(/\\/g, '/').split('/').pop() ?? '')
+        .replace(/\.(test|spec)\.[jt]sx?$/, '')
+        .replace(/^test_/, '')
+        .replace(/_test$/, '')
+        .replace(/\.[jt]sx?$/, '');
+    if (base.length < 3)
+        return null;
+    if (/^(index|main|app|setup|utils?|helpers?|constants?|types?)$/i.test(base))
+        return null;
+    return base;
+}
+// True when `code` references `subject` as a whole-word identifier (import or usage). Word-bounded so
+// `useForcedUpdate` doesn't match inside `useForcedUpdateThing`.
+export function referencesSubject(code, subject) {
+    return new RegExp(`\\b${subject.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(code);
+}
+// Whether a leaked-handle warning is plausibly fixable by editing THIS test — i.e. the test or its
+// source actually creates a timer/interval/subscription/connection the test could clear. When it
+// does NOT (the leak comes from the RN/jest/firebase/expo environment or a dependency the test only
+// mocks), no test edit can clear it, so the fix loop must NOT chase it: doing so treats a passing
+// file as failing and burns iterations on an unfixable warning. In that case, accept the green tests
+// with a note instead. Keyed on real handle-creating APIs in the test/source, not in mocks.
+const LEAK_FIXABLE_RE = /\b(setInterval|setTimeout|setImmediate|requestAnimationFrame|addEventListener|addListener|new WebSocket|createConnection)\b|\.(subscribe|listen|connect|watch|poll)\s*\(/;
+export function leakLooksTestFixable(testCode, sourceCode) {
+    return LEAK_FIXABLE_RE.test(testCode) || (!!sourceCode && LEAK_FIXABLE_RE.test(sourceCode));
+}
+// Detects when a compile/runtime error actually originates in the SHARED mocks file(s) rather
+// than the test file the fix loop is currently editing (e.g. a bare `jest.fn()` inside
+// tests/mocks.ts itself losing its type, breaking `.mockResolvedValue()` for every test file that
+// imports it). Without this, the model is only ever shown the raw diagnostic — which names the
+// mocks file's path, not the test file's — and has no explicit signal that rewriting the TEST
+// file can never fix it. Observed repeatedly: the model retries the test file up to
+// maxIterations with no progress because the actual broken line lives in a file it was never
+// told to touch. Returns a prompt-injectable banner naming the exact offending file(s), or null
+// when the error doesn't reference any configured mocks file.
+export function detectMocksFileError(errorOutput, mocksFiles) {
+    const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const hits = mocksFiles.filter(mf => new RegExp(`${escapeRe(mf)}[:(]\\d`).test(errorOutput));
+    if (hits.length === 0)
+        return null;
+    return (`\n\n⚠ THIS ERROR IS IN THE SHARED MOCKS FILE, NOT YOUR TEST FILE: the diagnostic above references ${hits.map(h => `"${h}"`).join(', ')} — a file shared across every test that imports it, not the file you are editing.\n` +
+        `Editing your test file CANNOT fix this. You must emit a // ---MOCKS_PATCH--- (or // ---MOCKS_FILE--- for a full rewrite) section that fixes the EXACT reported line inside the mocks file itself, in addition to (or instead of, if your test file needs no changes) editing the test file. See the MOCK PATCH instructions for the exact syntax.`);
+}
+// A hard process crash (V8 out-of-memory abort, segfault) looks superficially like a normal test
+// regression to the pass/fail-count classification in loop.ts/fix-loop.ts — the runner never
+// prints a summary line, so parsePassCount reads 0, which satisfies "fewer passing than before"
+// and gets reported as ⚠ REGRESSION. That's actively wrong guidance: a crash means something is
+// consuming unbounded memory/resources, not that an assertion is wrong — "fix your assertions"
+// sends the model nowhere useful. These signatures are V8-runtime-internal phrasing, distinctive
+// enough that no real application test fixture would ever legitimately contain them.
+const CRASH_SIGNATURES = [
+    /FATAL ERROR:[\s\S]{0,200}?(?:heap out of memory|Allocation failed)/i,
+    /JavaScript heap out of memory/i,
+    /Segmentation fault/i,
+];
+// Jest refuses to run at all when it finds BOTH a jest.config.js/ts AND a `"jest"` key in
+// package.json (no --config flag disambiguating) — a real, live-reproduced case: a project with
+// coverageReporters/coverageDirectory correctly set in jest.config.js still got "Could not read
+// coverage report" because jest exited in under a second with THIS error before running a single
+// test, so no report was ever written — completely unrelated to whether coverage is configured.
+// The generic "make sure your config has coverage enabled" message is actively wrong here since
+// the config IS correct; this fires first and names the real, fixable cause instead.
+const JEST_MULTIPLE_CONFIGS_RE = /Multiple configurations found:\s*\n\s*\n?((?:\s*\*\s*.+\n?)+)/;
+export function detectJestConfigConflict(rawOutput) {
+    const m = JEST_MULTIPLE_CONFIGS_RE.exec(rawOutput);
+    if (!m)
+        return null;
+    const sources = m[1].trim().split('\n').map(l => l.replace(/^\s*\*\s*/, '').trim()).filter(Boolean);
+    return (`Jest found more than one config source and refuses to guess which one to use, so it exited before running any tests (no coverage report was ever written):\n` +
+        sources.map(s => `  • ${s}`).join('\n') + '\n' +
+        `Delete or merge one of them — most commonly, remove the "jest" key from package.json if jest.config.js/ts is the one you actually maintain (or vice versa).`);
+}
+// Jest wraps EVERY fatal pre-test config/validation failure (missing preset, malformed config,
+// "Multiple configurations found", etc.) in the SAME generic envelope: a `● <Title>:` header,
+// the actual error body, and — uniquely to this class of error, never printed for an ordinary
+// per-file "Test suite failed to run" — a "Configuration Documentation:" footer. Live-reproduced
+// TWICE on the same real project: first "Multiple configurations found" (handled precisely above
+// by detectJestConfigConflict), then — after fixing that — jest-expo's preset requiring the
+// since-split-out `@react-native/jest-preset` package threw a DIFFERENT "Validation Error" that
+// fell through to the same misleading "make sure coverage is enabled" message, because only the
+// narrow "Multiple configurations" pattern was being checked. Rather than adding one detector per
+// crash shape (whack-a-mole), this catches the WHOLE family generically and surfaces jest's own
+// error verbatim instead of guessing "check your coverage config." Checked AFTER
+// detectJestConfigConflict, which gives a more specific, actionable message for its one case.
+const JEST_VALIDATION_ERROR_RE = /●\s*([^\n:]+):\s*\n+([\s\S]*?)\n\s*Configuration Documentation:\s*\n\s*https:\/\/jestjs\.io\/docs\/configuration/;
+export function detectJestValidationError(rawOutput) {
+    const m = JEST_VALIDATION_ERROR_RE.exec(rawOutput);
+    if (!m)
+        return null;
+    const title = m[1].trim();
+    const body = m[2].trim().split('\n').filter(l => !/^\s*at\s/.test(l)).join('\n').trim();
+    return (`Jest crashed with a fatal "${title}" before running any tests (no coverage report was ever written):\n\n${body}\n\n` +
+        `This is a Jest/dependency configuration problem, not a lacuna coverage setting — resolve it directly (the message above names the exact fix), then re-run.`);
+}
+export function detectProcessCrash(rawOutput) {
+    for (const re of CRASH_SIGNATURES) {
+        const m = re.exec(rawOutput);
+        if (m)
+            return m[0];
+    }
+    return null;
+}
+// Scans for stack-frame-shaped "at ... (file:line:col)" references and flags the first one that
+// points OUTSIDE the set of files the model actually knows it's allowed to touch (the test file,
+// the source file under test, and the configured mocks files) — i.e. a fix broke a SHARED,
+// unrelated module's init/mock chain, collateral damage the model has no visibility into and no
+// way to connect back to its own edit. Deliberately narrow: only meaningful against a genuine
+// crash trace (call from the isZeroTestsOutput/structure-broken branch only) — a normal in-test
+// assertion failure's stack legitimately references many application files, which would make this
+// noisy/false-positive-prone if applied broadly.
+export function detectUnrelatedFileCrash(errorOutput, testFilePath, sourceFilePath, mocksFiles) {
+    const frames = [...errorOutput.matchAll(/\bat\s+(?:[\w.$<>]+\s+)?\(?([\w./-]+\.tsx?):(\d+):(\d+)\)?/g)];
+    if (frames.length === 0)
+        return null;
+    const known = [testFilePath, sourceFilePath, ...mocksFiles].filter((p) => Boolean(p));
+    const isKnown = (file) => known.some(k => file.endsWith(k) || k.endsWith(file));
+    const culprit = frames.find(f => !isKnown(f[1]));
+    if (!culprit)
+        return null;
+    const [, file, line] = culprit;
+    return (`\n\n⚠ THIS CRASH ORIGINATES IN AN UNRELATED FILE (${file}:${line}) — not your test file, not a configured mock, not the source file under test.\n` +
+        `Your change likely altered something ${file}'s module-load or dependency chain relies on (e.g. removed/broke a mock or import elsewhere). Do NOT edit assertions in your test file to work around this — find and undo whatever change caused '${file}' to receive an unexpected value, or add/fix a mock for whatever it depends on that isn't mocked yet.`);
+}
+// Serializes the read-merge-write critical section around the shared mocks file(s). Under
+// parallel workers (`generate -w N` / `fix -w N`) each worker processes a DIFFERENT test file but
+// they can all touch the SAME shared mocksFile — without a lock, two workers can both read the
+// current content, independently compute their own merge, and write back; the second writer wins
+// and silently discards whatever the first worker just added (or reintroduces the very
+// duplicate-export corruption dedupeMockExports exists to prevent, if both reads land before
+// either write). Mirrors typecheck.ts's withTscLock — same one-at-a-time promise-chain pattern,
+// applied here instead to the mocks file's read+merge+write instead of a tsc invocation. Exported
+// so loop.ts (generate) and fix-loop.ts (fix) share ONE lock instance rather than each queuing
+// only against their own in-process calls.
+let mocksLock = Promise.resolve();
+export function withMocksLock(fn) {
+    const run = mocksLock.then(fn, fn);
+    mocksLock = run.then(() => { }, () => { });
+    return run;
+}
 // Strip comments and string literals to avoid false positives inside quoted text.
 function stripNonCode(code) {
     return code
@@ -12,6 +159,44 @@ function stripNonCode(code) {
 export function hasTestFunctions(code) {
     const stripped = stripNonCode(code);
     return /\b(?:it|test)\s*(?:\.(?:each|concurrent|skip|only))?\s*\(/.test(stripped);
+}
+// Counts top-level it()/test() cases (including .each/.concurrent/.skip/.only variants),
+// ignoring string/comment content. Used to detect a patch that net-deletes tests: DELETE_TEST is
+// a legitimate op for genuinely obsolete tests, but a model that can't get a REPLACE anchor to
+// match sometimes reaches for DELETE_TEST on perfectly valid tests just to get SOME op in its
+// patch to succeed. A raw count comparison against the pre-patch file is a cheap, model-agnostic
+// tripwire for that failure mode.
+export function countTestCases(code) {
+    const stripped = stripNonCode(code);
+    const matches = stripped.match(/\b(?:it|test)\s*(?:\.(?:each|concurrent|skip|only))?\s*\(/g);
+    return matches ? matches.length : 0;
+}
+// Scores how "blocked" a STRUCTURE-BROKEN run's output is (a compile error or a require-time
+// crash where 0 tests could even be collected). Pass count can't distinguish two such runs from
+// each other — both report 0 passing — so the fix loop's keep-best tracking (fix-loop.ts)
+// historically gave ZERO credit for fixing one blocking error only to reveal a different one
+// underneath it: observed live, a model correctly fixed an invalid `import { default }`
+// reserved-word error (TS1003 — the file doesn't even PARSE), which then surfaced a separate
+// module-hoisting TDZ ReferenceError (the file parses fine, crashes during evaluation instead) —
+// genuine forward progress, but a raw error COUNT can't see it: both states have exactly one
+// error. The two failure classes aren't equally severe though — a file that doesn't parse is
+// strictly further from working than one that parses and crashes at require-time, regardless of
+// how many errors of each kind there are — so this scores by TIER first (parse errors are always
+// worse than any number of runtime crashes) and error count only as the tiebreaker within a tier.
+// Lower score = closer to compiling.
+export function countDistinctErrors(output) {
+    const TIER_PARSE_ERROR = 1000; // TS compile/syntax errors — the file doesn't even parse
+    const TIER_RUNTIME_CRASH = 100; // require-time exception — parses fine, throws during eval
+    const tsErrors = (output.match(/error TS\d+/g) ?? []).length;
+    if (tsErrors > 0)
+        return TIER_PARSE_ERROR + tsErrors;
+    // No TS compile errors — most likely a single require-time exception (SyntaxError,
+    // ReferenceError, TypeError thrown while evaluating the module, or Jest's own generic "Error:").
+    // Count distinct "<ErrorType>:" headers rather than every stack-trace line under it.
+    const exceptionHeaders = (output.match(/\b(?:SyntaxError|ReferenceError|TypeError|Error):/g) ?? []).length;
+    // Always at least 1 — the caller only calls this when the run is already known to be
+    // structure-broken, so an unrecognized error format still counts as "something is wrong".
+    return TIER_RUNTIME_CRASH + Math.max(exceptionHeaders, 1);
 }
 // Returns true when the code contains placeholder test bodies — e.g. `{ // body }`.
 // A placeholder passes vitest (no assertions = no failures) but produces zero value.
@@ -112,6 +297,42 @@ export function parseFailCount(output) {
     const summaryLine = stripAnsi(output).match(/^\s*Tests\b[^\n]*?(\d+)\s+failed/m);
     return summaryLine ? parseInt(summaryLine[1], 10) : 0;
 }
+// Once a file has enough failing tests, asking the model to "fix the file" means regenerating a
+// large amount of mocking code in one shot — observed on a real 1,073-line file (33/49 failing):
+// three DIFFERENT mistakes surfaced across three DIFFERENT full-rewrite attempts, the signature
+// of getting a different fraction wrong each time rather than a stuck loop repeating one error.
+// Narrowing the ask to a named, shrinking checklist of specific still-failing tests — explicitly
+// stating everything else already passes and must not be touched — is a task size a model
+// handles far more reliably. Both supported runners print exactly this, just in different shapes:
+// jest's failure-summary lists each failing test's full `Describe › Describe › test name` path on
+// a `●`-prefixed line (the same marker FAILURE_MARKERS above already anchors on); vitest's
+// "Failed Tests" recap lists ` FAIL  <file> > Describe > test name` per failing test. Both are
+// framing changes on data already captured, not new instrumentation — confirmed against a real
+// vitest failure captured from examples/regen-demo (temporarily broken, then reverted) alongside
+// a real jest capture from a production project's debug logs.
+const LARGE_FAILURE_THRESHOLD = 6;
+export function buildFailingTestChecklist(rawRunOutput) {
+    const clean = stripAnsi(rawRunOutput);
+    let names = [...new Set([...clean.matchAll(/^\s*●\s+(.+)$/gm)]
+            .map(m => m[1].trim())
+            .filter(name => name && name !== 'Test suite failed to run'))];
+    if (names.length === 0) {
+        // vitest's "Failed Tests" recap section — " FAIL  <file path> > Describe > test name".
+        // Requires the " > " continuation after the file path, so a bare file-level "FAIL <file>"
+        // line (no test path — the whole suite failed to run) is correctly NOT matched here.
+        names = [...new Set([...clean.matchAll(/^\s*FAIL\s+\S+\s*>\s*(.+)$/gm)]
+                .map(m => m[1].trim())
+                .filter(Boolean))];
+    }
+    // Self-gating and purely current-attempt-driven: a handful of failures is already easy to
+    // track from the raw error text, so this stays out of the way for ordinary files, and
+    // naturally stops firing once a later attempt shrinks the failing count back down — a good
+    // sign, not a gap to patch around.
+    if (names.length <= LARGE_FAILURE_THRESHOLD)
+        return null;
+    return (`\n\n⚠ ${names.length} TESTS ARE STILL FAILING IN THIS FILE — fix ONLY these, one at a time if needed. Every other test in the file is passing; do NOT modify, rename, or restructure any test not listed here:\n` +
+        names.map(n => `  - ${n}`).join('\n'));
+}
 // Test runners print PASSING tests first and the actual failures + summary LAST. Naively
 // slicing the HEAD of a long, mostly-passing run (slice(0, N)) therefore shows the model only
 // ✓ passes and hides every failure — so it concludes "the tests pass, the output is just
@@ -126,7 +347,7 @@ const FAILURE_MARKERS = [
     /^\s*(?:Failed Tests|Test Files)\b/m, // vitest end-of-run summary block
     /\b\d+\s+failed\b/, // "N failed" (summary or inline)
 ];
-export function extractFailureRegion(output, maxChars = 3000) {
+export function extractFailureRegion(output, maxChars = 4500) {
     const clean = stripAnsi(output);
     if (clean.length <= maxChars)
         return clean;
@@ -198,7 +419,54 @@ export function mergeMocksContent(existing, incoming) {
     const appended = toAppend.join('\n').trim();
     return appended ? existing.trimEnd() + '\n\n' + appended : existing;
 }
-function extractExportNames(code) {
+// Collapses duplicate top-level `export const/function/class NAME` declarations in a mocks file
+// down to a single (the LAST) occurrence. mergeMocksContent is called on every retry that touches
+// the shared mocks file, and a model response that re-emits an export the file already has —
+// rather than a true partial diff — can slip through the superset-replace branch (case 2), or
+// accumulate across retries via the append branch (case 3), leaving the same name declared 2-3
+// times in one file: a hard "Cannot redeclare block-scoped variable" compile error that cascades
+// into every test file importing the mock (observed across multiple fix-cache debug logs:
+// mockCreateProcessorsRepo, mockCreateWalletsRepo, mockFlutterwaveClient each declared 2-3x).
+// Runs as part of the same write-time cleanup pipeline as dedupeImports/dedupeTestBlocks, just
+// for the mocks file instead of the test file.
+export function dedupeMockExports(code) {
+    const lines = code.split('\n');
+    const exportRe = /^export\s+(?:const|let|var|function|async\s+function|class)\s+(\w+)/;
+    const starts = [];
+    for (let i = 0; i < lines.length; i++) {
+        const m = lines[i].match(exportRe);
+        if (m)
+            starts.push({ name: m[1], start: i });
+    }
+    if (starts.length <= 1)
+        return code;
+    // Each block runs from its own `export` line to the line before the NEXT export declaration
+    // (or EOF) — the same "capture until next export" boundary mergeMocksContent already uses.
+    const blocks = starts.map((s, idx) => ({
+        name: s.name,
+        start: s.start,
+        end: idx + 1 < starts.length ? starts[idx + 1].start : lines.length,
+    }));
+    const lastIndexByName = new Map();
+    blocks.forEach((b, idx) => lastIndexByName.set(b.name, idx));
+    if (lastIndexByName.size === blocks.length)
+        return code; // no duplicate names — nothing to do
+    const keptLines = [];
+    let cursor = 0;
+    blocks.forEach((b, idx) => {
+        // Non-export lines between the previous block and this one (blank lines, comments, plain
+        // imports) are always preserved regardless of which duplicate wins.
+        if (b.start > cursor)
+            keptLines.push(...lines.slice(cursor, b.start));
+        if (lastIndexByName.get(b.name) === idx)
+            keptLines.push(...lines.slice(b.start, b.end));
+        cursor = b.end;
+    });
+    if (cursor < lines.length)
+        keptLines.push(...lines.slice(cursor));
+    return keptLines.join('\n');
+}
+export function extractExportNames(code) {
     const names = [];
     for (const m of code.matchAll(/^export\s+(?:const|let|var|function|class|async\s+function)\s+(\w+)/gm))
         names.push(m[1]);
@@ -230,6 +498,101 @@ function isProseContent(content) {
     const thinkingPatterns = /\bI think\b|\bLet me\b|\bActually,?\s|\bBut wait\b|\bHmm,?\b/m.test(content);
     const bulletLines = lines.filter(l => /^[-*]\s/.test(l)).length;
     return thinkingPatterns || bulletLines > 5;
+}
+// A malformed or truncated model response (hit a token limit mid-function, or emitted a stray
+// fragment) can otherwise be merged straight into the SHARED mocks file with no check at all —
+// unlike test-file content (see hasTestFunctions below), nothing validated the mocks file was
+// even syntactically complete before this existed. Live-observed on kabocash-mobile-RN-expo: a
+// truncated `---MOCKS_FILE---` response left `renderWithProviders` as `(ui) => {` with no closing
+// brace, silently corrupting the ONE file every test in the project imports — cascading to 80+ of
+// 87 files in a single run, each independently (and wastefully) re-attempting to fix the same
+// shared file from its own per-file retry loop instead of the actual corruption ever being caught
+// at the source. String/comment-aware brace/paren/bracket balance scan, same walk as findCallEnd.
+export function detectUnbalancedMocksSyntax(code) {
+    let paren = 0, brace = 0, bracket = 0;
+    let i = 0;
+    while (i < code.length) {
+        const ch = code[i];
+        if (ch === '/' && code[i + 1] === '/') {
+            i += 2;
+            while (i < code.length && code[i] !== '\n')
+                i++;
+            continue;
+        }
+        if (ch === '/' && code[i + 1] === '*') {
+            i += 2;
+            while (i < code.length && !(code[i] === '*' && code[i + 1] === '/'))
+                i++;
+            i += 2;
+            continue;
+        }
+        if (ch === '"' || ch === "'") {
+            const q = ch;
+            i++;
+            while (i < code.length) {
+                if (code[i] === '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (code[i] === q) {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '`') {
+            i++;
+            while (i < code.length) {
+                if (code[i] === '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (code[i] === '`') {
+                    i++;
+                    break;
+                }
+                if (code[i] === '$' && code[i + 1] === '{') {
+                    i += 2;
+                    let tDepth = 1;
+                    while (i < code.length && tDepth > 0) {
+                        if (code[i] === '{')
+                            tDepth++;
+                        else if (code[i] === '}')
+                            tDepth--;
+                        i++;
+                    }
+                    continue;
+                }
+                i++;
+            }
+            continue;
+        }
+        if (ch === '{')
+            brace++;
+        else if (ch === '}') {
+            brace--;
+            if (brace < 0)
+                return true;
+        }
+        else if (ch === '(')
+            paren++;
+        else if (ch === ')') {
+            paren--;
+            if (paren < 0)
+                return true;
+        }
+        else if (ch === '[')
+            bracket++;
+        else if (ch === ']') {
+            bracket--;
+            if (bracket < 0)
+                return true;
+        }
+        i++;
+    }
+    return paren !== 0 || brace !== 0 || bracket !== 0;
 }
 // Removes content that does not belong in a shared mock file.
 // Strips: test blocks (describe/it/test/expect), framework config
@@ -617,11 +980,28 @@ export function ensureMockedImports(code) {
     const need = new Map();
     for (const mk of mocks) {
         for (const name of mk.names) {
+            // `default` and `__esModule` are factory-interop keys (`{ __esModule: true, default: fn }`
+            // marks a mocked module's default export), never real named exports a consumer imports
+            // directly. `default` in particular is a reserved word — `import { default } from '...'`
+            // is invalid syntax under ANY circumstances (only `import { default as X }` or a plain
+            // `import X from '...'` are valid), so this function must never propose it as a bare named
+            // import regardless of how the "used outside factory" heuristic below reads the code.
+            // Confirmed live: this was the actual root cause of a bug that looked like a MODEL mistake
+            // across every provider tried (local and cloud) — the model's own responses were correct
+            // (either omitting the import or writing `import PhoneAdapter from '...'`), but this
+            // function then injected `import { default }` / appended `, { default }` afterward because
+            // it saw `default` as a "name used outside the factory" (see the next skip's comment).
+            if (name === 'default' || name === '__esModule')
+                continue;
             if (bound.has(name))
                 continue;
             if (new RegExp(`\\b(?:const|let|var|function|class)\\s+${name}\\b`).test(masked))
                 continue; // locally declared
-            if (!new RegExp(`\\b${name}\\b`).test(masked))
+            // "Used outside the factory" must mean used as a FREE IDENTIFIER, not as `.name` property
+            // access (e.g. `jest.requireMock(...).default`) — a bare \b${name}\b match doesn't
+            // distinguish the two, since a word boundary exists on both sides of "default" whether or
+            // not it's preceded by a dot. A negative lookbehind excludes the property-access form.
+            if (!new RegExp(`(?<!\\.)\\b${name}\\b`).test(masked))
                 continue; // never used outside factory
             const s = need.get(mk.path) ?? new Set();
             s.add(name);
@@ -639,6 +1019,86 @@ export function ensureMockedImports(code) {
         }
     }
     return outLines.join('\n');
+}
+// A bare `jest.fn()`/`vi.fn()` (no generic) types as Mock<UnknownFunction>, whose return type is
+// `unknown` — NOT `Promise<unknown>`. jest-mock's `.mockResolvedValue()`/`.mockRejectedValue()`
+// overloads are conditional on the mock's return type extending Promise, so against a bare
+// UnknownFunction mock they collapse their parameter to `never` and reject every value, no matter
+// what's passed. The fix is mechanical (give the mock an explicit Promise-returning type) and
+// models reliably fail to apply it even when told the exact pattern to use, re-emitting the same
+// broken `jest.fn().mockResolvedValue(x)` verbatim across retries — so do it deterministically
+// instead of relying on the model. Two shapes seen in practice:
+//   jest.fn().mockResolvedValue(x)              -> (jest.fn() as unknown as jest.Mock<() => Promise<any>>).mockResolvedValue(x)
+//   (thing as jest.Mock).mockResolvedValue(x)    -> (thing as unknown as jest.Mock<() => Promise<any>>).mockResolvedValue(x)
+// A single-generic, full-function-type `jest.Mock<() => Promise<any>>` ONLY resolves this way
+// under `@jest/globals`'s modern type (`Mock<T extends FunctionLike = UnknownFunction>`). Without
+// `import { jest } from '@jest/globals'` in scope, the ambient (ships-with-@types/jest) `Mock` is
+// the legacy 3-generic form (`Mock<T = any, Y extends any[] = any, C = any>`) where the first slot
+// means RETURN TYPE, not a full function signature — so `Mock<() => Promise<any>>` silently binds
+// `T` to a function type instead, and `.mockResolvedValue()`'s conditional overload (needs T to
+// extend Promise) collapses to `never` again, the exact failure this function exists to fix.
+// Confirmed by direct testing: this happens identically whether the annotation is written as a
+// cast (`as unknown as jest.Mock<T>`), a call generic (`jest.fn<T>()`, which additionally hits a
+// TS2743 arity error under the legacy ambient overloads), or a variable annotation — there is no
+// generic-position trick that avoids it. So whenever this function performs a jest rewrite, it
+// also ensures the file imports `{ jest }` from '@jest/globals' (merging into an existing import
+// from that module if present) — vitest is left alone since `vi.fn<T>()`'s arity hasn't been
+// observed to have the same fragility and vitest's `Mock<T>` is a different (args, return) shape
+// that isn't safe to guess a fix for here. Already-generic forms (`jest.fn<...>()`,
+// `as jest.Mock<...>`) don't match and are left alone.
+export function fixNeverTypedAsyncMocks(code) {
+    if (!/\.mock(?:Resolved|Rejected)Value\(/.test(code))
+        return code;
+    const masked = blankStringsAndComments(code);
+    const chainRe = /\b(?:jest|vi)\.fn\(\)(?=\s*\.mock(?:Resolved|Rejected)Value\()/g;
+    const castRe = /\([^()]+?\s+as\s+jest\.Mock\)(?=\s*\.mock(?:Resolved|Rejected)Value\()/g;
+    const matches = [];
+    let touchedJest = false;
+    for (let m = chainRe.exec(masked); m; m = chainRe.exec(masked)) {
+        const ns = masked.slice(m.index, m.index + m[0].indexOf('.'));
+        if (ns === 'jest')
+            touchedJest = true;
+        matches.push({
+            start: m.index,
+            end: m.index + m[0].length,
+            replacement: ns === 'jest'
+                ? `(jest.fn() as unknown as jest.Mock<() => Promise<any>>)`
+                : `vi.fn<() => Promise<any>>()`,
+        });
+    }
+    for (let m = castRe.exec(masked); m; m = castRe.exec(masked)) {
+        touchedJest = true;
+        const inner = code.slice(m.index + 1, m.index + m[0].length - 1).replace(/\s+as\s+jest\.Mock\s*$/, '');
+        matches.push({ start: m.index, end: m.index + m[0].length, replacement: `(${inner} as unknown as jest.Mock<() => Promise<any>>)` });
+    }
+    if (matches.length === 0)
+        return code;
+    matches.sort((a, b) => a.start - b.start);
+    let out = '';
+    let last = 0;
+    for (const m of matches) {
+        if (m.start < last)
+            continue; // overlapping match, skip
+        out += code.slice(last, m.start) + m.replacement;
+        last = m.end;
+    }
+    out += code.slice(last);
+    if (touchedJest) {
+        const outLines = out.split('\n');
+        const alreadyImported = [...iterImportStatements(outLines)].some(stmt => {
+            const p = parseImportStatement(stmt.text);
+            return p && moduleKey(p.module) === moduleKey('@jest/globals') && p.names.includes('jest');
+        });
+        if (!alreadyImported) {
+            const stmt = `import { jest } from '@jest/globals';`;
+            if (!mergeNamedImportIntoExisting(outLines, stmt)) {
+                const at = lastImportStatementEndIdx(outLines);
+                outLines.splice(at + 1, 0, stmt);
+            }
+            out = outLines.join('\n');
+        }
+    }
+    return out;
 }
 // Merges duplicate vi.mock() calls for the same module path into one.
 // The model sometimes emits two vi.mock('lucide-react', ...) blocks when a component
@@ -850,6 +1310,29 @@ export function buildUnhandledErrorMessage(currentError, passCount) {
         `${currentError}\n` +
         `${RULE_DIVIDER}`);
 }
+// The test process CRASHED (see detectProcessCrash) rather than failing a normal assertion —
+// framed completely differently from buildRegressionMessage/buildStructureBrokenMessage on
+// purpose, since "fix your assertions" is actively wrong advice for a heap-exhaustion/segfault.
+export function buildProcessCrashMessage(crashSignature, originalError) {
+    return (`⚠ CRITICAL — THE TEST PROCESS CRASHED (${crashSignature.slice(0, 150)}). THIS IS NOT A NORMAL TEST REGRESSION.\n\n` +
+        `Do NOT edit assertions or try to "make tests pass again" — a crash means something is consuming unbounded memory or resources. Most likely causes:\n` +
+        `- An unmocked timer/interval, or a real network/DB call, left running across tests instead of being mocked or cleared\n` +
+        `- A mock that calls itself recursively, or returns something that drives an infinite loop\n` +
+        `- A genuinely huge fixture/mock data structure your change introduced\n\n` +
+        `Find and undo whatever your last change introduced that could run unbounded — do not just resubmit a similar patch.\n\n` +
+        `Original failing test error (what you were originally fixing):\n` +
+        `${RULE_DIVIDER}\n` +
+        `${originalError.slice(0, 800)}\n` +
+        `${RULE_DIVIDER}`);
+}
+// Shared by every consecutivePatchFailures escalation trigger (anchor-not-found, test-count-
+// mismatch, and a patch/rewrite that keeps producing a 0-tests-collected file) in both
+// loop.ts and fix-loop.ts — one message instead of three near-duplicate strings per file.
+export function buildPatchEscalationMessage(count, reason) {
+    return (`PATCH MODE KEEPS FAILING (${reason}, ${count} times in a row) — SWITCH TO FULL REWRITE MODE.\n` +
+        `You MUST use <code_output> (NOT <code_patch>) on this attempt and output the COMPLETE test file, including every existing test verbatim plus your fix.\n` +
+        `Do NOT use <code_patch> this time.`);
+}
 // A very specific, high-signal failure: the stack bottoms out in `process.exit`
 // inside PRODUCTION code (a fail-loud health check in an async factory/singleton
 // — getInstance/connect/init), invoked from the test, NOT on an `expect` line.
@@ -1007,9 +1490,30 @@ function stripOuterQuotes(s) {
     }
     return s;
 }
+// Models occasionally wrap a `@@@` marker line in a comment style other than the required `//`
+// line-comment — most often HTML-comment syntax (`<!-- @@@ REPLACE: ... -->`) or a block comment
+// (`/* @@@ REPLACE: ... */`), and typically wrap the WHOLE multi-line op in one comment (opener
+// on the REPLACE line, closer on the END line) rather than per-line, so the opener and closer
+// tokens can land on different lines entirely. headerRe/withRe/endRe require an exact `// @@@ ...`
+// prefix with no fallback, so a marker in the wrong comment style doesn't error, it just fails to
+// match — the line is silently skipped and the whole operation vanishes with no signal to the
+// model or the user, even when the underlying fix was otherwise correct. Confirmed in practice: a
+// model correctly diagnosed a missing `session.withTransaction` mock and emitted two REPLACE ops,
+// but wrote the first as `<!-- @@@ REPLACE:` ... `// @@@ END -->` — it silently no-opped while the
+// second, plain `// @@@`-prefixed op for the same fix elsewhere applied fine. Strip a leading
+// comment-opener immediately before `@@@` and a trailing comment-closer at end of line
+// independently (not requiring both on the same line) before running the marker regexes; only
+// ever used for MARKER detection on a parallel array, never for the captured old/new content
+// itself, so a correctly-formatted patch behaves identically to before.
+function normalizePatchMarkerLine(line) {
+    return line
+        .replace(/^(\s*)(?:<!--|\/\*)\s*(?=@@@)/, '$1// ')
+        .replace(/\s*(?:-->|\*\/)\s*$/, '');
+}
 export function parsePatch(patchOutput) {
     const ops = [];
     const lines = patchOutput.split('\n');
+    const markerLines = lines.map(normalizePatchMarkerLine);
     // Capture everything after the colon as the raw anchor; a single pair of
     // outer quotes is stripped below. Capturing the whole remainder (rather than
     // a `"([^"]*)"` group) is required because a test name can itself contain
@@ -1022,7 +1526,7 @@ export function parsePatch(patchOutput) {
     const endRe = /^\/\/ @@@ END\s*$/;
     let i = 0;
     while (i < lines.length) {
-        const m = headerRe.exec(lines[i]);
+        const m = headerRe.exec(markerLines[i]);
         if (!m) {
             i++;
             continue;
@@ -1032,17 +1536,17 @@ export function parsePatch(patchOutput) {
         if (type === 'REPLACE') {
             // Read old text until // @@@ WITH:
             const oldLines = [];
-            while (i < lines.length && !withRe.test(lines[i]) && !endRe.test(lines[i])) {
+            while (i < lines.length && !withRe.test(markerLines[i]) && !endRe.test(markerLines[i])) {
                 oldLines.push(lines[i]);
                 i++;
             }
-            if (!withRe.test(lines[i] ?? '')) {
+            if (!withRe.test(markerLines[i] ?? '')) {
                 i++;
                 continue;
             } // malformed — skip
             i++; // skip // @@@ WITH:
             const newLines = [];
-            while (i < lines.length && !endRe.test(lines[i])) {
+            while (i < lines.length && !endRe.test(markerLines[i])) {
                 newLines.push(lines[i]);
                 i++;
             }
@@ -1062,7 +1566,7 @@ export function parsePatch(patchOutput) {
         else {
             const anchor = stripOuterQuotes((m[2] ?? '').trim()); // ADD_IMPORT/ADD_AFTER_IMPORTS have no anchor
             const contentLines = [];
-            while (i < lines.length && !endRe.test(lines[i])) {
+            while (i < lines.length && !endRe.test(markerLines[i])) {
                 contentLines.push(lines[i]);
                 i++;
             }
@@ -1126,7 +1630,7 @@ function findAnchorRange(code, anchor) {
 // until it returns to 0, then consume the closing `)` and optional `;`.
 // We do a simplified scan that handles string literals and template literals to avoid
 // false brace counts inside quoted text.
-function findCallEnd(code, startIdx) {
+export function findCallEnd(code, startIdx) {
     let i = startIdx; // points at the `(` of the call
     let parenDepth = 0;
     let braceDepth = 0;
@@ -1646,6 +2150,44 @@ function normalizeBlockSig(block) {
 export function dedupeTestBlocks(code) {
     return dedupeScope(code);
 }
+// A full <code_output> rewrite should NEVER legitimately contain this literal text — `// @@@
+// REPLACE:`/`// @@@ WITH:`/`// @@@ END` is lacuna's OWN internal <code_patch> delimiter syntax
+// (see parsePatch above), not real TypeScript. Found leaking into a full-file response in real
+// production dogfooding — the model's own prior patch-mode attempt was still sitting in
+// conversation history, and a later full-rewrite response copied fragments of it verbatim,
+// including the raw markers, rather than treating it as reference-only. The EXISTING check at
+// loop.ts's `generator.isPatch && !patchBase` branch is a different, already-fixed scenario (patch
+// syntax used for a brand-new file); this checks the OPPOSITE direction — patch syntax bleeding
+// into what's supposed to be full, patch-free file content.
+const STRAY_PATCH_MARKER_RE = /\/\/ @@@ (?:REPLACE|WITH|END)\b/;
+export function detectStrayPatchMarkers(code) {
+    return STRAY_PATCH_MARKER_RE.test(code);
+}
+// A test file can pass every assertion while still leaking a real async handle (an interval a
+// module starts on import, an open socket/connection) that's never cleared — invisible to
+// pass/fail-count classification since the run is green. Confirmed via a real production dogfooding
+// bug: db.ts's setInterval-based connection-progress logger stayed alive past 2 tests that never
+// called the module's own exported stopProgress(). Jest itself already tells us this happened —
+// `forceExit` prints "Force exiting Jest: Have you considered using `--detectOpenHandles`" whenever
+// it had to kill a lingering handle, and WITHOUT forceExit at all, Jest instead first prints "Jest
+// did not exit one second after the test run has completed" and then hangs indefinitely (verified
+// empirically: a bare `setInterval` in a test left the process alive with no further output).
+// Both phrasings are Jest-internal and distinctive enough that no real test fixture would produce
+// them coincidentally.
+const OPEN_HANDLE_LEAK_RE = /Force exiting Jest|Jest did not exit one second after the test run/;
+export function detectOpenHandleLeak(rawRunOutput) {
+    return OPEN_HANDLE_LEAK_RE.test(rawRunOutput);
+}
+export function buildOpenHandleLeakMessage() {
+    return ('Tests passed, but Jest had to force-exit because of a leaked async handle (a setInterval/setTimeout/open ' +
+        'connection that was never cleared) — left running, this can hang CI or bleed into later test suites.\n' +
+        'Find the timer/interval/connection this test (or a module it imports) creates and clear it before the test ' +
+        'ends: capture the handle and call clearInterval(...)/clearTimeout(...)/close(...), or call the module\'s own ' +
+        'cleanup/stop export if it has one — a module that starts a background interval on import often also exports ' +
+        'a stop/cleanup function for exactly this reason.\n' +
+        'Only switch to jest.useFakeTimers() if doing so does not change what the test is actually verifying — ' +
+        'otherwise clear the real handle directly.');
+}
 function dedupeScope(code) {
     const seen = new Set();
     let out = '';
@@ -1720,12 +2262,13 @@ export function tryApplyPatchWithDiag(existingCode, patchOutput) {
 export function parseMocksPatch(patchOutput) {
     const ops = [];
     const lines = patchOutput.split('\n');
+    const markerLines = lines.map(normalizePatchMarkerLine);
     const headerRe = /^\/\/ @@@ (REPLACE|APPEND_EXPORT|ADD_TO_BEFOREEACH):\s*$/;
     const withRe = /^\/\/ @@@ WITH:\s*$/;
     const endRe = /^\/\/ @@@ END\s*$/;
     let i = 0;
     while (i < lines.length) {
-        const m = headerRe.exec(lines[i]);
+        const m = headerRe.exec(markerLines[i]);
         if (!m) {
             i++;
             continue;
@@ -1734,17 +2277,17 @@ export function parseMocksPatch(patchOutput) {
         i++;
         if (type === 'REPLACE') {
             const oldLines = [];
-            while (i < lines.length && !withRe.test(lines[i]) && !endRe.test(lines[i])) {
+            while (i < lines.length && !withRe.test(markerLines[i]) && !endRe.test(markerLines[i])) {
                 oldLines.push(lines[i]);
                 i++;
             }
-            if (!withRe.test(lines[i] ?? '')) {
+            if (!withRe.test(markerLines[i] ?? '')) {
                 i++;
                 continue;
             }
             i++; // skip // @@@ WITH:
             const newLines = [];
-            while (i < lines.length && !endRe.test(lines[i])) {
+            while (i < lines.length && !endRe.test(markerLines[i])) {
                 newLines.push(lines[i]);
                 i++;
             }
@@ -1764,7 +2307,7 @@ export function parseMocksPatch(patchOutput) {
         else {
             // APPEND_EXPORT and ADD_TO_BEFOREEACH — just content, no WITH: block
             const contentLines = [];
-            while (i < lines.length && !endRe.test(lines[i])) {
+            while (i < lines.length && !endRe.test(markerLines[i])) {
                 contentLines.push(lines[i]);
                 i++;
             }
