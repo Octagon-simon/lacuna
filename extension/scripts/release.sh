@@ -1,16 +1,21 @@
 #!/bin/bash
-# Usage (from extension/): npm run release [patch|minor|major]
+# Usage (from extension/): npm run release [patch|minor|major|--no-bump]
 #
-# Bumps the extension version, validates the build + package locally (so a broken bundle or manifest
-# fails BEFORE we tag), then commits, tags `ext-vX.Y.Z`, and pushes. CI takes over from the tag:
+# Bumps the extension version (or --no-bump to ship the current version as-is — for the FIRST
+# Marketplace release, where you want 0.1.0 published rather than skipping straight to 0.1.1),
+# validates the build + package locally (so a broken bundle or manifest fails BEFORE we tag), then
+# commits, tags `ext-vX.Y.Z`, and pushes. CI takes over from the tag:
 # .github/workflows/release-extension.yml builds, packages, and publishes to the VS Code Marketplace,
 # and attaches the .vsix to a GitHub release. Mirrors the CLI's scripts/release.sh (tag → CI ships),
 # except the extension tag is namespaced `ext-v*` so it never collides with the CLI's `v*` tags.
 set -e
 
 BUMP=${1:-patch}
-if [[ ! "$BUMP" =~ ^(patch|minor|major)$ ]]; then
-  echo "Usage: npm run release [patch|minor|major]"
+NO_BUMP=0
+if [[ "$BUMP" == "--no-bump" ]]; then
+  NO_BUMP=1
+elif [[ ! "$BUMP" =~ ^(patch|minor|major)$ ]]; then
+  echo "Usage: npm run release [patch|minor|major|--no-bump]"
   exit 1
 fi
 
@@ -35,16 +40,36 @@ npx @vscode/vsce package --no-dependencies -o /tmp/lacuna-ext-preflight.vsix >/d
 rm -f /tmp/lacuna-ext-preflight.vsix
 echo "✓ pre-flight package OK"
 
-# Bump extension/package.json only (no npm git tag — we tag ext-v* ourselves).
-npm version "$BUMP" --no-git-tag-version
-VERSION=$(node -p "require('./package.json').version")
+# Bump extension/package.json (or keep the current version with --no-bump). No npm git tag — we tag
+# ext-v* ourselves.
+if [[ "$NO_BUMP" == "1" ]]; then
+  VERSION=$(node -p "require('./package.json').version")
+  echo "No-bump: releasing current version ${VERSION}"
+else
+  npm version "$BUMP" --no-git-tag-version
+  VERSION=$(node -p "require('./package.json').version")
+fi
 TAG="ext-v${VERSION}"
 
-git add package.json package-lock.json
-git commit -m "chore: release extension ${TAG}"
-git tag "$TAG"
-git push origin main
-git push origin "$TAG"
+# Never silently move an existing tag (a --no-bump re-run, or a version already released).
+if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+  echo "Tag ${TAG} already exists. Bump the version instead of re-releasing ${VERSION}."
+  exit 1
+fi
+
+# Stage whatever changed since the clean checkpoint: the version bump, and any dist the pre-flight
+# build refreshed. With --no-bump on an already-current tree there's nothing to stage — then we just
+# tag the existing HEAD (no empty commit) and push only the tag.
+git add -A
+if git diff --cached --quiet; then
+  git tag "$TAG"
+  git push origin "$TAG"
+else
+  git commit -m "chore: release extension ${TAG}"
+  git tag "$TAG"
+  git push origin main
+  git push origin "$TAG"
+fi
 
 echo ""
 echo "Released extension ${TAG} — CI will build, package, and publish to the VS Code Marketplace."
