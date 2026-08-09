@@ -52,8 +52,15 @@ else
 fi
 
 if changed "$EXT_TAG" "${EXT_PATHS[@]}"; then
-  echo "▶ Extension changed since ${EXT_TAG:-<no tag>} — releasing extension ($BUMP)"
-  bash extension/scripts/release.sh "$BUMP"
+  if [ -z "$EXT_TAG" ]; then
+    # First-ever extension release: ship the current version as-is (e.g. 0.1.0) rather than bumping
+    # straight to 0.1.1. After this the ext-v* tag exists and normal bumping applies.
+    echo "▶ First extension release — shipping current version as-is (no bump)"
+    bash extension/scripts/release.sh --no-bump
+  else
+    echo "▶ Extension changed since ${EXT_TAG} — releasing extension ($BUMP)"
+    bash extension/scripts/release.sh "$BUMP"
+  fi
   DID=1
 else
   echo "• Extension unchanged since ${EXT_TAG} — skipping"
