@@ -139,13 +139,15 @@
     "watch": "node esbuild.mjs --watch",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "package": "vsce package --no-dependencies",
-    "release": "bash scripts/release.sh"
+    "release": "bash scripts/release.sh",
+    "publish:ovsx": "bash scripts/publish-ovsx.sh"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^3.9.0",
     "esbuild": "^0.21.0",
+    "ovsx": "^0.10.0",
     "typescript": "^5.4.0"
   }
 }
