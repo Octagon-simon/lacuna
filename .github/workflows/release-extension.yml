@@ -44,17 +44,19 @@ jobs:
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
 
-      # Open VSX (Cursor / Windsurf / VSCodium) — disabled until the Open VSX account is approved.
-      # To enable: add an OVSX_TOKEN repo secret and uncomment. The attached .vsix (below) lets those
-      # editors install manually in the meantime.
-      # - name: Publish to Open VSX
-      #   working-directory: extension
-      #   run: npx ovsx publish "lacuna-vscode-${GITHUB_REF_NAME#ext-v}.vsix" -p "$OVSX_TOKEN"
-      #   env:
-      #     OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
+      # Open VSX (Cursor / Windsurf / VSCodium / Antigravity). Publishes the SAME .vsix as above.
+      # Needs an OVSX_TOKEN repo secret. For a new version both registries publish cleanly; to
+      # re-publish only Open VSX for an already-Marketplace'd version, use `npm run publish:ovsx`
+      # locally (see extension/package.json) — that path skips vsce so it won't error on a duplicate.
+      - name: Publish to Open VSX
+        working-directory: extension
+        run: npx ovsx publish "lacuna-vscode-${GITHUB_REF_NAME#ext-v}.vsix" -p "$OVSX_TOKEN"
+        env:
+          OVSX_TOKEN: ${{ secrets.OVSX_TOKEN }}
 
-      # A GitHub release with the .vsix attached — for manual install on editors we don't publish to
-      # yet. NOT marked --latest (that belongs to the CLI's `v*` releases).
+      # A GitHub release with the .vsix attached — for direct/manual install (air-gapped setups,
+      # Theia-based editors, or pinning an exact version). NOT marked --latest (that belongs to the
+      # CLI's `v*` releases).
       - name: GitHub release (attach .vsix)
         working-directory: extension
         env:
