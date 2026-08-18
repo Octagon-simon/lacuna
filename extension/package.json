@@ -2,7 +2,7 @@
   "name": "lacuna-vscode",
   "displayName": "Lacuna — AI Test Coverage",
   "description": "Find coverage gaps, generate tests, and fix failing tests with an agentic loop — inside your editor.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "octagon",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -31,71 +31,251 @@
   ],
   "contributes": {
     "commands": [
-      { "command": "lacuna.generateTests", "title": "Generate Tests", "category": "Lacuna" },
-      { "command": "lacuna.fixTests", "title": "Fix Failing Tests", "category": "Lacuna" },
-      { "command": "lacuna.generateFolder", "title": "Generate Tests for Gaps in Folder", "category": "Lacuna" },
-      { "command": "lacuna.fixFolder", "title": "Fix Failing Tests in Folder", "category": "Lacuna" },
-      { "command": "lacuna.generateSelected", "title": "Generate Tests for Selected Files", "category": "Lacuna" },
-      { "command": "lacuna.fixSelected", "title": "Fix Failing Tests for Selected Files", "category": "Lacuna" },
-      { "command": "lacuna.toggleAutoMode", "title": "Toggle Auto Mode", "category": "Lacuna" },
-      { "command": "lacuna.openSettings", "title": "Open Settings", "category": "Lacuna" },
-      { "command": "lacuna.runInit", "title": "Set Up (init)", "category": "Lacuna" },
-      { "command": "lacuna.runSetup", "title": "Install Test Dependencies", "category": "Lacuna" },
-      { "command": "lacuna.setApiKey", "title": "Set API Key", "category": "Lacuna" },
-      { "command": "lacuna.clearApiKey", "title": "Clear Stored API Key", "category": "Lacuna" },
-      { "command": "lacuna.showRawLog", "title": "View Raw Log", "category": "Lacuna" },
-      { "command": "lacuna.showActiveRun", "title": "Show Active Run", "category": "Lacuna" },
-      { "command": "lacuna.gaps.refresh", "title": "Refresh", "category": "Lacuna", "icon": "$(refresh)" },
-      { "command": "lacuna.gaps.generateHere", "title": "Generate Tests", "category": "Lacuna", "icon": "$(sparkle)" },
-      { "command": "lacuna.memory.refresh", "title": "Refresh", "category": "Lacuna", "icon": "$(refresh)" },
-      { "command": "lacuna.memory.delete", "title": "Delete Entry", "category": "Lacuna", "icon": "$(trash)" },
-      { "command": "lacuna.memory.show", "title": "Show Entry", "category": "Lacuna", "icon": "$(eye)" },
-      { "command": "lacuna.memory.sortConfidence", "title": "Sort by Confidence", "category": "Lacuna" },
-      { "command": "lacuna.memory.sortHits", "title": "Sort by Hit Count", "category": "Lacuna" },
-      { "command": "lacuna.showDebugLog", "title": "View Debug Log for File", "category": "Lacuna" }
+      {
+        "command": "lacuna.generateTests",
+        "title": "Generate Tests",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.fixTests",
+        "title": "Fix Failing Tests",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.generateFolder",
+        "title": "Generate Tests for Gaps in Folder",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.fixFolder",
+        "title": "Fix Failing Tests in Folder",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.generateSelected",
+        "title": "Generate Tests for Selected Files",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.fixSelected",
+        "title": "Fix Failing Tests for Selected Files",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.toggleAutoMode",
+        "title": "Toggle Auto Mode",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.openSettings",
+        "title": "Open Settings",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.runInit",
+        "title": "Set Up (init)",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.runSetup",
+        "title": "Install Test Dependencies",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.setApiKey",
+        "title": "Set API Key",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.clearApiKey",
+        "title": "Clear Stored API Key",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.showRawLog",
+        "title": "View Raw Log",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.showActiveRun",
+        "title": "Show Active Run",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.gaps.refresh",
+        "title": "Refresh",
+        "category": "Lacuna",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "lacuna.gaps.generateHere",
+        "title": "Generate Tests",
+        "category": "Lacuna",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "lacuna.memory.refresh",
+        "title": "Refresh",
+        "category": "Lacuna",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "lacuna.memory.delete",
+        "title": "Delete Entry",
+        "category": "Lacuna",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "lacuna.memory.show",
+        "title": "Show Entry",
+        "category": "Lacuna",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "lacuna.memory.sortConfidence",
+        "title": "Sort by Confidence",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.memory.sortHits",
+        "title": "Sort by Hit Count",
+        "category": "Lacuna"
+      },
+      {
+        "command": "lacuna.showDebugLog",
+        "title": "View Debug Log for File",
+        "category": "Lacuna"
+      }
     ],
     "menus": {
       "explorer/context": [
-        { "command": "lacuna.generateTests", "when": "resourceLangId =~ /^(typescript|typescriptreact|javascript|javascriptreact)$/ && !explorerResourceIsFolder && !(resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/)", "group": "lacuna@1" },
-        { "command": "lacuna.fixTests", "when": "resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/", "group": "lacuna@2" },
-        { "command": "lacuna.generateFolder", "when": "explorerResourceIsFolder", "group": "lacuna@1" },
-        { "command": "lacuna.fixFolder", "when": "explorerResourceIsFolder", "group": "lacuna@2" },
-        { "command": "lacuna.generateSelected", "when": "!explorerResourceIsFolder && listMultiSelection", "group": "lacuna@1" },
-        { "command": "lacuna.fixSelected", "when": "!explorerResourceIsFolder && listMultiSelection", "group": "lacuna@2" }
+        {
+          "command": "lacuna.generateTests",
+          "when": "resourceLangId =~ /^(typescript|typescriptreact|javascript|javascriptreact)$/ && !explorerResourceIsFolder && !(resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/)",
+          "group": "lacuna@1"
+        },
+        {
+          "command": "lacuna.fixTests",
+          "when": "resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/",
+          "group": "lacuna@2"
+        },
+        {
+          "command": "lacuna.generateFolder",
+          "when": "explorerResourceIsFolder",
+          "group": "lacuna@1"
+        },
+        {
+          "command": "lacuna.fixFolder",
+          "when": "explorerResourceIsFolder",
+          "group": "lacuna@2"
+        },
+        {
+          "command": "lacuna.generateSelected",
+          "when": "!explorerResourceIsFolder && listMultiSelection",
+          "group": "lacuna@1"
+        },
+        {
+          "command": "lacuna.fixSelected",
+          "when": "!explorerResourceIsFolder && listMultiSelection",
+          "group": "lacuna@2"
+        }
       ],
       "editor/context": [
-        { "command": "lacuna.generateTests", "when": "resourceLangId =~ /^(typescript|typescriptreact|javascript|javascriptreact)$/ && !(resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/)", "group": "lacuna@1" },
-        { "command": "lacuna.fixTests", "when": "resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/", "group": "lacuna@2" }
+        {
+          "command": "lacuna.generateTests",
+          "when": "resourceLangId =~ /^(typescript|typescriptreact|javascript|javascriptreact)$/ && !(resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/)",
+          "group": "lacuna@1"
+        },
+        {
+          "command": "lacuna.fixTests",
+          "when": "resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/",
+          "group": "lacuna@2"
+        }
       ],
       "editor/title": [
-        { "command": "lacuna.generateTests", "when": "resourceLangId =~ /^(typescript|typescriptreact|javascript|javascriptreact)$/ && !(resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/)", "group": "navigation@9" }
+        {
+          "command": "lacuna.generateTests",
+          "when": "resourceLangId =~ /^(typescript|typescriptreact|javascript|javascriptreact)$/ && !(resourceFilename =~ /\\.(test|spec)\\.[jt]sx?$/)",
+          "group": "navigation@9"
+        }
       ],
       "view/title": [
-        { "command": "lacuna.gaps.refresh", "when": "view == lacuna.gapsView", "group": "navigation" },
-        { "command": "lacuna.memory.refresh", "when": "view == lacuna.memoryView", "group": "navigation" },
-        { "command": "lacuna.memory.sortConfidence", "when": "view == lacuna.memoryView", "group": "1_sort" },
-        { "command": "lacuna.memory.sortHits", "when": "view == lacuna.memoryView", "group": "1_sort" }
+        {
+          "command": "lacuna.gaps.refresh",
+          "when": "view == lacuna.gapsView",
+          "group": "navigation"
+        },
+        {
+          "command": "lacuna.memory.refresh",
+          "when": "view == lacuna.memoryView",
+          "group": "navigation"
+        },
+        {
+          "command": "lacuna.memory.sortConfidence",
+          "when": "view == lacuna.memoryView",
+          "group": "1_sort"
+        },
+        {
+          "command": "lacuna.memory.sortHits",
+          "when": "view == lacuna.memoryView",
+          "group": "1_sort"
+        }
       ],
       "view/item/context": [
-        { "command": "lacuna.gaps.generateHere", "when": "view == lacuna.gapsView && viewItem == gap", "group": "inline" },
-        { "command": "lacuna.memory.show", "when": "view == lacuna.memoryView && viewItem == memoryEntry", "group": "inline@1" },
-        { "command": "lacuna.memory.delete", "when": "view == lacuna.memoryView && viewItem == memoryEntry", "group": "inline@2" }
+        {
+          "command": "lacuna.gaps.generateHere",
+          "when": "view == lacuna.gapsView && viewItem == gap",
+          "group": "inline"
+        },
+        {
+          "command": "lacuna.memory.show",
+          "when": "view == lacuna.memoryView && viewItem == memoryEntry",
+          "group": "inline@1"
+        },
+        {
+          "command": "lacuna.memory.delete",
+          "when": "view == lacuna.memoryView && viewItem == memoryEntry",
+          "group": "inline@2"
+        }
       ],
       "commandPalette": [
-        { "command": "lacuna.gaps.generateHere", "when": "false" },
-        { "command": "lacuna.memory.delete", "when": "false" },
-        { "command": "lacuna.memory.show", "when": "false" }
+        {
+          "command": "lacuna.gaps.generateHere",
+          "when": "false"
+        },
+        {
+          "command": "lacuna.memory.delete",
+          "when": "false"
+        },
+        {
+          "command": "lacuna.memory.show",
+          "when": "false"
+        }
       ]
     },
     "viewsContainers": {
       "activitybar": [
-        { "id": "lacuna", "title": "Lacuna", "icon": "media/lacuna.svg" }
+        {
+          "id": "lacuna",
+          "title": "Lacuna",
+          "icon": "media/lacuna.svg"
+        }
       ]
     },
     "views": {
       "lacuna": [
-        { "id": "lacuna.gapsView", "name": "Coverage Gaps", "icon": "media/lacuna.svg", "contextualTitle": "Lacuna" },
-        { "id": "lacuna.memoryView", "name": "Memory (Learned Rules)", "icon": "media/lacuna.svg", "contextualTitle": "Lacuna" }
+        {
+          "id": "lacuna.gapsView",
+          "name": "Coverage Gaps",
+          "icon": "media/lacuna.svg",
+          "contextualTitle": "Lacuna"
+        },
+        {
+          "id": "lacuna.memoryView",
+          "name": "Memory (Learned Rules)",
+          "icon": "media/lacuna.svg",
+          "contextualTitle": "Lacuna"
+        }
       ]
     },
     "viewsWelcome": [
