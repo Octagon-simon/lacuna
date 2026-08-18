@@ -1,7 +1,7 @@
-// The identifier a test file is named for — `useForcedUpdate.test.ts` → `useForcedUpdate`. Used to
+// The identifier a test file is named for — `useThing.test.ts` → `useThing`. Used to
 // guard against a fix/regen QUIETLY changing WHAT the test tests: a model that can't get a hard
 // hook/component mock right will sometimes rewrite the file to test an easy imported utility
-// instead (observed: `useForcedUpdate.test.ts` rewritten to test `compareVersions`), and because
+// instead (observed: a hook's test rewritten to test an imported util), and because
 // keep-best ranks by PASS COUNT, those trivial-but-passing tests beat the real ones and get kept —
 // silently destroying coverage of the actual subject. Returns null for generic/aggregate names
 // where the guard would false-positive.
@@ -17,7 +17,7 @@ export function subjectFromTestPath(testPath: string): string | null {
 }
 
 // True when `code` references `subject` as a whole-word identifier (import or usage). Word-bounded so
-// `useForcedUpdate` doesn't match inside `useForcedUpdateThing`.
+// `useThing` doesn't match inside `useThingExtra`.
 export function referencesSubject(code: string, subject: string): boolean {
   return new RegExp(`\\b${subject.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(code)
 }
@@ -142,6 +142,62 @@ export function detectUnrelatedFileCrash(
   return (
     `\n\n⚠ THIS CRASH ORIGINATES IN AN UNRELATED FILE (${file}:${line}) — not your test file, not a configured mock, not the source file under test.\n` +
     `Your change likely altered something ${file}'s module-load or dependency chain relies on (e.g. removed/broke a mock or import elsewhere). Do NOT edit assertions in your test file to work around this — find and undo whatever change caused '${file}' to receive an unexpected value, or add/fix a mock for whatever it depends on that isn't mocked yet.`
+  )
+}
+
+// A test run can fail for reasons NO edit to the test file can fix: a globalSetup / vitest.config /
+// jest globalSetup or a config-level GUARD that throws BEFORE the test file (and its vi.mock()/
+// jest.mock() calls) is ever loaded, or a required backing service (a database) the run can't
+// provide. Vitest's globalSetup runs in its OWN process before the test module exists, so a throw
+// there is structurally un-mockable from inside the test file — the fix loop must recognize this
+// class and STOP, not spend every iteration mock-padding a file that was never the problem.
+// Live-reproduced: a Mongoose DB-integration test hit the same "Refusing to run the test suite
+// against a non-local Mongo host" globalSetup guard on all THREE attempts, the model each time
+// (correctly) reasoning "this is an environment/config issue, not a test logic issue" yet still
+// burning the full iteration budget trying to mock its way past it.
+// Deliberately NARROW: only signatures that are UNAMBIGUOUSLY un-patchable from the test file —
+// an explicit human-authored "refuse to run" guard, or a globalSetup/setup file that itself failed.
+// A bare connection error (ECONNREFUSED:27017, MongoNetworkError) is intentionally NOT here: a unit
+// test that shouldn't touch a real DB can legitimately be fixed by mocking the client, so hard-
+// skipping on it would wrongly abandon a fixable file. Better to miss a few true limitations than
+// to skip a fixable test.
+const ENVIRONMENT_LIMITATION_SIGNATURES: RegExp[] = [
+  // Explicit "refuse to run" safety guards (DB-host allow-listing, "not a local server", etc.) —
+  // these are deliberate globalSetup/config throws, never a per-test failure.
+  /Refusing to run\b[^\n]*/i,
+  // A globalSetup/setup file that itself failed to execute (vitest/jest both name it in the error).
+  /(?:global\s?setup|globalSetup)[^\n]*\b(?:failed|threw|error|exited)/i,
+]
+
+// Returns the guard's own message (the offending sentence through the next blank line) when the
+// failure is an un-patchable environment/setup limitation, else null. Kept to the FIRST match so
+// the message quotes the actual guard, not a downstream stack frame.
+export function detectEnvironmentLimitation(rawOutput: string): string | null {
+  const text = stripAnsi(rawOutput)
+  for (const re of ENVIRONMENT_LIMITATION_SIGNATURES) {
+    const m = re.exec(text)
+    if (!m) continue
+    const lineStart = text.lastIndexOf('\n', m.index) + 1
+    const rest = text.slice(lineStart)
+    const blank = rest.search(/\n\s*\n/)
+    const block = (blank === -1 ? rest : rest.slice(0, blank)).trim()
+    // Cap it — a runaway match shouldn't dump the whole suite output into the message.
+    return block.length > 600 ? block.slice(0, 600) + '…' : block
+  }
+  return null
+}
+
+// The human-facing explanation for an environment limitation: names WHY no test-file edit works
+// (the throw is in a different process/phase than the test's mocks) and WHAT a human must do. Fed
+// to the model AND logged, so both the model (if it somehow continues) and the user get the truth
+// instead of a mock-shaped guess.
+export function buildEnvironmentLimitationMessage(signature: string): string {
+  return (
+    `\n\n⚠ ENVIRONMENT LIMITATION — this is NOT a bug in the test file, and no edit to the test file can fix it:\n` +
+    `${signature}\n\n` +
+    `This is thrown by the project's test SETUP — a vitest/jest globalSetup, vitest.config, or a config-level guard — which runs in a SEPARATE process/phase BEFORE this test file and its vi.mock()/jest.mock() calls are ever loaded. That is why mocking modules inside the test file cannot intercept it. ` +
+    `The suite needs something the run isn't providing: a real backing service (e.g. a local database) or an environment variable. A human must supply it — set the required env var (e.g. MONGO_URL pointing at a LOCAL instance) in .lacuna.json's "testEnv", start the service the tests expect, or add this file to .lacuna.json's "ignore" list until the environment can provide it. ` +
+    `Do NOT rewrite the test to replace the real integration with an in-memory fake — that silently defeats exactly what the test verifies.`
   )
 }
 
@@ -542,7 +598,7 @@ function isProseContent(content: string): boolean {
 // A malformed or truncated model response (hit a token limit mid-function, or emitted a stray
 // fragment) can otherwise be merged straight into the SHARED mocks file with no check at all —
 // unlike test-file content (see hasTestFunctions below), nothing validated the mocks file was
-// even syntactically complete before this existed. Live-observed on kabocash-mobile-RN-expo: a
+// even syntactically complete before this existed. Live-observed on an RN-Expo project: a
 // truncated `---MOCKS_FILE---` response left `renderWithProviders` as `(ui) => {` with no closing
 // brace, silently corrupting the ONE file every test in the project imports — cascading to 80+ of
 // 87 files in a single run, each independently (and wastefully) re-attempting to fix the same

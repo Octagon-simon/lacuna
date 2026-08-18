@@ -36,6 +36,13 @@ export class ProgressPanel {
     return false
   }
 
+  /** Whether a progress panel is currently on-screen (exists AND its tab is visible). Used to decide
+   * if a run needs a completion TOAST — when the panel is closed or hidden, its in-panel done summary
+   * is never seen, so the outcome must be surfaced another way. */
+  static get isVisible(): boolean {
+    return ProgressPanel.current?.panel.visible ?? false
+  }
+
   private bind(run: RunHandle) {
     this.sub?.dispose()
     this.run = run
@@ -45,6 +52,10 @@ export class ProgressPanel {
     this.post({ type: 'init', title: run.title, model: run.meta.model, provider: run.meta.provider, maxIterations: run.meta.maxIterations, files: run.files })
     for (const text of run.rawLog) this.post({ type: 'log', line: { kind: 'info', text, ts: Date.now() } })
     this.post({ type: 'stats', stats: { ...run.stats } })
+    // If the run already finished (panel opened via the completion toast's "Show Details", or
+    // reopened later), replay the terminal state so the summary shows and Stop reads "Done" — the
+    // live `done` event fired before we subscribed and won't come again.
+    if (run.finalDone) this.post(run.finalDone)
     this.sub = run.onMessage((m) => this.post(m))
   }
 
@@ -131,10 +142,10 @@ export class ProgressPanel {
   }
   window.addEventListener('message', (e) => {
     const m = e.data;
-    if (m.type === 'init'){ $('title').textContent = m.title; if(m.model) $('model').textContent = m.model+' ('+m.provider+')'; if(!m._replay){ log.innerHTML=''; done=false; } }
+    if (m.type === 'init'){ $('title').textContent = m.title; if(m.model) $('model').textContent = m.model+' ('+m.provider+')'; if(!m._replay){ log.innerHTML=''; done=false; const s=$('stop'); s.disabled=false; s.classList.add('stop'); s.textContent='Stop'; } }
     else if (m.type === 'log'){ addRow(m.line); }
     else if (m.type === 'stats'){ setStats(m.stats); }
-    else if (m.type === 'done'){ done=true; setStats(m.stats); const d=document.createElement('div'); d.className='done'; d.textContent=(m.ok?'✓ ':'✗ ')+m.summary; log.appendChild(d); $('stop').disabled=true; window.scrollTo(0,document.body.scrollHeight); }
+    else if (m.type === 'done'){ done=true; setStats(m.stats); const d=document.createElement('div'); d.className='done'; d.textContent=(m.ok?'✓ ':'✗ ')+m.summary; log.appendChild(d); const s=$('stop'); s.disabled=true; s.classList.remove('stop'); s.textContent=(m.ok?'Done ✓':'Done ✗'); window.scrollTo(0,document.body.scrollHeight); }
   });
   $('stop').addEventListener('click', () => { if(!done){ vscode.postMessage({type:'cancel'}); $('stop').textContent='Stopping…'; $('stop').disabled=true; } });
   $('raw').addEventListener('click', () => vscode.postMessage({type:'viewRawLog'}));

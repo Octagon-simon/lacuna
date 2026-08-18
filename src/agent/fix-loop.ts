@@ -22,10 +22,30 @@ import type { CoverageGap } from '../lib/coverage/types.js'
 import { ProjectMemory } from './project-memory.js'
 import { getActiveTips, createTipRotator, formatTip } from '../lib/tips.js'
 import { typeCheckFile, findTestFilesWithTypeErrors, TYPECHECK_INCONCLUSIVE } from '../lib/typecheck.js'
-import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, parseFailCount, buildStructureBrokenMessage, buildRegressionMessage, buildUnhandledErrorMessage, processExitLeakGuidance, sanitizeMocksContent, detectUnbalancedMocksSyntax, stripLeadingProse, mergeMocksContent, dedupeMockExports, countTestCases, countDistinctErrors, withMocksLock, detectMocksFileError, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, fixNeverTypedAsyncMocks, dedupeImports, dedupeTestBlocks, replaceUnsafeFunctionType, tryApplyPatch, tryApplyMocksPatch, detectProcessCrash, buildProcessCrashMessage, detectUnrelatedFileCrash, buildPatchEscalationMessage, buildFailingTestChecklist, detectStrayPatchMarkers, detectOpenHandleLeak, buildOpenHandleLeakMessage, detectJestConfigConflict, detectJestValidationError, subjectFromTestPath, referencesSubject, leakLooksTestFixable } from '../lib/validate.js'
+import { hasTestFunctions, hasPlaceholderBodies, enrichNoTestsError, isZeroTestsOutput, parsePassCount, parseFailCount, buildStructureBrokenMessage, buildRegressionMessage, buildUnhandledErrorMessage, processExitLeakGuidance, sanitizeMocksContent, detectUnbalancedMocksSyntax, stripLeadingProse, mergeMocksContent, dedupeMockExports, countTestCases, countDistinctErrors, withMocksLock, detectMocksFileError, deduplicateViMocks, typeImportOriginalCalls, ensureMockedImports, fixNeverTypedAsyncMocks, dedupeImports, dedupeTestBlocks, replaceUnsafeFunctionType, tryApplyPatch, tryApplyMocksPatch, detectProcessCrash, buildProcessCrashMessage, detectUnrelatedFileCrash, buildPatchEscalationMessage, buildFailingTestChecklist, detectStrayPatchMarkers, detectOpenHandleLeak, buildOpenHandleLeakMessage, detectJestConfigConflict, detectJestValidationError, subjectFromTestPath, referencesSubject, leakLooksTestFixable, detectEnvironmentLimitation } from '../lib/validate.js'
 import { extractTestFailure } from '../lib/extract-error.js'
 import { StreamingFileViewer } from '../lib/streaming-viewer.js'
 import { buildFixMemoryHint, recordFixOutcome, recordTagMatchOutcome, normalizeErrorSignature, errorSignatureHash } from '../lib/memory/index.js'
+
+// Format a file we just reported as fixed/passing, then RE-VERIFY. formatFile runs the repo's
+// eslint --fix + prettier, and eslint --fix is not guaranteed behavior-preserving (it can drop an
+// import it deems unused, apply an autofix that changes a matcher, etc.). Without re-verifying, a
+// format that breaks the file leaves it failing on disk even though the loop reported success — the
+// exact "panel said passed but the file fails" bug. Re-run the file's tests; if they no longer pass,
+// restore the exact pre-format content we verified. Best-effort: if we can't run the verify, keep
+// the formatted file (no worse than before this guard existed).
+async function formatFileVerified(absFile: string, cwd: string, config: LacunaConfig, env: DetectedEnvironment): Promise<void> {
+  if (!config.format) return  // formatFile would no-op; skip the whole (costly) verify
+  const green = await readFile(absFile, 'utf-8').catch(() => null)
+  await formatFile(absFile, cwd, { enabled: config.format, env })
+  if (green === null) return
+  try {
+    const fileEnv = await resolveEnvForFile(env, absFile, cwd)
+    const run = await resolveFileTestRun(fileEnv, absFile, cwd)
+    const res = await runCommand(run.command, run.cwd, config.coverageTimeout * 1000)
+    if (!res.success) await writeFile(absFile, green, 'utf-8')
+  } catch { /* verify is best-effort */ }
+}
 
 export interface FixOptions {
   config: LacunaConfig
@@ -132,7 +152,7 @@ function parseFailingTestFiles(output: string, runner: string): string[] {
 
     if (runner === 'jest' || runner === 'vitest' || runner === 'unknown') {
       // `FAIL <path>` (jest / plain vitest) OR `FAIL <project> <path>` (vitest workspace &
-      // monorepo mode, where the package label — e.g. `@afriex/admin` — sits between FAIL and the
+      // monorepo mode, where the package label — e.g. `@acme/admin` — sits between FAIL and the
       // path). Match the first test-file token anywhere on a FAIL-prefixed line rather than
       // requiring it immediately after FAIL, so the workspace label can't hide the file.
       if (/^FAIL\b/.test(clean)) {
@@ -250,9 +270,10 @@ export async function discoverFailingTests(
   cwd: string,
   scopeDir?: string,
   onLine?: (line: string) => void,
+  signal?: AbortSignal,
 ): Promise<{ failing: string[]; allPassing: boolean }> {
   const scopeRun = scopeDir ? await resolveScopeTestRun(env, scopeDir, cwd) : { command: env.testCommand, cwd }
-  const result = await runCommand(scopeRun.command, scopeRun.cwd, config.coverageTimeout * 1000, onLine)
+  const result = await runCommand(scopeRun.command, scopeRun.cwd, config.coverageTimeout * 1000, onLine, signal)
 
   if (result.timedOut) {
     throw new DiscoverFailingError(
@@ -365,7 +386,7 @@ export async function fixFile(
   // caller (a standalone `lacuna fix` discovering already-on-disk failing files) omits this and
   // gets the original re-run-from-scratch behavior.
   precomputedFirstRun?: RunResult,
-): Promise<{ success: boolean; skipped?: boolean; error?: string; typeOnly?: boolean; baselinePassCount?: number }> {
+): Promise<{ success: boolean; skipped?: boolean; error?: string; typeOnly?: boolean; baselinePassCount?: number; environmentLimited?: boolean }> {
   const { config, env, cwd, dryRun, verbose, log } = options
   const shortPath = testFilePath.replace(cwd + '/', '')
   const absTestPath = testFilePath.startsWith('/') ? testFilePath : join(cwd, testFilePath)
@@ -389,7 +410,13 @@ export async function fixFile(
 
   // Run just this test file to get focused error output — unless the caller already has a fresh
   // result for the EXACT content currently on disk (see precomputedFirstRun's own doc comment).
-  const firstRun = precomputedFirstRun ?? await runCommand(fileRun.command, fileRun.cwd, runTimeout)
+  const firstRun = precomputedFirstRun ?? await runCommand(fileRun.command, fileRun.cwd, runTimeout, undefined, options.abortSignal)
+  // Stop pressed while the suite was running — the run was killed, not failed. Bail immediately
+  // instead of feeding empty output into a "fix" the user just cancelled.
+  if (firstRun.aborted || options.abortSignal?.aborted) {
+    onStatus?.({ phase: 'failed', file: shortPath })
+    return { success: false, error: 'Cancelled.' }
+  }
   // A killed run is NOT a test failure — editing tests can't fix a timeout, and the partial,
   // summary-less output would send the fix loop chasing a phantom failure. Surface it instead.
   if (firstRun.timedOut) {
@@ -397,6 +424,24 @@ export async function fixFile(
     if (!onStatus) log(chalk.yellow(`    Raise the limit in .lacuna.json: { "coverageTimeout": ${config.coverageTimeout * 2} }`))
     onStatus?.({ phase: 'failed', file: shortPath })
     return { success: false, error: `Test run timed out after ${config.coverageTimeout}s (suite killed before completing — raise coverageTimeout).` }
+  }
+  // Un-patchable environment/setup failure: a globalSetup / vitest.config / config-level GUARD that
+  // throws before this test file (and its mocks) is even loaded, or a required backing service the
+  // run can't provide. No edit to the test file can fix it — bail BEFORE spending any model
+  // iterations (or even building context/retrieving memory) on a file that was never the problem.
+  // (Live: a DB-integration test hit the same "Refusing to run against a non-local Mongo host"
+  // globalSetup guard on all 3 attempts, each burning the full budget mock-padding it.)
+  if (!firstRun.success) {
+    const envLimit = detectEnvironmentLimitation(firstRun.stdout + '\n' + firstRun.stderr)
+    if (envLimit) {
+      if (!onStatus) {
+        log(chalk.yellow(`\n  ⚠ ${shortPath} — environment limitation; no test-file edit can fix this, skipping:`))
+        log(chalk.dim('    ' + envLimit.split('\n').join('\n    ')))
+        log(chalk.dim('    Provide the missing service/env var (e.g. MONGO_URL → a LOCAL instance) in .lacuna.json "testEnv", or add this file to "ignore".'))
+      }
+      onStatus?.({ phase: 'failed', file: shortPath })
+      return { success: false, environmentLimited: true, error: `Environment limitation (not a test bug): ${envLimit.split('\n')[0].trim()}` }
+    }
   }
   let typeErrorsAtStart: string | null = null
   if (firstRun.success) {
@@ -477,7 +522,7 @@ export async function fixFile(
 
   // Real, live-observed bug: the classification that later retries get (crash / unrelated-file
   // attribution) was NEVER applied to this FIRST prompt — errorOutput above is a bare
-  // extractTestFailure() with no enrichment at all. Confirmed on kabocash-mobile-RN-expo: 18+
+  // extractTestFailure() with no enrichment at all. Confirmed on an RN-Expo project: 18+
   // files all crashed identically inside node_modules/expo/src/winter/fetch/... (an
   // expo-runtime polyfill issue, nothing to do with any individual test file), and the model
   // spent its ENTIRE first attempt (and often the second) trying to fix it by editing the test
@@ -589,7 +634,7 @@ export async function fixFile(
   // mocks being edited — e.g. a node_modules/expo polyfill failure) CANNOT be fixed by editing
   // the test file, by definition. If it's still there on a SECOND attempt (proving the model's
   // edit had no effect, as it never could), burning the REMAINING budget re-editing the same file
-  // is pure waste — live-observed on kabocash-mobile-RN-expo: 18+ files each spent their FULL
+  // is pure waste — live-observed on an RN-Expo project: 18+ files each spent their FULL
   // budget on the identical node_modules/expo/src/winter/fetch crash before giving up anyway.
   let consecutiveUnrelatedFileCrashes = firstUnrelatedFileNote ? 1 : 0
 
@@ -953,7 +998,7 @@ export async function fixFile(
 
     // Subject-integrity: never let the fix drift to testing a DIFFERENT module. Rejected BEFORE
     // writing/verifying, so a wrong-subject rewrite (however many trivial tests it passes) can never
-    // win keep-best. This is the exact failure that turned useForcedUpdate's test into compareVersions tests.
+    // win keep-best. This is the exact failure that turned a hook's test into tests for an imported util.
     if (originalTestsSubject && subject && !referencesSubject(testFileContent, subject)) {
       errorOutput =
         `ERROR: This test file is \`${subject}\`'s — it must test \`${subject}\`. Your rewrite no longer ` +
@@ -971,7 +1016,11 @@ export async function fixFile(
     if (!onStatus) log(chalk.dim('  Written. Running tests...'))
     onStatus?.({ phase: 'running', file: shortPath })
 
-    const result = await runCommand(fileRun.command, fileRun.cwd, runTimeout)
+    const result = await runCommand(fileRun.command, fileRun.cwd, runTimeout, undefined, options.abortSignal)
+    if (result.aborted || options.abortSignal?.aborted) {
+      onStatus?.({ phase: 'failed', file: shortPath })
+      return { success: false, error: 'Cancelled.' }
+    }
     const rawRunOutput = result.stdout + '\n' + result.stderr
     if (result.timedOut) {
       if (!onStatus) log(chalk.red(`  ⚠ ${shortPath} did not finish within ${config.coverageTimeout}s — keeping the current file; raise coverageTimeout to verify it.`))
@@ -1455,10 +1504,10 @@ async function regenerateFile(
     // (e.g. 50 passing replacing 477). Re-run the regenerated file and keep it only if it has
     // at least as many passing tests as the original — otherwise restore the original.
     const regenFileRun = await resolveFileTestRun(options.env, absTestFile, options.cwd)
-    const regenRun = await runCommand(regenFileRun.command, regenFileRun.cwd, options.config.coverageTimeout * 1000)
-    // A timed-out re-run parses as 0 passing → would look like a regression vs baseline and
-    // restore the original. Don't punish a slow suite: keep the regen when the run was killed.
-    if (regenRun.timedOut) return { success: true }
+    const regenRun = await runCommand(regenFileRun.command, regenFileRun.cwd, options.config.coverageTimeout * 1000, undefined, options.abortSignal)
+    // A timed-out OR cancelled re-run parses as 0 passing → would look like a regression vs baseline
+    // and restore the original. Don't punish a slow suite or a Stop: keep the regen when killed.
+    if (regenRun.timedOut || regenRun.aborted) return { success: true }
     const regenPass = parsePassCount(regenRun.stdout + '\n' + regenRun.stderr)
     if (regenPass < baselinePassCount && originalContent !== null) {
       await writeFile(absTestFile, originalContent, 'utf-8').catch(() => {})
@@ -1529,9 +1578,9 @@ async function runFixWorkers(
             // --types run is a TYPE-CLEAN file, so this is NOT "fixed". Keep the file (tests pass) but
             // report it as still having type errors, else "Files fixed: N / All type errors fixed" lies.
             stillFailingFiles.push(file)
-            if (!options.dryRun) await formatFile(absFile, options.cwd, { enabled: options.config.format, env: options.env })
+            if (!options.dryRun) await formatFileVerified(absFile, options.cwd, options.config, options.env)
           }
-          else { filesFixed++; if (!options.dryRun) await formatFile(absFile, options.cwd, { enabled: options.config.format, env: options.env }) }
+          else { filesFixed++; if (!options.dryRun) await formatFileVerified(absFile, options.cwd, options.config, options.env) }
         } else if (options.regenerateOnFailure && !options.types && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
           // Regenerate from scratch only for mostly-broken files (few passing tests) — that's
           // where a fresh take rescues stuck tests. A file with a substantial passing suite is
@@ -1544,7 +1593,7 @@ async function runFixWorkers(
           const regenResult = await regenerateFile(absFile, workerOptions, onStatus, projectMemory, result.baselinePassCount ?? 0)
           if (regenResult.success) {
             filesFixed++
-            if (!options.dryRun) await formatFile(absFile, options.cwd, { enabled: options.config.format, env: options.env })
+            if (!options.dryRun) await formatFileVerified(absFile, options.cwd, options.config, options.env)
           } else {
             stillFailingFiles.push(file)
             if (regenResult.error) errors.push(tagError(file, options.cwd, regenResult.error))
@@ -1565,6 +1614,13 @@ async function runFixWorkers(
 
 export async function runFixLoop(options: FixOptions): Promise<FixResult> {
   const { config, env, cwd, log } = options
+  // Apply the configured test-env vars (e.g. MONGO_URL for a local test DB) into process.env BEFORE
+  // any test run — the spawned runner inherits it. This lives HERE (the shared loop) not only in the
+  // CLI commands, because the VS Code extension embeds runFixLoop directly and never executes the
+  // command layer: without this, a user who set "testEnv" in .lacuna.json saw it silently ignored in
+  // the extension, so a DB-integration test kept hitting its globalSetup guard. Idempotent — the CLI
+  // path assigning it again is a harmless no-op.
+  if (config.testEnv) Object.assign(process.env, config.testEnv)
   const workerCount = Math.max(1, Math.min(options.workers ?? 1, 10))
   const parallel = workerCount > 1
 
@@ -1609,7 +1665,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       : join(cwd, options.targetFile)
     const spinner = startCoverageSpinner(chalk.dim(`  Checking ${options.targetFile}...`), env.testRunner)
     const targetRun = await resolveFileTestRun(env, absTarget, cwd)
-    const fileResult = await runCommand(targetRun.command, targetRun.cwd, config.coverageTimeout * 1000, spinner.onLine)
+    const fileResult = await runCommand(targetRun.command, targetRun.cwd, config.coverageTimeout * 1000, spinner.onLine, options.abortSignal)
     spinner.stop(fileResult.stdout + fileResult.stderr)
 
     const targetRawOutput = fileResult.stdout + fileResult.stderr
@@ -1669,7 +1725,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
         : { command: env.testCommand, cwd }
       const label = scopeRel ? `  Running tests under ${scopeRel} to find failures...` : '  Running test suite to find failures...'
       const spinner = startCoverageSpinner(chalk.dim(label), env.testRunner)
-      const suiteResult = await runCommand(scopeRun.command, scopeRun.cwd, config.coverageTimeout * 1000, spinner.onLine)
+      const suiteResult = await runCommand(scopeRun.command, scopeRun.cwd, config.coverageTimeout * 1000, spinner.onLine, options.abortSignal)
       spinner.stop(suiteResult.stdout + suiteResult.stderr)
 
       if (suiteResult.timedOut) {
@@ -1811,9 +1867,9 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
           // --types run: tests pass (kept-green) but type errors REMAIN — not a type-fix success.
           // Keep the file, but report it as still having type errors (see runFixWorkers).
           stillFailingFiles.push(file)
-          if (!options.dryRun) await formatFile(absFile, cwd, { enabled: config.format, env })
+          if (!options.dryRun) await formatFileVerified(absFile, cwd, config, env)
         }
-        else { filesFixed++; if (!options.dryRun) await formatFile(absFile, cwd, { enabled: config.format, env }) }
+        else { filesFixed++; if (!options.dryRun) await formatFileVerified(absFile, cwd, config, env) }
       } else if (options.regenerateOnFailure && !options.types && !result.typeOnly && (result.baselinePassCount ?? Infinity) < REGEN_MAX_BASELINE_PASS) {
         // Regenerate only for mostly-broken files (few passing tests) — see runFixWorkers.
         // A substantial passing suite is left restored by fixFile, never nuked + rebuilt.
@@ -1821,7 +1877,7 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
         const regenResult = await regenerateFile(absFile, options, options.onStatus, memory.toPromptSection(), result.baselinePassCount ?? 0)
         if (regenResult.success) {
           filesFixed++
-          if (!options.dryRun) await formatFile(absFile, cwd, { enabled: config.format, env })
+          if (!options.dryRun) await formatFileVerified(absFile, cwd, config, env)
         } else {
           stillFailingFiles.push(file)
           if (regenResult.error) errors.push(tagError(file, cwd, regenResult.error))

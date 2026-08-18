@@ -226,7 +226,7 @@ export async function processGap(
   let rateLimitRetries = 0
   const MAX_RATE_LIMIT_RETRIES = 4
   let consecutivePatchFailures = 0
-  // Live-observed on kabocash-mobile-RN-expo: an infrastructure-level crash (Expo's
+  // Live-observed on an RN-Expo project: an infrastructure-level crash (Expo's
   // ExpoFetchModule polyfill, no native runtime under Jest) hit 53/66 files identically, and
   // this loop burned its FULL config.maxIterations on every single one — no test-file edit could
   // ever fix a crash that happens before any test runs. Mirrors the identical guard added to
@@ -620,7 +620,7 @@ export async function processGap(
 
     // Subject-integrity: the generated test must actually test THIS source file (import + exercise
     // it), not an easy imported utility. Without this a hard-to-mock hook/component gets "tested" by
-    // trivially testing a dependency (e.g. useForcedUpdate → compareVersions), which passes and gets
+    // trivially testing a dependency (e.g. a hook whose test drifts to an imported util), which passes and gets
     // kept. Gated on a specific (non-generic) subject name; the test's own import path from the
     // source satisfies the reference, so ordinary multi-export util files are unaffected.
     const genSubject = subjectFromTestPath(context.suggestedTestFile)
@@ -645,7 +645,11 @@ export async function processGap(
     if (!onStatus) log(chalk.dim(`  Written. Running tests...`))
     onStatus?.({ phase: 'running', file: shortPath })
 
-    const runResult = await runCommand(testRun.command, testRun.cwd)
+    const runResult = await runCommand(testRun.command, testRun.cwd, 300_000, undefined, options.abortSignal)
+    if (runResult.aborted || options.abortSignal?.aborted) {
+      onStatus?.({ phase: 'failed', file: shortPath })
+      return { success: false, error: 'Cancelled.' }
+    }
     lastRunResult = runResult
     const rawRunOutput = runResult.stdout + '\n' + runResult.stderr
 
@@ -716,10 +720,20 @@ export async function processGap(
       if (mocksPatchFailureNote && !onStatus) {
         log(chalk.yellow(`  ⚠ Note: this file's tests pass without it, but the accompanying mocks-file patch in this response did NOT apply (anchor not found) — ${primaryMocksFile} was left unchanged.`))
       }
-      // Format the accepted file with the repo's own eslint/prettier so it matches local style
-      // and clears the lint gate (best-effort, behavior-preserving — no re-run needed).
+      // Format the accepted file with the repo's own eslint/prettier so it matches local style and
+      // clears the lint gate. eslint --fix is NOT guaranteed behavior-preserving (it can drop an
+      // import it thinks is unused, apply an autofix that changes a matcher, etc.), so re-verify and
+      // restore the EXACT green version if it broke the test — we must never report `passed` with a
+      // failing file on disk (the file the user reviews/keeps must match what we verified).
       if (!dryRun) {
         await formatFile(context.suggestedTestFile, cwd, { enabled: config.format, env })
+        if (config.format) {
+          const afterFormat = await runCommand(testRun.command, testRun.cwd)
+          if (!afterFormat.success) {
+            await writeFile(context.suggestedTestFile, testCode, 'utf-8')
+            if (!onStatus) log(chalk.yellow('  ⚠ Formatting changed the test\'s behavior — restored the verified passing version.'))
+          }
+        }
         // A DOM-free test pays the jsdom startup tax for nothing — route it to the node
         // environment via a docblock (verified per-file, reverted if it breaks the test).
         const routed = await routeTestToNodeEnv(context.suggestedTestFile, cwd, { enabled: config.nodeEnvRouting, env })
@@ -1029,6 +1043,11 @@ const COVERAGE_CACHE_TTL_S = 600
 
 export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
   const { config, env, cwd, log } = options
+  // Apply configured test-env vars (e.g. MONGO_URL) into process.env before any test run — the
+  // spawned runner inherits it. Here in the shared loop (not only the CLI commands) so the embedded
+  // extension path, which calls runAgentLoop directly and skips the command layer, honors "testEnv"
+  // too. Idempotent with the CLI's own assignment.
+  if (config.testEnv) Object.assign(process.env, config.testEnv)
   const workerCount = Math.max(1, Math.min(options.workers ?? 1, 10))
   const parallel = workerCount > 1
 
@@ -1183,7 +1202,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         ? `  Running tests under ${scopeRel} to collect coverage...`
         : '  Running test suite to collect coverage...'
       const spinner = startCoverageSpinner(chalk.dim(label), scopeEnv.testRunner)
-      const coverageResult = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine)
+      const coverageResult = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, spinner.onLine, options.abortSignal)
       spinner.stop(coverageResult.stdout + coverageResult.stderr)
 
       if (coverageResult.timedOut) {
@@ -1409,7 +1428,7 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
       ? `\n  Measuring coverage under ${scopeRel}...`
       : '\n  Running full suite for final coverage measurement...'
     const finalSpinner = startCoverageSpinner(chalk.dim(measureLabel), env.testRunner)
-    const finalCoverageResult = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, finalSpinner.onLine)
+    const finalCoverageResult = await runCommand(coverageCommand, cwd, config.coverageTimeout * 1000, finalSpinner.onLine, options.abortSignal)
     finalSpinner.stop(finalCoverageResult.stdout + finalCoverageResult.stderr)
   }
 
@@ -1446,14 +1465,14 @@ export async function runAgentLoop(options: LoopOptions): Promise<LoopResult> {
         : '\n  Measuring new patch coverage...'), env.testRunner)
       let incremental: CoverageReport
       if (covRun && tmpCovDir) {
-        const covRunResult = await runCommand(covRun.command, covRun.cwd, config.coverageTimeout * 1000, spin.onLine)
+        const covRunResult = await runCommand(covRun.command, covRun.cwd, config.coverageTimeout * 1000, spin.onLine, options.abortSignal)
         spin.stop(covRunResult.stdout + covRunResult.stderr)
         incremental = await parseLcov(tmpCovDir, '')
       } else {
         const afterCmd = relTargetFile
           ? (relatedCoverageCommand(env, relTargetFile) ?? env.coverageCommand)
           : env.coverageCommand
-        const afterResult = await runCommand(afterCmd, cwd, config.coverageTimeout * 1000, spin.onLine)
+        const afterResult = await runCommand(afterCmd, cwd, config.coverageTimeout * 1000, spin.onLine, options.abortSignal)
         spin.stop(afterResult.stdout + afterResult.stderr)
         incremental = await loadCoverage(config, cwd)
       }

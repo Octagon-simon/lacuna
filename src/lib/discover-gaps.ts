@@ -18,6 +18,35 @@ export class DiscoverGapsError extends Error {
   }
 }
 
+// Build a coverage-read error that names WHAT is (and isn't) in the coverage dir and the concrete
+// fix, instead of the old generic "check your runner's coverage config". The common footgun: the
+// reporter list produced clover.xml/coverage-final.json/html (vitest/jest defaults) but no lcov, so
+// tell the user exactly that. loadCoverage already falls back to coverage-final.json, so reaching
+// here means neither lcov.info NOR coverage-final.json is readable.
+async function coverageReadError(config: LacunaConfig, cwd: string): Promise<string> {
+  const { readdir } = await import('fs/promises')
+  const dir = join(cwd, config.coverageDir)
+  let present: string[] = []
+  try { present = await readdir(dir) } catch { /* dir missing */ }
+
+  if (present.length === 0) {
+    return `No coverage report in ./${config.coverageDir}/. Run your tests with coverage first ` +
+      `(e.g. \`vitest run --coverage\` / \`jest --coverage\`), then try again.`
+  }
+  const has = (name: string) => present.some((f) => f === name || f.endsWith(name))
+  const found = present.filter((f) => /\.(info|json|xml)$/.test(f)).slice(0, 6).join(', ') || present.slice(0, 6).join(', ')
+  const otherFormats = has('clover.xml') || has('coverage-final.json') || has('index.html')
+  return (
+    `Could not read a usable coverage report from ./${config.coverageDir}/ (found: ${found}).\n` +
+    (otherFormats
+      ? `Those are your runner's DEFAULT reporters — there's no \`lcov.info\` or \`coverage-final.json\`. ` +
+        `Add \`'lcov'\` (or \`'json'\`) to the coverage reporter list, and make sure the \`coverage\` block ` +
+        `is nested under \`test:\` in your vitest/vite config (a top-level \`coverage\` block is ignored, ` +
+        `so the reporters silently fall back to defaults).`
+      : `Ensure your coverage reporter list includes \`'lcov'\` or \`'json'\`, configured under \`test.coverage\`.`)
+  )
+}
+
 export interface ScopeGapsResult {
   gaps: CoverageGap[]        // absolute filePaths
   coverageBefore: number     // whole-report line rate % (0 when no tests ran)
@@ -78,7 +107,7 @@ export async function discoverScopeGaps(
     try {
       report = await loadCoverage(config, cwd)
     } catch {
-      throw new DiscoverGapsError(`Could not read the coverage report from ./${config.coverageDir}/ — check your runner's coverage config.`)
+      throw new DiscoverGapsError(await coverageReadError(config, cwd))
     }
   }
 

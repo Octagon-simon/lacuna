@@ -412,6 +412,71 @@ function buildSetupFileContent(variant: 'react' | 'react-native' | 'vue' | 'svel
   return lines.join('\n') + '\n'
 }
 
+// The `test` / `test:cov` scripts each runner should have. `test` is the fast, no-coverage run (the
+// inner loop and what `npm test` / CI call); `test:cov` opts into coverage — matching the scaffolded
+// config where coverage is off by default. These are what `lacuna` and CI rely on; without them a
+// project "works" until the first `npm test` / pipeline, then breaks.
+function desiredTestScripts(runner: string): Record<string, string> {
+  switch (runner) {
+    case 'vitest': return { test: 'vitest run', 'test:cov': 'vitest run --coverage' }
+    case 'jest':   return { test: 'jest', 'test:cov': 'jest --coverage' }
+    case 'mocha':  return { test: 'mocha', 'test:cov': 'c8 --reporter=lcov mocha' }
+    default:       return {}
+  }
+}
+
+// `npm init`'s placeholder test script — not a real command, safe to replace.
+const NPM_PLACEHOLDER_TEST = /^echo\s+["']?Error: no test specified["']?\s*&&\s*exit\s+1$/
+
+// Preserve the file's own indentation (2-space, 4-space, or tabs) so we don't reformat the whole
+// package.json just to add two scripts.
+function detectJsonIndent(raw: string): string | number {
+  const m = raw.match(/\n([ \t]+)"/)
+  return m ? m[1] : 2
+}
+
+// Idempotently ensure package.json has the runner's test scripts. Adds `test` if missing (or if it's
+// npm's placeholder), adds `test:cov` if missing, and NEVER clobbers a real user-authored script.
+// This is the step whose absence "breaks tomorrow" — the scaffold used to only PRINT a suggestion.
+// Exported for tests.
+export async function ensureTestScripts(cwd: string, runner: string, log: (msg: string) => void): Promise<void> {
+  const desired = desiredTestScripts(runner)
+  if (Object.keys(desired).length === 0) return
+
+  const pkgPath = join(cwd, 'package.json')
+  let raw: string
+  try { raw = await readFile(pkgPath, 'utf-8') } catch { return } // no package.json → nothing to wire
+  let pkg: { scripts?: Record<string, string> } & Record<string, unknown>
+  try { pkg = JSON.parse(raw) } catch {
+    log(chalk.yellow('  ⚠ package.json is not valid JSON — add test scripts manually: ' + JSON.stringify(desired)))
+    return
+  }
+
+  const scripts = (pkg.scripts && typeof pkg.scripts === 'object') ? pkg.scripts : {}
+  const added: string[] = []
+
+  const currentTest = typeof scripts.test === 'string' ? scripts.test.trim() : ''
+  if (!currentTest || NPM_PLACEHOLDER_TEST.test(currentTest)) {
+    if (scripts.test !== desired.test) { scripts.test = desired.test; added.push('test') }
+  } else if (currentTest && !/\b(vitest|jest|mocha)\b/.test(currentTest)) {
+    // A real but non-runner `test` script (e.g. a lint alias) — don't clobber it, but surface it so
+    // the user knows `npm test` won't run the suite the runner config expects.
+    log(chalk.yellow(`  ⚠ Existing "test" script doesn't run ${runner}: ${currentTest}`))
+    log(chalk.dim(`    Left it untouched. Added the runner as "test:${runner}" instead.`))
+    if (!scripts[`test:${runner}`]) { scripts[`test:${runner}`] = desired.test; added.push(`test:${runner}`) }
+  }
+  if (!scripts['test:cov']) { scripts['test:cov'] = desired['test:cov']; added.push('test:cov') }
+
+  if (added.length === 0) {
+    log(chalk.dim('  package.json test scripts already present — skipping.'))
+    return
+  }
+  pkg.scripts = scripts
+  const newline = raw.endsWith('\n') ? '\n' : ''
+  await writeFile(pkgPath, JSON.stringify(pkg, null, detectJsonIndent(raw)) + newline)
+  log(chalk.green(`  ✓ Added package.json script${added.length > 1 ? 's' : ''}: ${added.join(', ')}`))
+}
+
 export async function ensureTestRunnerSetup(
   runner: string,
   sourceDir: string,
@@ -421,6 +486,11 @@ export async function ensureTestRunnerSetup(
   // Interactive install consent, injected by the CLI (inquirer). Omitted by library callers, who
   // pass yes=true — so this module carries no @inquirer dependency and bundles cleanly.
   confirmInstall?: (message: string) => Promise<boolean>,
+  // Where to put the setup file, overriding the framework default. Wired from the caller's
+  // configured `setupFile` (e.g. the VS Code panel / .lacuna.json) so the scaffolded file lands where
+  // config says it will — otherwise the panel writes `test/setup.ts` while the scaffold creates
+  // `src/test/setup.ts`, and the two silently disagree.
+  setupFileOverride?: string,
 ): Promise<string | undefined> {
   if (['pytest', 'go-test'].includes(runner)) return undefined
 
@@ -513,7 +583,7 @@ export async function ensureTestRunnerSetup(
   }
 
   // Determine setup file path based on framework
-  const setupFilePath = (() => {
+  const defaultSetupPath = (() => {
     if (meta.isReactNative || meta.isExpo) return `test/setup.ts`
     if (meta.isNextJs) return `test/setup.ts`
     if (meta.isAngular) return `test/setup.ts`
@@ -521,6 +591,9 @@ export async function ensureTestRunnerSetup(
     if (meta.isReact || meta.isVue || meta.isSvelte) return `${sourceDir}/test/setup.ts`
     return undefined
   })()
+  // Honor a caller-configured setup path, but only for a framework that actually gets a setup file —
+  // an override can't invent meaningful setup content for a plain-TS/NestJS project that has none.
+  const setupFilePath = defaultSetupPath ? (setupFileOverride?.trim() || defaultSetupPath) : undefined
 
   // ── Install missing packages ───────────────────────────────────────────────
 
@@ -683,8 +756,6 @@ export async function ensureTestRunnerSetup(
       await writeFile(configPath, content)
       log(chalk.green(`  ✓ Created vitest.config.ts at project root`))
     }
-    log(chalk.dim(`\n  Add to package.json scripts: "test": "vitest run", "test:cov": "vitest run --coverage"`))
-    log(chalk.dim(`  (Keep coverage out of the inner loop — it's the biggest cost. Run test:cov / CI for reports.)`))
 
   } else if (runner === 'jest') {
     const configPath = resolve(cwd, 'jest.config.js')
@@ -735,8 +806,6 @@ export async function ensureTestRunnerSetup(
       await writeFile(configPath, content)
       log(chalk.green(`  ✓ Created jest.config.js`))
     }
-    log(chalk.dim(`\n  Add to package.json scripts: "test": "jest", "test:cov": "jest --coverage"`))
-    log(chalk.dim(`  (Keep coverage out of the inner loop — it's the biggest cost. Run test:cov / CI for reports.)`))
 
   } else if (runner === 'mocha') {
     const configPath = resolve(cwd, '.mocharc.json')
@@ -751,8 +820,13 @@ export async function ensureTestRunnerSetup(
       await writeFile(configPath, content)
       log(chalk.green(`  ✓ Created .mocharc.json`))
     }
-    log(chalk.dim(`\n  Add to package.json scripts: "test": "c8 --reporter=lcov mocha"`))
   }
+
+  // ── Ensure npm test scripts ────────────────────────────────────────────────
+  // The scaffold used to only PRINT these — so a project could have deps + config + setup file yet
+  // no `test`/`test:cov`, and break on the first `npm test`/CI/`lacuna` coverage run. Now written
+  // idempotently (won't clobber a real user script).
+  await ensureTestScripts(cwd, runner, log)
 
   return createdSetupFile
 }
@@ -769,6 +843,9 @@ export interface ScaffoldOptions {
    */
   runner?: string
   sourceDir: string
+  /** Setup-file path from the caller's config (e.g. `.lacuna.json` setupFile). Overrides the
+   * framework default so the scaffolded file matches what config records. */
+  setupFile?: string
   /** Sink for progress lines (defaults to console.log). npm-install output streams via stdio:inherit regardless. */
   log?: (msg: string) => void
 }
@@ -808,6 +885,6 @@ export async function scaffoldProject(opts: ScaffoldOptions): Promise<{ createdS
     log(chalk.dim(`${runner} needs no Node dependency setup — nothing to scaffold.`))
     return { runner }
   }
-  const createdSetupFile = await ensureTestRunnerSetup(runner, opts.sourceDir, opts.cwd, log, true)
+  const createdSetupFile = await ensureTestRunnerSetup(runner, opts.sourceDir, opts.cwd, log, true, undefined, opts.setupFile)
   return { createdSetupFile, runner }
 }

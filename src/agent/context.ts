@@ -346,8 +346,8 @@ async function resolveToFile(basePath: string): Promise<string | null> {
 }
 
 // A tsconfig path alias can point at another WORKSPACE PACKAGE's root (e.g.
-// `"@afriex/core": ["../core"]` in a monorepo), not just a local directory. When the import has
-// a subpath beyond the bare alias (`@afriex/core/domain`), the real target isn't a plain file
+// `"@acme/core": ["../core"]` in a monorepo), not just a local directory. When the import has
+// a subpath beyond the bare alias (`@acme/core/domain`), the real target isn't a plain file
 // under that root — it's resolved through the package's OWN package.json `exports` map, which
 // commonly points at compiled output (`./dist/src/domain/index.js`) whose TypeScript source
 // lives one directory removed (`src/domain/index.ts`, since TS project references mirror

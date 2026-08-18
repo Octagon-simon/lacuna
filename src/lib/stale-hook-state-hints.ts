@@ -4,13 +4,13 @@
 //
 //   1. X IS returned by the hook, but was read right after a SYNCHRONOUS state-changing call without
 //      act() → the setState hasn't flushed to `result.current`, so it reads the stale value. FIX:
-//      wrap the trigger in a synchronous `act(() => { … })` (from 'react'). (berry: useStartCollection
+//      wrap the trigger in a synchronous `act(() => { … })` (from 'react'). (e.g. a hook that starts a collection
 //      reads `startingId` right after `start()`.) waitFor does NOT help — the value is set
 //      synchronously; there is nothing async to wait for.
 //
 //   2. X is NOT in the hook's return object (it's internal useState the hook uses but never returns)
 //      → `result.current.X` is permanently undefined. FIX: delete the assertion and assert the
-//      observable OUTCOME instead (the service the value was passed to). (berry: useOnboarding asserts
+//      observable OUTCOME instead (the service the value was passed to). (e.g. an onboarding hook that asserts
 //      `result.current.socialToken`, which the hook keeps in state but only returns `socialProvider`.)
 //
 // A general prompt rule for this gets drowned out among the many RNTL rules and contradicted by the
