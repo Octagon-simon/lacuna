@@ -45,7 +45,13 @@ jobs:
           else
             git commit -m "chore: build dist for ${TAG} [skip ci]"
 
-            # Move the exact version tag to the new commit that includes dist/
+            # Another release (e.g. the extension in `release:all`) may have advanced main
+            # between this tag's push and now — rebase the dist commit onto the latest main so
+            # the push FAST-FORWARDS instead of racing (the non-fast-forward that aborted v0.4.0).
+            git fetch origin main
+            git rebase origin/main
+
+            # Move the exact version tag to the (possibly rebased) commit that includes dist/
             git tag -fa "${TAG}" -m "Release ${TAG}"
 
             git push origin HEAD:main
