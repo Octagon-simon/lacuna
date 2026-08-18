@@ -47,7 +47,7 @@ export class DiffSession {
   private readonly changed = new Set<string>()
   private readonly watcher: vscode.FileSystemWatcher
 
-  private readonly ignoredPrefixes: string[]
+  private readonly ignoredSegments: Set<string>
 
   constructor(
     private readonly cwd: string,
@@ -56,11 +56,15 @@ export class DiffSession {
   ) {
     this.mocksAbs = new Set(mocksFileList(config).map((m) => path.resolve(cwd, m)))
     // Generated / non-source trees a run legitimately writes to but the user must NEVER be asked to
-    // review — most importantly the coverage report dir, whose lcov-report/*.js (prettify, sorter,
-    // block-navigation) jest rewrites on every run. lacuna itself only writes test files + the mocks
-    // file, so anything here is incidental output.
-    const generatedDirs = [config.coverageDir || 'coverage', 'node_modules', 'dist', 'build', '.next', 'out', '.nyc_output', '.turbo']
-    this.ignoredPrefixes = generatedDirs.map((d) => path.resolve(cwd, d) + path.sep)
+    // review — most importantly the coverage report dir, whose lcov-report/*.js jest rewrites on
+    // every run, and compiled output (a `tsc`/build step run by `npm test` emits *.test.js into
+    // dist/). lacuna itself only writes test SOURCE files + the mocks file, so anything under these
+    // trees is incidental output. Matched as PATH SEGMENTS, not just a cwd-anchored prefix: a
+    // monorepo's generated tree is nested (packages/core/dist/**, apps/*/coverage/**), which a
+    // top-level `<cwd>/dist/` prefix never catches — that let a compiled
+    // packages/core/dist/**/foo.test.js slip into the review as a "new file".
+    const covTop = (config.coverageDir || 'coverage').replace(/^\.\//, '').split(/[\\/]/)[0]
+    this.ignoredSegments = new Set(['node_modules', 'dist', 'build', '.next', 'out', '.nyc_output', '.turbo', covTop].filter(Boolean))
     const pattern = new vscode.RelativePattern(cwd, '**/*.{ts,tsx,js,jsx,mts,cts}')
     this.watcher = vscode.workspace.createFileSystemWatcher(pattern)
     const track = (u: vscode.Uri) => { if (!this.isIgnored(u.fsPath)) this.changed.add(u.fsPath) }
@@ -69,7 +73,10 @@ export class DiffSession {
   }
 
   private isIgnored(fsPath: string): boolean {
-    return this.ignoredPrefixes.some((p) => fsPath.startsWith(p))
+    const rel = path.relative(this.cwd, fsPath)
+    // Outside cwd (shouldn't happen under the scoped watcher) → not something we wrote; skip it.
+    if (!rel || rel.startsWith('..')) return true
+    return rel.split(path.sep).some((seg) => this.ignoredSegments.has(seg))
   }
 
   /** Snapshot known-important files (the mocks file) BEFORE the run mutates them. */
@@ -97,19 +104,50 @@ export class DiffSession {
     const testFiles = files.filter((f) => TEST_FILE_RE.test(f) && !this.mocksAbs.has(f))
     const mocksFiles = files.filter((f) => this.mocksAbs.has(f))
 
-    if (testFiles.length === 0 && mocksFiles.length === 0) {
+    // A fix that couldn't succeed restores the file to its original (keep-best), and a formatter can
+    // rewrite a file then leave it byte-identical — in both cases the watcher fired but there is NO
+    // net change. Presenting an empty "Keep Lacuna's changes?" diff is misleading: Accept does
+    // nothing, which reads as a silent failure. Drop files whose current content equals their
+    // before-content so only real changes are offered for review (the run summary already reports
+    // "Could not fix the test file", which is the honest signal for the no-change case).
+    const withChange = async (list: string[]): Promise<string[]> => {
+      const out: string[] = []
+      for (const f of list) if (await this.hasNetChange(f)) out.push(f)
+      return out
+    }
+    const changedTests = await withChange(testFiles)
+    const changedMocks = await withChange(mocksFiles)
+
+    if (changedTests.length === 0 && changedMocks.length === 0) {
       vscode.window.showInformationMessage('Lacuna: no file changes to review.')
       return
     }
 
-    for (const f of testFiles) await this.reviewOne(f, 'test file')
+    for (const f of changedTests) await this.reviewOne(f, 'test file')
     // Tier 2b: the shared mocks file is imported by every test — always its own explicit review.
-    for (const f of mocksFiles) await this.reviewOne(f, 'shared mocks file', true)
+    for (const f of changedMocks) await this.reviewOne(f, 'shared mocks file', true)
+  }
+
+  /** The file's pre-run content: the up-front snapshot if we took one (mocks file), else git HEAD,
+   * else empty (a genuinely new file). */
+  private async beforeOf(abs: string): Promise<string> {
+    return this.preRun.get(abs) ?? (await gitHead(this.cwd, path.relative(this.cwd, abs))) ?? ''
+  }
+
+  /** Whether the file on disk actually differs from its pre-run content (a real change to review). */
+  private async hasNetChange(abs: string): Promise<boolean> {
+    const before = await this.beforeOf(abs)
+    try {
+      const current = Buffer.from(await vscode.workspace.fs.readFile(vscode.Uri.file(abs))).toString('utf8')
+      return current !== before
+    } catch {
+      return false // file gone (never written / deleted) — nothing to review
+    }
   }
 
   private async reviewOne(abs: string, label: string, emphasise = false): Promise<void> {
     const rel = path.relative(this.cwd, abs)
-    const beforeContent = this.preRun.get(abs) ?? (await gitHead(this.cwd, rel)) ?? ''
+    const beforeContent = await this.beforeOf(abs)
     const isNew = beforeContent === ''
 
     this.before.set(abs, beforeContent)

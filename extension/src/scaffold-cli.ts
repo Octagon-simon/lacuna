@@ -21,8 +21,9 @@ async function main(): Promise<void> {
   // testRunner to .lacuna.json) means scaffoldProject detects the runner and falls back to vitest.
   const runner = arg('runner')
   const sourceDir = arg('source-dir') ?? 'src'
+  const setupFile = arg('setup-file')
   const cwd = await findProjectRoot(process.cwd())
-  await scaffoldProject({ cwd, runner, sourceDir, log: (m: string) => console.log(m) })
+  await scaffoldProject({ cwd, runner, sourceDir, setupFile, log: (m: string) => console.log(m) })
   console.log('\n✓ Setup complete. You can close this terminal and generate tests.')
 }
 

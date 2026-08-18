@@ -21,7 +21,7 @@ export async function runInit(context: vscode.ExtensionContext): Promise<void> {
   await SettingsPanel.show(context, firstRun)
 }
 
-interface LacunaConfigShape { testRunner?: string; sourceDir?: string[] | string }
+interface LacunaConfigShape { testRunner?: string; sourceDir?: string[] | string; setupFile?: string }
 
 async function readConfig(cwd: string): Promise<LacunaConfigShape | undefined> {
   try {
@@ -45,16 +45,55 @@ async function isNodeProject(cwd: string): Promise<boolean> {
   } catch { return false }
 }
 
-// Whether the runner's binary is present in node_modules. This — NOT "does .lacuna.json exist" — is
-// the correct signal for "does this project still need the install/scaffold step": a project can
-// have a saved config but no installed deps (e.g. config written, npm install never run). The
-// auto-offer keys off this so it fires exactly when there's real setup work left, and stays quiet on
-// an already-provisioned project.
-async function isRunnerInstalled(cwd: string, runner: string): Promise<boolean> {
+async function exists(cwd: string, rel: string): Promise<boolean> {
   try {
-    await vscode.workspace.fs.stat(vscode.Uri.file(path.join(cwd, 'node_modules', '.bin', runner)))
+    await vscode.workspace.fs.stat(vscode.Uri.file(path.join(cwd, rel)))
     return true
   } catch { return false }
+}
+
+// Whether the runner's binary is present in node_modules.
+async function isRunnerInstalled(cwd: string, runner: string): Promise<boolean> {
+  return exists(cwd, path.join('node_modules', '.bin', runner))
+}
+
+// The config filenames each runner is considered "configured" by (vitest also reads vite.config.*).
+const RUNNER_CONFIG_FILES: Record<string, string[]> = {
+  vitest: ['vitest.config.ts', 'vitest.config.js', 'vitest.config.mjs', 'vitest.config.mts', 'vitest.config.cjs', 'vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts'],
+  jest: ['jest.config.ts', 'jest.config.js', 'jest.config.cjs', 'jest.config.mjs', 'jest.config.json'],
+  mocha: ['.mocharc.json', '.mocharc.js', '.mocharc.cjs', '.mocharc.yml', '.mocharc.yaml'],
+}
+
+async function readPackageJson(cwd: string): Promise<{ scripts?: Record<string, string>; jest?: unknown } | undefined> {
+  try {
+    const buf = await vscode.workspace.fs.readFile(vscode.Uri.file(path.join(cwd, 'package.json')))
+    return JSON.parse(Buffer.from(buf).toString('utf8'))
+  } catch { return undefined }
+}
+
+/**
+ * Whether the project is FULLY set up for `runner` — deps installed, a runner config present, AND a
+ * real `test` script. This is the right gate for the setup offer: gating merely on "is the runner
+ * installed" wrongly treats a project that has e.g. vitest in node_modules but no config/scripts as
+ * done, so it silently skipped the rest of setup and things broke on the first `npm test` / CI run.
+ * The scaffold is idempotent, so re-running it when only some pieces are missing is safe.
+ */
+async function isSetupComplete(cwd: string, runner: string): Promise<boolean> {
+  if (!NODE_RUNNERS.has(runner)) return true
+  if (!(await isRunnerInstalled(cwd, runner))) return false
+
+  const configFiles = RUNNER_CONFIG_FILES[runner] ?? []
+  const pkg = await readPackageJson(cwd)
+  const hasConfig = (await Promise.all(configFiles.map((f) => exists(cwd, f)))).some(Boolean)
+    || (runner === 'jest' && pkg?.jest != null) // jest config can live in package.json#jest
+  if (!hasConfig) return false
+
+  // A real test script: present and actually invoking the runner (not npm's placeholder / a lint alias).
+  const test = pkg?.scripts?.test?.trim() ?? ''
+  const hasTestScript = /\b(vitest|jest|mocha)\b/.test(test)
+  if (!hasTestScript) return false
+
+  return true
 }
 
 /**
@@ -103,25 +142,31 @@ export async function runScaffold(cwd: string, scaffoldScript: string): Promise<
   // Omit --runner when auto-detecting so the scaffold script resolves it (detect → vitest fallback).
   const args = runner ? ['--runner', runner] : []
   if (sourceDir) { args.push('--source-dir', sourceDir) }
+  // Pass the configured setup-file path so the scaffolded file lands where .lacuna.json says it is,
+  // instead of the framework default (which left `setupFile: test/setup.ts` pointing at a file the
+  // scaffold actually created under src/test/).
+  if (config?.setupFile) { args.push('--setup-file', config.setupFile) }
   const term = vscode.window.createTerminal({ name: 'Lacuna Setup', cwd })
   term.show()
   term.sendText(`node ${[scaffoldScript, ...args].map(shellQuote).join(' ')}`)
 }
 
 /**
- * First-run nudge: after the settings form saves `.lacuna.json` on a fresh project, offer to run the
- * install/scaffold so the project is actually runnable (a bare `.lacuna.json` with no runner
- * installed would fail the first generate/fix). No-op for non-Node runners.
+ * After the settings form saves `.lacuna.json`, offer to run the install/scaffold when the project
+ * isn't FULLY set up — deps + runner config + a real `test` script (see isSetupComplete). Gating on
+ * completeness (not merely "is the runner installed") is what fixes projects that had the test
+ * packages in node_modules but no config/setup file/scripts: they were silently treated as done and
+ * broke later. The scaffold is idempotent, so offering when only some pieces are missing is safe.
+ * No-op for non-Node runners.
  */
 export async function offerScaffoldAfterSave(cwd: string, scaffoldScript: string): Promise<void> {
   const config = await readConfig(cwd)
   const runner = config?.testRunner
   // Concrete non-Node runner → nothing to install, no nudge.
   if (runner && !NODE_RUNNERS.has(runner)) return
-  // A Node runner that's already installed → the project is set up, don't nag on every settings save.
-  // (An absent runner means auto-detect wrote nothing; we can't know it's installed, so let
-  // runScaffold — which detects + checks — decide.)
-  if (runner && await isRunnerInstalled(cwd, runner)) return
+  // Fully set up already → don't nag on every settings save. (An absent runner means auto-detect
+  // wrote nothing; we can't evaluate completeness, so let runScaffold self-detect and decide.)
+  if (runner && await isSetupComplete(cwd, runner)) return
   await runScaffold(cwd, scaffoldScript)
 }
 

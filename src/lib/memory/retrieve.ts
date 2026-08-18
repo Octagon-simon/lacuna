@@ -106,10 +106,28 @@ export async function retrieveMemory(config: LacunaConfig, ctx: RetrievalContext
     .slice(0, MAX_ENTRIES)
 }
 
+// A learned summary is banner junk when it's really captured runner output (a `====` separator
+// run, a `> jest …`/`> vitest …` command echo, a `console.error/warn/log` line, a `PASS`/`FAIL`
+// result header, or a `✕`/`✓` marker) rather than an actual error message — an older normalize
+// pass let these through into `summary`, and surfacing them wastes prompt space and reads as
+// noise. Skip such entries at render time so already-stored corrupt entries never reach the model
+// (normalize.ts now strips this decoration up front so new entries don't hit it).
+function isBannerJunkSummary(summary: string): boolean {
+  const s = summary.trim()
+  return (
+    /={6,}|-{6,}/.test(s) ||
+    /(^|\s)>\s+(?:jest|vitest|mocha|npm|yarn|pnpm)\b/.test(s) ||
+    /\bconsole\.(?:error|warn|log)\b/.test(s) ||
+    /(^|\s)(?:PASS|FAIL)\b/.test(s) ||
+    /[✕✓×]/.test(s)
+  )
+}
+
 export function renderMemorySection(entries: MemoryEntry[]): string | null {
-  if (entries.length === 0) return null
+  const clean = entries.filter(e => !isBannerJunkSummary(e.summary))
+  if (clean.length === 0) return null
   const parts = ['RELEVANT LEARNED MEMORY (from prior runs — apply if relevant, don\'t force it):']
-  for (const e of entries) {
+  for (const e of clean) {
     parts.push(`  • ${e.summary}: ${e.rule}`)
     if (e.example) parts.push(`    e.g. ${e.example}`)
   }
@@ -143,20 +161,20 @@ export interface FixMemoryHint {
 // tags detected from the error text itself (pattern-tags.ts) — this is what makes retrieval
 // precise (a `never`-type failure pulls only the never-type-mock entry) rather than merely
 // runner-scoped (every jest project pulling every jest-tagged entry regardless of relevance).
-export async function buildFixMemoryHint(config: LacunaConfig, errorOutput: string, ctx: Omit<RetrievalContext, 'errorSignature'>): Promise<FixMemoryHint> {
+export async function buildFixMemoryHint(config: LacunaConfig, errorOutput: string, _ctx: Omit<RetrievalContext, 'errorSignature'>): Promise<FixMemoryHint> {
   if (!config.memory.enabled) return { text: null, coveredPatterns: [] }
   const patternTags = detectPatternTags(errorOutput)
-  // Tag matching in retrieveMemory is a UNION (any matching tag includes the entry), not an
-  // intersection — merging precise pattern tags alongside the broad testRunner/framework tags
-  // would still pull back every entry tagged for that runner regardless of relevance (defeating
-  // the entire point of pattern-based tagging). When a pattern IS detected, use ONLY the pattern
-  // tags; fall back to the broader runner/framework signal only when nothing more specific
-  // matched (the seed catalog's pattern-tagged entries already carry their own runner tags too,
-  // e.g. 'unsafe-cast' + 'jest' + 'vitest', so dropping the ctx-level runner filter here doesn't
-  // lose runner relevance where it actually matters).
-  const entries = await retrieveMemory(config, patternTags.length > 0
-    ? { testRunner: '', dependencies: patternTags, errorSignature: errorOutput }
-    : { ...ctx, errorSignature: errorOutput })
+  // Retrieve ONLY by what actually relates to THIS error: the exact error-signature hash and any
+  // precise pattern tags detected in the error text. Deliberately NO fallback to the broad
+  // testRunner/framework tag — tag matching is a UNION, so a runner tag pulls back EVERY `fixes`
+  // entry sharing that runner regardless of relevance. A `fixes` entry surfaced purely because it
+  // shares a runner ('vitest'/'jest') with the current file is, by construction, a fix learned for
+  // a DIFFERENT error — pure noise. Live: a Mongoose DB-integration failure pulled six React-Native
+  // hook-mocking rules from an unrelated repo just because both ran under the same runner, biasing
+  // the model toward mock-shaped theories for an infra error no mock could touch. When no pattern
+  // matches and no exact hash exists, surfacing NOTHING is the correct outcome. (`_ctx` is retained
+  // for call-site/signature stability; its broad tags are intentionally no longer used here.)
+  const entries = await retrieveMemory(config, { testRunner: '', dependencies: patternTags, errorSignature: errorOutput })
   const matchedTags = new Set(entries.flatMap(e => e.tags))
   const coveredPatterns = patternTags.filter(t => matchedTags.has(t))
   return { text: renderMemorySection(entries), coveredPatterns }

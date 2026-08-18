@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { detectProcessCrash, detectUnrelatedFileCrash, buildProcessCrashMessage, buildPatchEscalationMessage, buildFailingTestChecklist, detectStrayPatchMarkers, detectOpenHandleLeak, buildOpenHandleLeakMessage, detectJestConfigConflict, detectJestValidationError, detectUnbalancedMocksSyntax } from './validate.js'
+import { detectProcessCrash, detectUnrelatedFileCrash, buildProcessCrashMessage, buildPatchEscalationMessage, buildFailingTestChecklist, detectStrayPatchMarkers, detectOpenHandleLeak, buildOpenHandleLeakMessage, detectJestConfigConflict, detectJestValidationError, detectUnbalancedMocksSyntax, detectEnvironmentLimitation, buildEnvironmentLimitationMessage } from './validate.js'
 
 // Real text captured from a lacuna debug log on a real production project (attempt 1) — not a
 // synthetic example. The retry loop classified this as "⚠ REGRESSION — 13 passing before, now
@@ -233,7 +233,7 @@ describe('foo', () => { it('works', () => { expect(1).toBe(1) }) })
 
 // Real text captured by running a fresh `npx jest` (v29) against a throwaway fixture with a bare
 // `setInterval(() => {}, 1000)` and no cleanup, under a config with `forceExit: true` (the exact
-// setting kabo-cash-api's own jest.config.ts uses) — this is the line Jest prints when forceExit
+// setting a real Node API project's jest.config.ts uses) — this is the line Jest prints when forceExit
 // had to actually kill a lingering handle, WITHOUT --detectOpenHandles being passed at all.
 const REAL_FORCE_EXIT_OUTPUT = `
 Test Suites: 1 passed, 1 total
@@ -289,8 +289,8 @@ test('buildOpenHandleLeakMessage names the concrete fix (clear the handle or cal
 const REAL_JEST_MULTIPLE_CONFIGS_OUTPUT = `
 ● Multiple configurations found:
 
-    * /Users/octagon/Documents/github/kabocash-mobile-RN-expo/jest.config.js
-    * \`jest\` key in /Users/octagon/Documents/github/kabocash-mobile-RN-expo/package.json
+    * /Users/dev/rn-expo-app/jest.config.js
+    * \`jest\` key in /Users/dev/rn-expo-app/package.json
 
   Implicit config resolution does not allow multiple configuration files.
   Either remove unused config files or select one explicitly with \`--config\`.
@@ -334,7 +334,7 @@ jest.config.js to reference:
 To migrate, please install "@react-native/jest-preset" and update your
 jest.config.js to reference:
   preset: '@react-native/jest-preset'
-    at Object.<anonymous> (/Users/octagon/Documents/github/kabocash-mobile-RN-expo/node_modules/react-native/jest-preset.js:17:11)
+    at Object.<anonymous> (/Users/dev/rn-expo-app/node_modules/react-native/jest-preset.js:17:11)
     at Module._compile (node:internal/modules/cjs/loader:1734:14)
 
   Configuration Documentation:
@@ -373,7 +373,7 @@ Test Suites: 3 passed, 3 total
   assert.equal(detectJestValidationError(clean), null)
 })
 
-// Real corruption captured on kabocash-mobile-RN-expo: a truncated ---MOCKS_FILE--- response
+// Real corruption captured on an RN-Expo project: a truncated ---MOCKS_FILE--- response
 // left this exact fragment as the shared mock file's `renderWithProviders`, which then broke
 // 80+ of 87 test files that imported it in a single run.
 const REAL_TRUNCATED_MOCKS_FILE = `
@@ -417,4 +417,45 @@ export const fn = () => { return 1; };
 }
 `
   assert.equal(detectUnbalancedMocksSyntax(extra), true)
+})
+
+// ── environment-limitation detection ──────────────────────────────────────────
+// Real-SHAPED (anonymized) globalSetup guard: a Mongoose DB-integration test hit a guard like this
+// identically on all 3 attempts, each burning the full iteration budget mock-padding a file no
+// test-file edit could fix.
+const MONGO_GUARD = `
+⎯⎯⎯⎯⎯⎯ Unhandled Error ⎯⎯⎯⎯⎯⎯⎯
+Error: Refusing to run the test suite against MongoDB host "cluster0.example.mongodb.net".
+It comes from the committed config/test.json (no MONGO_URL is set anywhere), and it is not a local server.
+The suite creates and drops app_test_* databases on whatever server it is pointed at, so this would write to shared infrastructure.
+
+    172|   };
+`
+
+test('detectEnvironmentLimitation fires on a "Refusing to run" Mongo globalSetup guard', () => {
+  const sig = detectEnvironmentLimitation(MONGO_GUARD)
+  assert.ok(sig, 'expected a signature')
+  assert.match(sig!, /Refusing to run the test suite against MongoDB host/)
+})
+
+test('detectEnvironmentLimitation fires on a globalSetup that failed', () => {
+  assert.ok(detectEnvironmentLimitation('Error: globalSetup file "./vitest.globalSetup.ts" threw during setup'))
+})
+
+test('detectEnvironmentLimitation does NOT fire on an ordinary assertion failure (fixable)', () => {
+  assert.equal(detectEnvironmentLimitation(NORMAL_ASSERTION_FAILURE), null)
+})
+
+test('detectEnvironmentLimitation does NOT fire on a bare DB connection error (a unit test could mock it)', () => {
+  // Conservative by design: ECONNREFUSED / MongoNetworkError are NOT treated as un-patchable,
+  // because a unit test that shouldn't hit a real DB can legitimately be fixed by mocking the client.
+  assert.equal(detectEnvironmentLimitation('MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017'), null)
+})
+
+test('buildEnvironmentLimitationMessage explains WHY no test-file edit works and names the human fix', () => {
+  const msg = buildEnvironmentLimitationMessage('Refusing to run the test suite against MongoDB host "x".')
+  assert.match(msg, /ENVIRONMENT LIMITATION/)
+  assert.match(msg, /globalSetup/)
+  assert.match(msg, /testEnv|ignore/)
+  assert.match(msg, /in-memory fake/) // warns against the quirk-locking "fix"
 })

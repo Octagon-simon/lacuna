@@ -208,6 +208,22 @@ export class Commands {
   ) {
     const { config, env, cwd } = project
 
+    // Serialize runs: a second concurrent run writes the SAME shared mocks file and test files as the
+    // first, so their writes interleave — a test can pass mid-run and then fail once the other run
+    // overwrites a mock it depended on. (Closing the progress panel does NOT stop a run — it keeps
+    // going in the background — which is exactly how a user ends up starting a second one.) Block it.
+    const active = this.svc.runs.activeRuns
+    if (active.length > 0) {
+      const VIEW = 'View Active Run', STOP = 'Stop It'
+      const choice = await vscode.window.showWarningMessage(
+        'A Lacuna run is already in progress. Running two at once can corrupt the shared mocks file and leave tests that passed mid-run failing afterward. Let it finish, or stop it first.',
+        VIEW, STOP,
+      )
+      if (choice === VIEW) ProgressPanel.showFor(this.svc.output, active[active.length - 1])
+      else if (choice === STOP) active.forEach((r) => r.requestCancel())
+      return
+    }
+
     if (!opts.preConfirmed) {
       if (!(await this.svc.approval.confirmRun({ kind, files: opts.files, config }))) return
     }
@@ -229,6 +245,18 @@ export class Commands {
 
     try {
       await run.done
+      // The pass/fail summary lives INSIDE the progress panel — but the panel is closeable and the
+      // run keeps going in the background, so if it's closed/hidden the user never learns the outcome.
+      // Surface a completion toast in that case (with a way to reopen the transcript).
+      if (!ProgressPanel.isVisible) {
+        const { passed, failed, filesDone, filesTotal } = run.stats
+        const summary = `Lacuna ${kind}: ✓ ${passed} passed · ✗ ${failed} failed (${filesDone}/${filesTotal} files)`
+        const SHOW = 'Show Details'
+        const pick = failed > 0
+          ? await vscode.window.showWarningMessage(summary, SHOW)
+          : await vscode.window.showInformationMessage(summary, SHOW)
+        if (pick === SHOW) ProgressPanel.showFor(this.svc.output, run)
+      }
     } catch (e: any) {
       vscode.window.showErrorMessage(`Lacuna: ${e?.message ?? e}`)
     } finally {

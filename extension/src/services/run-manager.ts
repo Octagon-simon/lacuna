@@ -30,6 +30,10 @@ export interface RunHandle {
   readonly stats: RunStats
   cancelRequested: boolean
   readonly onMessage: vscode.Event<HostToPanel>
+  /** The terminal `done` message once the run has settled, so a panel that opens/reopens AFTER the
+   * run finished can replay the final pass/fail state (the live `done` event already fired and is
+   * gone). Undefined while still running. */
+  readonly finalDone?: HostToPanel
   readonly done: Promise<LoopResult | FixResult>
   /** Full plain-text transcript, for "View Raw Log". */
   readonly rawLog: string[]
@@ -98,6 +102,12 @@ export class RunManager {
       log('debug: off — enable "debug": true in .lacuna.json (or LACUNA_DEBUG=1) and re-run to capture prompt/response logs')
     }
 
+    // Last phase-text emitted per file, to collapse runs of the SAME phase into one log line. The
+    // fix-specialist handoff pins every internal phase (generating/running/retrying, per attempt) to
+    // `fixing`, so without this the log fills with dozens of identical "handing off to the fix
+    // specialist…" lines and looks stuck. The live `phase` message (for the worker row) still fires
+    // every time — only the append-only LOG is de-duplicated.
+    const lastPhaseByFile = new Map<string, string>()
     const onStatus = (state: WorkerState) => {
       const t = phaseText(state)
       const file = 'file' in state ? state.file : undefined
@@ -112,9 +122,13 @@ export class RunManager {
       run.stats.elapsedMs = Date.now() - started
       run.push({ type: 'phase', state })
       if (t) {
-        const line: LogLine = { kind: t.kind, file, text: t.text, ts: Date.now() }
-        run.rawLog.push(`${file ? file + ' — ' : ''}${t.text}`)
-        run.push({ type: 'log', line })
+        const key = file ?? ''
+        if (lastPhaseByFile.get(key) !== t.text) {
+          lastPhaseByFile.set(key, t.text)
+          const line: LogLine = { kind: t.kind, file, text: t.text, ts: Date.now() }
+          run.rawLog.push(`${file ? file + ' — ' : ''}${t.text}`)
+          run.push({ type: 'log', line })
+        }
       }
       run.push({ type: 'stats', stats: { ...run.stats } })
     }
@@ -152,7 +166,7 @@ export class RunManager {
       .then((result) => {
         run.stats.elapsedMs = Date.now() - started
         const summary = summarize(opts.kind, result, run.cancelRequested)
-        run.push({ type: 'done', ok: !hasErrors(result), summary, stats: { ...run.stats } })
+        run.emitDone({ type: 'done', ok: !hasErrors(result), summary, stats: { ...run.stats } })
         run.rawLog.push(summary)
         this.output.appendLine(summary)
         return result
@@ -160,7 +174,7 @@ export class RunManager {
       .catch((err: unknown) => {
         run.stats.elapsedMs = Date.now() - started
         const msg = err instanceof Error ? err.message : String(err)
-        run.push({ type: 'done', ok: false, summary: `Run failed: ${msg}`, stats: { ...run.stats } })
+        run.emitDone({ type: 'done', ok: false, summary: `Run failed: ${msg}`, stats: { ...run.stats } })
         run.rawLog.push(`ERROR: ${msg}`)
         this.output.appendLine(`ERROR: ${msg}`)
         throw err
@@ -211,6 +225,7 @@ class InternalRun implements RunHandle {
   readonly memoryUsed = new Map<string, string[]>()
   readonly abort = new AbortController()
   cancelRequested = false
+  finalDone?: HostToPanel
   readonly emitter = new vscode.EventEmitter<HostToPanel>()
   private _done!: Promise<LoopResult | FixResult>
 
@@ -226,6 +241,8 @@ class InternalRun implements RunHandle {
   get done() { return this._done }
   setDone(p: Promise<LoopResult | FixResult>) { this._done = p }
   push(m: HostToPanel) { this.emitter.fire(m) }
+  /** Fire the terminal `done` AND remember it, so a later bind() can replay the final state. */
+  emitDone(m: HostToPanel) { this.finalDone = m; this.emitter.fire(m) }
   requestCancel() { this.cancelRequested = true; this.abort.abort() }
 
   failedWithMemory(): { file: string; entries: string[] }[] {
