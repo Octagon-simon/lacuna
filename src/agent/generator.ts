@@ -138,6 +138,12 @@ function estimateMaxTokens(sourceCode: string | null | undefined, configMax: num
 // forced out of patch mode — see retry()'s Math.max, which never LOWERS the configured ceiling.
 const MAX_ESCALATED_REWRITE_TOKENS = 32_000   // generous soft ceiling, not a hard model/provider limit
 
+// Ceiling for markAsReasoningModel()'s doubled budget (generator.ts below). Reasoning models can
+// spend a large, unpredictable fraction of their output on reasoning_content before any real
+// content — doubling once is a pragmatic guess, not a measured minimum, so this caps the guess
+// rather than letting a pathological model double forever across repeated misdetections.
+const MAX_REASONING_TOKENS = 64_000
+
 function estimateFullRewriteTokens(lineCount: number): number {
   // ~18 tokens/line covers typical TS test code (mock setup + assertions), +1500 for the
   // <thinking> block and structural tags.
@@ -476,12 +482,26 @@ export class TestGenerator {
   // Called by fix-loop.ts on catching ReasoningBudgetExhaustedError — a model whose name doesn't
   // match REASONING_MODEL_RE just proved at runtime that it IS one (burned its whole max_tokens
   // budget on reasoning_content, zero real content). Flips this generator instance to the
-  // reasoning-model budget (estimateMaxTokens skips the line-count scale-down entirely) for every
-  // subsequent call, so the retry actually gets more room instead of repeating the same failure.
+  // reasoning-model budget (estimateMaxTokens skips the line-count scale-down entirely) AND
+  // raises the numeric ceiling itself (doubled, capped at MAX_REASONING_TOKENS).
+  //
+  // The flag alone is a no-op on a large file: estimateMaxTokens clamps its line-based estimate
+  // to configMax regardless of the flag once the estimate already exceeds configMax (e.g. a
+  // 700+-line source file), and retry()'s own budget formula in patch mode uses this.maxTokens
+  // directly — it never reads this.reasoningModel at all. On a large file the model was ALREADY
+  // getting the full configured ceiling on attempt 1, proved insufficient, and every subsequent
+  // retry (including the one immediately triggered by this same catch) would request the exact
+  // same ceiling again — a guaranteed repeat, observed live as 3 back-to-back empty responses on
+  // a 1094-line test file even after the flag-only version of this fix shipped. Raising the
+  // number itself is what actually changes the outcome; the flag only helps a SMALL file that
+  // was being needlessly scaled down below an already-generous configMax.
+  //
   // A worker's generator is reused across files (see setEnv's comment), so this also benefits
-  // every later file the worker picks up — one misdetection costs at most one file's first attempt.
+  // every later file the worker picks up — one misdetection costs at most one file's first
+  // attempt at the old ceiling.
   markAsReasoningModel(): void {
     this.reasoningModel = true
+    this.maxTokens = Math.min(this.maxTokens * 2, MAX_REASONING_TOKENS)
   }
 
   async generate(context: FileContext, gap: CoverageGap, projectMemory?: string | null): Promise<string> {
