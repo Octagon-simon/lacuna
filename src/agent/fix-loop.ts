@@ -15,7 +15,7 @@ import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 import type { LacunaEventHandler } from '../lib/events.js'
 import { buildFixFileContext, computeRelativeImport, collectTypeDefinitions, collectLocalImportPaths, detectReactMajorVersion, findFileByName, resolveToFile } from './context.js'
-import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, ModelRateLimitError, ModelCancelledError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE, resolveDebugBase, perFileDebugPath, debugWrite } from './generator.js'
+import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, ModelRateLimitError, ModelCancelledError, ReasoningBudgetExhaustedError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE, resolveDebugBase, perFileDebugPath, debugWrite } from './generator.js'
 import { processGap } from './loop.js'
 import { fixMocksFilesUpfront } from './mocks-fix.js'
 import type { CoverageGap } from '../lib/coverage/types.js'
@@ -629,6 +629,12 @@ export async function fixFile(
   const MAX_STALL_RETRIES = 2
   let rateLimitRetries = 0
   const MAX_RATE_LIMIT_RETRIES = 4
+  // Widen the budget exactly once per file — this is a one-time structural correction (the
+  // generator now permanently skips the line-count scale-down for the rest of its life, see
+  // markAsReasoningModel), not a transient condition to keep waiting out. If it STILL happens
+  // after the widen, that's a genuinely verbose reasoner exhausting even the full configured
+  // ceiling — fall through to ordinary retry handling instead of looping forever.
+  let reasoningBudgetWidened = false
   // Mirrors loop.ts's identical counter (previously only that file had one) — tracks 3 distinct
   // ways patch mode can fail to make progress on THIS file: an anchor not found, a patch that
   // nets test deletions instead of a real fix, or a patch that applies cleanly but still leaves
@@ -794,7 +800,20 @@ export async function fixFile(
           continue
         }
       }
-      if (err instanceof TruncatedOutputError) {
+      // A model whose name doesn't match the reasoning-model allowlist (e.g. a provider-specific
+      // alias lacuna has never seen) just proved at runtime that it IS one: it spent the whole
+      // max_tokens budget on reasoning_content and never reached real content, which otherwise
+      // looks identical to a plain empty response with no error, forever re-sent at the same
+      // too-small budget. Widen it once and retry without burning a real attempt.
+      if (err instanceof ReasoningBudgetExhaustedError && !reasoningBudgetWidened) {
+        reasoningBudgetWidened = true
+        generator.markAsReasoningModel()
+        if (!onStatus) log(chalk.yellow(`\n  ⌛ ${err.model} spent its full token budget on reasoning — retrying with the full configured budget...`))
+        onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax })
+        attempt--   // don't consume an AI iteration for a misdetected budget, not a genuine failure
+        continue
+      }
+      if (err instanceof TruncatedOutputError || err instanceof ReasoningBudgetExhaustedError) {
         errorOutput = TRUNCATION_RETRY_MESSAGE
         if (!onStatus) log(chalk.yellow(`\n  Output truncated — retrying with shorter output request...`))
         onStatus?.({ phase: 'retrying', file: shortPath, attempt, max: effectiveMax })

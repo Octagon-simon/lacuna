@@ -1,7 +1,7 @@
 import { gunzipSync } from 'node:zlib'
 import OpenAI from 'openai'
 import type { ModelProvider, ChatMessage } from './types.js'
-import { ModelStallError, ModelRateLimitError, ModelCancelledError } from './types.js'
+import { ModelStallError, ModelRateLimitError, ModelCancelledError, ReasoningBudgetExhaustedError } from './types.js'
 
 const FIRST_TOKEN_TIMEOUT_MS = 30_000
 const STALL_TIMEOUT_MS = 60_000
@@ -233,6 +233,16 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
     if (DIAGNOSE_TOKENS) {
       console.error(`[lacuna-diagnose] model=${this.model} maxTokens=${maxTokens} reasoningChars=${reasoningChars} contentChars=${contentChars} finishReason=${lastFinishReason} resultEmpty=${content.trim().length === 0}`)
+    }
+
+    // The model streamed reasoning_content but never reached real content — it burned the whole
+    // max_tokens budget thinking. A silent empty return here reads identically to "the model said
+    // nothing" further up the stack (TruncatedOutputError's code-based heuristics see an empty
+    // string either way), so the retry loop just re-sends the same too-small budget forever.
+    // Surfacing it as its own error lets the caller widen the budget instead of repeating the
+    // same failure — see generator.ts's markAsReasoningModel().
+    if (content.trim().length === 0 && reasoningChars > 0) {
+      throw new ReasoningBudgetExhaustedError(this.model, reasoningChars)
     }
 
     return content.trim()

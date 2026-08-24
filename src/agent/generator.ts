@@ -4,7 +4,7 @@ import type { LacunaConfig } from '../lib/config.js'
 import type { DetectedEnvironment } from '../lib/detector.js'
 import type { ModelProvider, ChatMessage } from '../lib/providers/index.js'
 import { createProvider } from '../lib/providers/index.js'
-export { ModelStallError, ModelRateLimitError, ModelCancelledError } from '../lib/providers/types.js'
+export { ModelStallError, ModelRateLimitError, ModelCancelledError, ReasoningBudgetExhaustedError } from '../lib/providers/types.js'
 import { buildSystemPrompt, buildGeneratePrompt, buildFixPrompt, buildRetryPrompt, buildPollutionFixPrompt, PATCH_MODE_LINE_THRESHOLD } from './prompts/index.js'
 import type { FailedAttempt } from './prompts/index.js'
 import type { FileContext } from './context.js'
@@ -471,6 +471,17 @@ export class TestGenerator {
   // self-contradicting prompt, not a real escape from patch mode.
   setPatchMode(v: boolean): void {
     this.patchMode = v
+  }
+
+  // Called by fix-loop.ts on catching ReasoningBudgetExhaustedError — a model whose name doesn't
+  // match REASONING_MODEL_RE just proved at runtime that it IS one (burned its whole max_tokens
+  // budget on reasoning_content, zero real content). Flips this generator instance to the
+  // reasoning-model budget (estimateMaxTokens skips the line-count scale-down entirely) for every
+  // subsequent call, so the retry actually gets more room instead of repeating the same failure.
+  // A worker's generator is reused across files (see setEnv's comment), so this also benefits
+  // every later file the worker picks up — one misdetection costs at most one file's first attempt.
+  markAsReasoningModel(): void {
+    this.reasoningModel = true
   }
 
   async generate(context: FileContext, gap: CoverageGap, projectMemory?: string | null): Promise<string> {

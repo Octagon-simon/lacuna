@@ -60,6 +60,22 @@ export class ModelCancelledError extends Error {
   }
 }
 
+// The model streamed ONLY reasoning_content and never reached real content — it spent its whole
+// max_tokens budget "thinking" before ever emitting <thinking>/<code_output>. This happens on
+// reasoning models generator.ts's own name-pattern allowlist (REASONING_MODEL_RE) doesn't
+// recognize, so estimateMaxTokens scaled the budget down for a non-reasoning model and the
+// reasoning phase alone exhausted it — content stays '', no HTTP error, indistinguishable from a
+// genuinely empty response without tracking reasoningChars/contentChars separately (see
+// openai-compatible.ts). Distinct from TruncatedOutputError (that fires on genuinely truncated
+// CODE, i.e. some content was produced) — this fires on ZERO content, which TruncatedOutputError's
+// own incomplete-code heuristics can't detect since there is no code to inspect.
+export class ReasoningBudgetExhaustedError extends Error {
+  constructor(public readonly model: string, public readonly reasoningChars: number) {
+    super(`${model} spent its entire token budget on reasoning_content (${reasoningChars} chars) and never produced real content.`)
+    this.name = 'ReasoningBudgetExhaustedError'
+  }
+}
+
 export const PRESETS: Record<string, ProviderPreset> = {
   claude: {
     label: 'Claude (Anthropic) — claude-sonnet-4-6',
