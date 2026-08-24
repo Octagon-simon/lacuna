@@ -1,1 +1,0 @@
-{"version":3,"file":"istanbul.d.ts","sourceRoot":"","sources":["../../../src/lib/coverage/istanbul.ts"],"names":[],"mappings":"AAEA,OAAO,KAAK,EAAE,cAAc,EAAgB,MAAM,YAAY,CAAA;AAiD9D,wBAAgB,iBAAiB,CAAC,WAAW,EAAE,MAAM,EAAE,GAAG,EAAE,MAAM,GAAG,MAAM,CAE1E;AAED,wBAAsB,kBAAkB,CAAC,WAAW,EAAE,MAAM,EAAE,GAAG,GAAE,MAAsB,GAAG,OAAO,CAAC,cAAc,CAAC,CAiBlH"}
