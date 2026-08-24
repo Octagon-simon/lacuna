@@ -385,6 +385,7 @@ export class TestGenerator {
   private testLineCount = 0   // the CURRENT test file's own line count — used to scale maxTokens if a later escalation forces a full rewrite of it
   private reactish = false     // React/RN project — gates React-specific retry guidance
   private coveredPatterns: string[] = []   // pattern tags memory has confirmed coverage for — gates detectTypeScriptErrors's own static guidance in retry()
+  private sourceResolved = false   // set in fix(): whether the module under test was found on disk — gates the retry loop's source-blindness bail-out
   private readonly debugFile: string | null   // configured base path (or null)
   private activeDebugFile: string | null = null   // per-file path for the file currently being processed
 
@@ -547,6 +548,7 @@ export class TestGenerator {
     this.patchMode = this.testLineCount > PATCH_MODE_LINE_THRESHOLD
     this.reactish = args.reactMajorVersion != null
     this.coveredPatterns = args.coveredPatterns ?? []
+    this.sourceResolved = !!(args.sourceFile && args.sourceCode)
 
     this.history = [{ role: 'user', content: buildFixPrompt(args) }]
     this.activeDebugFile = perFileDebugPath(this.debugFile, args.testFile)
@@ -622,7 +624,7 @@ export class TestGenerator {
 
     this.history.push({
       role: 'user',
-      content: buildRetryPrompt(failureOutput, this.failedAttempts, this.patchMode, this.reactish, this.coveredPatterns, this.env.testRunner === 'vitest' ? 'vi' : 'jest', this.env.testRunner === 'jest' || this.env.testRunner === 'vitest'),
+      content: buildRetryPrompt(failureOutput, this.failedAttempts, this.patchMode, this.reactish, this.coveredPatterns, this.env.testRunner === 'vitest' ? 'vi' : 'jest', this.env.testRunner === 'jest' || this.env.testRunner === 'vitest', this.sourceResolved),
     })
     await debugWrite(this.activeDebugFile, `PROMPT (retry ${this.failedAttempts.length})`, this.history[this.history.length - 1].content)
 

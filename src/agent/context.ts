@@ -337,7 +337,7 @@ function resolveLocalImport(
 // require an explicit compiled extension in relative specifiers even though the real source is
 // TypeScript (`import './foo.js'` resolving to `./foo.ts`) — strip it first, or every suffix
 // attempt below would double up (`foo.js.ts`) and silently fail to resolve.
-async function resolveToFile(basePath: string): Promise<string | null> {
+export async function resolveToFile(basePath: string): Promise<string | null> {
   const base = basePath.replace(/\.(m|c)?js$/, '')
   for (const suffix of ['.ts', '.tsx', '/index.ts', '/index.tsx', '']) {
     try { await access(base + suffix); return base + suffix } catch { /* try next */ }

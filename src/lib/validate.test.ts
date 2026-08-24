@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { detectProcessCrash, detectUnrelatedFileCrash, buildProcessCrashMessage, buildPatchEscalationMessage, buildFailingTestChecklist, detectStrayPatchMarkers, detectOpenHandleLeak, buildOpenHandleLeakMessage, detectJestConfigConflict, detectJestValidationError, detectUnbalancedMocksSyntax, detectEnvironmentLimitation, buildEnvironmentLimitationMessage } from './validate.js'
+import { detectProcessCrash, detectUnrelatedFileCrash, buildProcessCrashMessage, buildPatchEscalationMessage, buildFailingTestChecklist, detectStrayPatchMarkers, detectOpenHandleLeak, buildOpenHandleLeakMessage, detectJestConfigConflict, detectJestValidationError, detectUnbalancedMocksSyntax, detectEnvironmentLimitation, buildEnvironmentLimitationMessage, ensureMockedImports } from './validate.js'
 
 // Real text captured from a lacuna debug log on a real production project (attempt 1) — not a
 // synthetic example. The retry loop classified this as "⚠ REGRESSION — 13 passing before, now
@@ -458,4 +458,52 @@ test('buildEnvironmentLimitationMessage explains WHY no test-file edit works and
   assert.match(msg, /globalSetup/)
   assert.match(msg, /testEnv|ignore/)
   assert.match(msg, /in-memory fake/) // warns against the quirk-locking "fix"
+})
+
+// Real bug captured from a lacuna debug log on a scenario-suffixed test
+// file: the model correctly removed an unused
+// `import { useBusiness, useUser } from '@/state'`, but this function kept
+// re-adding it, byte-identically, on every retry — because it saw
+// `useBusiness:`/`useUser:` as "used outside the factory" when they were
+// actually just property KEYS in the unrelated `vi.hoisted(() => ({...}))`
+// mock-holder object, not references to the mocked module's exports.
+test('ensureMockedImports does not inject an import for a name that only appears as an object-literal KEY (vi.hoisted mock-holder pattern)', () => {
+  const code = `
+const mocks = vi.hoisted(() => ({
+  useBusiness: vi.fn(),
+  useUser: vi.fn(),
+}));
+
+vi.mock('@/state', async (importOriginal) => {
+  const actual = await importOriginal();
+  return {
+    ...actual,
+    useBusiness: mocks.useBusiness,
+    useUser: mocks.useUser,
+  };
+});
+
+describe('x', () => {
+  beforeEach(() => {
+    mocks.useBusiness.mockReturnValue({});
+    mocks.useUser.mockReturnValue({});
+  });
+  it('works', () => {});
+});
+`
+  assert.equal(ensureMockedImports(code), code)
+})
+
+test('ensureMockedImports still injects an import when the mocked name is genuinely referenced as a bare identifier outside the factory', () => {
+  const code = `
+jest.mock('@/context/AppContext', () => ({ useApp: jest.fn() }));
+
+describe('x', () => {
+  it('works', () => {
+    (useApp as jest.Mock).mockReturnValue({});
+  });
+});
+`
+  const result = ensureMockedImports(code)
+  assert.match(result, /^import \{ useApp \} from '@\/context\/AppContext';/)
 })

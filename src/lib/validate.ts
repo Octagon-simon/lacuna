@@ -963,7 +963,14 @@ export function ensureMockedImports(code: string): string {
       // access (e.g. `jest.requireMock(...).default`) — a bare \b${name}\b match doesn't
       // distinguish the two, since a word boundary exists on both sides of "default" whether or
       // not it's preceded by a dot. A negative lookbehind excludes the property-access form.
-      if (!new RegExp(`(?<!\\.)\\b${name}\\b`).test(masked)) continue                               // never used outside factory
+      // It also must not be an object-literal KEY — e.g. `vi.hoisted(() => ({ useApp: vi.fn() }))`,
+      // a mock-holder pattern used throughout this codebase's own tests, where the hoisted
+      // object's key happens to share the mocked export's name. `useApp:` there is a property
+      // name, not a reference to the import; a trailing `\s*:` (not already excluded as a real
+      // ternary/ ?: use, which is rare for a hook/component name) marks that case. Confirmed
+      // live: this false positive re-injected an unused import every retry, so the model's own
+      // (correct) removal of it never survived a write — an infinite identical-error retry loop.
+      if (!new RegExp(`(?<!\\.)\\b${name}\\b(?!\\s*:)`).test(masked)) continue                     // never used outside factory
       const s = need.get(mk.path) ?? new Set<string>()
       s.add(name)
       need.set(mk.path, s)

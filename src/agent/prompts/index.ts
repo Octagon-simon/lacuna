@@ -1408,7 +1408,25 @@ export interface FailedAttempt {
   failureReason: string
 }
 
-export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAttempt[] = [], patchMode = false, reactish = true, coveredPatterns: string[] = [], mockApi: 'vi' | 'jest' = 'vi', hasFnStyleMockApi = true): string {
+// A prior attempt's own <thinking> block claiming it can't see the source is the model
+// narrating its own blind spot, not us guessing at one. If the source genuinely couldn't be
+// resolved (sourceResolved=false — see findSourceFile in fix-loop.ts), more retries won't
+// produce new information: each one re-guesses from the same blind spot. Left unchecked this
+// compounds — observed in production logs as 5+ retries of near-identical multi-paragraph
+// "I can't see the source, I'll guess X" reasoning, ending in a response so large it got cut
+// off mid-file. Redirect instead of letting it repeat the mistake.
+function detectSourceBlindness(failedAttempts: FailedAttempt[], sourceResolved: boolean): string | null {
+  if (sourceResolved || failedAttempts.length === 0) return null
+  const blindPhrase = /\b(?:can'?t|cannot|can not|don'?t have (?:the )?|genuinely (?:cannot|can'?t)|without (?:the )?|no visibility into)\b[^.]{0,40}\bsource\b/i
+  if (!failedAttempts.some(a => blindPhrase.test(a.hypothesis))) return null
+  return [
+    '⚠️  SOURCE FILE UNAVAILABLE — a previous attempt reported it could not see the source of the module under test, and none could be resolved for this file.',
+    'STOP guessing at the module\'s prop names, return shape, or behavior — that guess-and-check pattern already failed and will keep failing with no new information on this retry either.',
+    'Only make changes you can justify from the TEST FILE and FAILURE OUTPUT alone (a wrong assertion value, a bad mock import path, an unawaited async call). If the failure genuinely requires knowing what the source does now, leave that specific test/assertion unfixed rather than guessing — an unfixed test is recoverable, a wrong guess baked in as "expected" is not.',
+  ].join('\n')
+}
+
+export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAttempt[] = [], patchMode = false, reactish = true, coveredPatterns: string[] = [], mockApi: 'vi' | 'jest' = 'vi', hasFnStyleMockApi = true, sourceResolved = true): string {
   const parts: string[] = []
 
   if (failedAttempts.length > 0) {
@@ -1428,6 +1446,9 @@ export function buildRetryPrompt(failureOutput: string, failedAttempts: FailedAt
     }
     parts.push('')
   }
+
+  const blindnessWarning = detectSourceBlindness(failedAttempts, sourceResolved)
+  if (blindnessWarning) { parts.push(blindnessWarning); parts.push('') }
 
   // Neutral header: this prompt is reused for assertion failures, type-only repairs (where
   // the tests actually PASS), patch-anchor failures, and "no tests" cases. Hardcoding "the

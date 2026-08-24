@@ -161,6 +161,35 @@ test('buildRetryPrompt defaults to vi.mock() for backward compatibility when moc
   assert.match(prompt, /vi\.mock\('axios'\)/)
 })
 
+// Real symptom (see lacuna-debug logs): when a test's source file can't be resolved, the model
+// has no way to know a failure like "onFoo is not a function" is a genuine API mismatch vs. a
+// bad guess of its own — so it keeps guessing prop names across retries, each one just as blind
+// as the last, until the growing prompt (every prior attempt's reasoning echoed back) blows the
+// output token budget and truncates mid-file. detectSourceBlindness catches the model saying so
+// itself and tells it to stop guessing instead of repeating the same unrecoverable spiral.
+const BLIND_ATTEMPT = [{
+  attemptNumber: 1,
+  hypothesis: "Since I genuinely cannot see the source, I'll make the mock accept the props object and render buttons that call the callbacks.",
+  failureReason: 'onStartPendingChange is not a function',
+}]
+
+test('buildRetryPrompt injects a stop-guessing warning when a prior attempt reported source blindness and none resolved', () => {
+  const prompt = buildRetryPrompt(REAL_REQUEST_ERROR, BLIND_ATTEMPT, false, true, [], 'vi', true, false)
+  assert.match(prompt, /SOURCE FILE UNAVAILABLE/)
+  assert.match(prompt, /STOP guessing/)
+})
+
+test('buildRetryPrompt stays silent when the source WAS resolved, even if a hypothesis mentions "source"', () => {
+  const prompt = buildRetryPrompt(REAL_REQUEST_ERROR, BLIND_ATTEMPT, false, true, [], 'vi', true, true)
+  assert.doesNotMatch(prompt, /SOURCE FILE UNAVAILABLE/)
+})
+
+test('buildRetryPrompt stays silent when source is unresolved but no attempt reported blindness', () => {
+  const ordinaryAttempt = [{ attemptNumber: 1, hypothesis: 'The mock returns the wrong shape, fixing the return value.', failureReason: 'expected true to be false' }]
+  const prompt = buildRetryPrompt(REAL_REQUEST_ERROR, ordinaryAttempt, false, true, [], 'vi', true, false)
+  assert.doesNotMatch(prompt, /SOURCE FILE UNAVAILABLE/)
+})
+
 test('buildVueGuidance names jest.advanceTimersByTime() for a jest project, not vi.advanceTimersByTime()', () => {
   const guidance = buildVueGuidance('jest')
   assert.match(guidance, /jest\.advanceTimersByTime\(\)/)

@@ -14,7 +14,7 @@ import { startCoverageSpinner } from '../lib/coverage-spinner.js'
 import { WorkerDisplay } from '../lib/worker-display.js'
 import type { WorkerState } from '../lib/worker-display.js'
 import type { LacunaEventHandler } from '../lib/events.js'
-import { buildFixFileContext, computeRelativeImport, collectTypeDefinitions, collectLocalImportPaths, detectReactMajorVersion, findFileByName } from './context.js'
+import { buildFixFileContext, computeRelativeImport, collectTypeDefinitions, collectLocalImportPaths, detectReactMajorVersion, findFileByName, resolveToFile } from './context.js'
 import { TestGenerator, TruncatedOutputError, OscillationError, ModelStallError, ModelRateLimitError, ModelCancelledError, TRUNCATION_RETRY_MESSAGE, OSCILLATION_ESCAPE_MESSAGE, resolveDebugBase, perFileDebugPath, debugWrite } from './generator.js'
 import { processGap } from './loop.js'
 import { fixMocksFilesUpfront } from './mocks-fix.js'
@@ -301,7 +301,20 @@ export async function discoverFailingTests(
 
 // ─── Find the source file that a test file is testing ────────────────────────
 
-async function findSourceFile(testFilePath: string, cwd: string, configSourceDirs: string | string[] = 'src'): Promise<string | null> {
+// A test's own relative import is ground truth for what it's testing — unlike filename
+// matching, it works regardless of naming convention (e.g. `__tests__/FooResendGuard.test.tsx`
+// covering a sibling `index.tsx`, not a file named FooResendGuard.tsx). Only relative specifiers
+// ('./x', '../x') are considered: they resolve without needing tsconfig aliases, which covers the
+// common colocated-test case this function otherwise misses entirely.
+export function extractRelativeImportSpecifiers(testCode: string): string[] {
+  const specifiers: string[] = []
+  const re = /import\s+(?:[\w*\s{},]+)\s+from\s+['"](\.[^'"]+)['"]/g
+  let m: RegExpExecArray | null
+  while ((m = re.exec(testCode))) specifiers.push(m[1])
+  return specifiers
+}
+
+export async function findSourceFile(testFilePath: string, cwd: string, configSourceDirs: string | string[] = 'src', testCode?: string): Promise<string | null> {
   const ext = extname(testFilePath)
   const base = basename(testFilePath, ext)
   const dir = dirname(testFilePath)
@@ -316,6 +329,20 @@ async function findSourceFile(testFilePath: string, cwd: string, configSourceDir
       try { await access(join(resolved, `${sourceBase}${e}`)); return join(resolved, `${sourceBase}${e}`) } catch { /* next */ }
     }
     return null
+  }
+
+  // Attempt 0: resolve the test file's own relative imports first — more reliable than the
+  // filename-matching attempts below, and catches the colocated `__tests__/*.test.tsx` → sibling
+  // `index.tsx` pattern they miss. Skips test/mock files so a fixture import doesn't win.
+  if (testCode) {
+    const absDir = isAbsolute(dir) ? dir : join(cwd, dir)
+    for (const spec of extractRelativeImportSpecifiers(testCode)) {
+      const basePath = join(absDir, spec)
+      const resolved = await resolveToFile(basePath)
+      if (resolved && !/[\\/]__(tests|mocks)__[\\/]/.test(resolved) && !/\.(test|spec)\.[tj]sx?$/i.test(resolved)) {
+        return resolved
+      }
+    }
   }
 
   // Attempt 1: same directory as test file, or parent of __tests__
@@ -467,9 +494,10 @@ export async function fixFile(
       // dependency — no handle-creating call in the test/source), no edit can clear it, so DON'T
       // chase it: that would treat a passing file as failing and burn iterations. Accept green + note.
       const leaked = detectOpenHandleLeak(firstRun.stdout + '\n' + firstRun.stderr)
+      const leakCheckTestCode = await readFile(absTestPath, 'utf-8').catch(() => '')
       const fixable = leaked && leakLooksTestFixable(
-        await readFile(absTestPath, 'utf-8').catch(() => ''),
-        await readFile((await findSourceFile(testFilePath, cwd, config.sourceDir)) ?? '', 'utf-8').catch(() => null),
+        leakCheckTestCode,
+        await readFile((await findSourceFile(testFilePath, cwd, config.sourceDir, leakCheckTestCode)) ?? '', 'utf-8').catch(() => null),
       )
       if (!fixable) {
         if (!onStatus) log(chalk.dim(leaked
@@ -514,7 +542,7 @@ export async function fixFile(
   const originalTestsSubject = !!subject && referencesSubject(testCode, subject)
 
   // Find and read the source file being tested
-  const sourceFilePath = await findSourceFile(testFilePath, cwd, config.sourceDir)
+  const sourceFilePath = await findSourceFile(testFilePath, cwd, config.sourceDir, testCode)
   let sourceCode: string | null = null
   if (sourceFilePath) {
     sourceCode = await readFile(sourceFilePath, 'utf-8').catch(() => null)
@@ -1453,17 +1481,19 @@ async function regenerateFile(
 ): Promise<{ success: boolean; error?: string }> {
   const absTestFile = testFilePath.startsWith('/') ? testFilePath : join(options.cwd, testFilePath)
 
+  // Back up the current content so a failed regeneration never leaves the file deleted or
+  // filled with a broken last attempt — on failure we restore exactly what was here. Read
+  // upfront (rather than after resolving the source below) so findSourceFile can also use it
+  // to resolve the test's own relative imports.
+  let originalContent: string | null = null
+  try { originalContent = await readFile(absTestFile, 'utf-8') } catch { /* already gone */ }
+
   // Find the source file so processGap gets the right starting point.
   // processGap expects gap.filePath to be the SOURCE file, not the test file.
-  const sourceFile = await findSourceFile(absTestFile, options.cwd, options.config.sourceDir)
+  const sourceFile = await findSourceFile(absTestFile, options.cwd, options.config.sourceDir, originalContent ?? undefined)
   if (!sourceFile) {
     return { success: false, error: `Could not find source file for ${absTestFile}` }
   }
-
-  // Back up the current content so a failed regeneration never leaves the file deleted or
-  // filled with a broken last attempt — on failure we restore exactly what was here.
-  let originalContent: string | null = null
-  try { originalContent = await readFile(absTestFile, 'utf-8') } catch { /* already gone */ }
 
   // Delete the broken test file before regenerating. If it stays on disk,
   // buildFileContext reads it as existingTestCode and the generate prompt says
@@ -1693,9 +1723,10 @@ export async function runFixLoop(options: FixOptions): Promise<FixResult> {
       const typeErrors = await typeCheckFile(absTarget, cwd, env)
       const leaked = detectOpenHandleLeak(fileResult.stdout + '\n' + fileResult.stderr)
       // A leak only counts as "to fix" when it's plausibly from THIS test/source (see fixFile).
+      const leakCheckTargetCode = await readFile(absTarget, 'utf-8').catch(() => '')
       const leakFixable = leaked && leakLooksTestFixable(
-        await readFile(absTarget, 'utf-8').catch(() => ''),
-        await readFile((await findSourceFile(absTarget, cwd, config.sourceDir)) ?? '', 'utf-8').catch(() => null),
+        leakCheckTargetCode,
+        await readFile((await findSourceFile(absTarget, cwd, config.sourceDir, leakCheckTargetCode)) ?? '', 'utf-8').catch(() => null),
       )
       if (!typeErrors && !leakFixable) {
         log(chalk.green(`\n  All tests are passing${leaked ? ' (a handle leaked, but it originates outside this test — environment/dependency)' : ''} — nothing to fix.`))
