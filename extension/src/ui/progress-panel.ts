@@ -74,10 +74,11 @@ export class ProgressPanel {
     const csp = this.panel.webview.cspSource
     return /* html */ `<!DOCTYPE html><html><head>
 <meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${csp} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${csp} https: data:; font-src ${csp}; style-src ${csp} 'unsafe-inline'; script-src 'nonce-${nonce}' ${csp};">
 <style>
   :root { color-scheme: light dark; }
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 0; margin: 0; font-size: 13px; }
+  html, body { background: var(--vscode-editor-background, #1e1e1e); }
+  body { font-family: var(--vscode-font-family, -apple-system, system-ui, sans-serif); color: var(--vscode-foreground, #ccc); padding: 0; margin: 0; font-size: 13px; }
   header { position: sticky; top: 0; background: var(--vscode-editor-background); padding: 10px 14px; border-bottom: 1px solid var(--vscode-panel-border); }
   .title { font-weight: 600; font-size: 14px; }
   .stats { display: flex; gap: 16px; margin-top: 6px; color: var(--vscode-descriptionForeground); flex-wrap: wrap; }

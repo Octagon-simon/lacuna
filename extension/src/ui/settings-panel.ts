@@ -42,7 +42,7 @@ export class SettingsPanel {
       const current = await readLacunaJson(cwd)
       const srcDir = (Array.isArray(current.sourceDir) ? current.sourceDir[0] : current.sourceDir) as string | undefined
       const mocksDefault = await computeMocksDefault(cwd, srcDir ?? 'src')
-      panel.webview.html = renderHtml(props, current, firstRun, mocksDefault)
+      panel.webview.html = renderHtml(props, current, firstRun, mocksDefault, panel.webview.cspSource)
     }
 
     // Re-invoking the command on an open panel repaints it from the latest saved config, then reveals.
@@ -254,7 +254,7 @@ function renderField(key: string, prop: JsonSchemaProp, current: Record<string, 
   return `<div class="field"><label>${escapeHtml(label)}</label><div class="control">${input}</div><p class="desc">${desc}</p></div>`
 }
 
-function renderHtml(props: Record<string, JsonSchemaProp>, current: Record<string, unknown>, firstRun: boolean, mocksDefault: string): string {
+function renderHtml(props: Record<string, JsonSchemaProp>, current: Record<string, unknown>, firstRun: boolean, mocksDefault: string, cspSource = ''): string {
   const nonce = String(Math.random()).slice(2)
   const allKeys = Object.keys(props)
   const primary = PRIMARY_KEYS.filter((k) => k in props)
@@ -262,10 +262,23 @@ function renderHtml(props: Record<string, JsonSchemaProp>, current: Record<strin
   const primaryRows = primary.map((k) => renderField(k, props[k], current, mocksDefault, FIELD_LABEL[k] ?? k)).join('')
   const advancedRows = advanced.map((k) => renderField(k, props[k], current, mocksDefault, k)).join('')
 
+  // CSP: include the webview's own resource origin (${cspSource}) in script-src
+  // and style-src. VS Code injects the acquireVsCodeApi() bootstrap in a way that
+  // a nonce-only script-src tolerates, but Theia serves that bootstrap FROM the
+  // webview resource origin — so a nonce-only policy blocks it there, leaving the
+  // panel dead/black. Whitelisting cspSource fixes Theia and is a no-op in VS Code.
+  const csp = [
+    `default-src 'none'`,
+    `img-src ${cspSource} https: data:`,
+    `font-src ${cspSource}`,
+    `style-src ${cspSource} 'unsafe-inline'`,
+    `script-src 'nonce-${nonce}' ${cspSource}`,
+  ].join('; ')
   return /* html */ `<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';">
+<meta http-equiv="Content-Security-Policy" content="${csp};">
 <style>
-  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 16px 20px; }
+  html, body { background: var(--vscode-editor-background, #1e1e1e); }
+  body { font-family: var(--vscode-font-family, -apple-system, system-ui, sans-serif); color: var(--vscode-foreground, #ccc); padding: 16px 20px; }
   h1 { font-size: 16px; } .intro { color: var(--vscode-descriptionForeground); }
   .field { margin: 14px 0; padding-bottom: 12px; border-bottom: 1px solid var(--vscode-panel-border); }
   label { font-weight: 600; display: inline-block; min-width: 160px; vertical-align: top; }
