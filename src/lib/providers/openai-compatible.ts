@@ -123,12 +123,27 @@ export class OpenAICompatibleProvider implements ModelProvider {
     }, 5_000)
 
     try {
+      // Strip any "provider/" routing prefix (OpenRouter etc. send "openai/gpt-5",
+      // "anthropic/claude-sonnet-4-6") so model detection works regardless of gateway.
+      const bareModel = this.model.includes('/') ? this.model.split('/').pop()! : this.model
+
+      // OpenAI's GPT and o-series models take `max_completion_tokens`, not `max_tokens`
+      // (the o-series and gpt-5 reject `max_tokens` outright). Everything else on an
+      // OpenAI-compatible endpoint — Claude via OpenRouter, DeepSeek, Gemini, Llama —
+      // uses `max_tokens`.
+      const isOpenAIModel = /^gpt-/.test(bareModel) || /^o\d/.test(bareModel)
+
+      // OpenAI reasoning models (o-series, gpt-5) only accept the DEFAULT temperature and
+      // reject `stop`/`temperature` with a 400 — so we must omit both for them. Non-reasoning
+      // GPT models (gpt-4o and older) still support both, so they keep the stop marker.
+      const isOpenAIReasoningModel = /^o\d/.test(bareModel) || /^gpt-5/.test(bareModel)
+
       const stream = await this.client.chat.completions.create(
         {
           model: this.model,
-          max_tokens: maxTokens,
-          stop: ['</code_output>'],
-          ...(temperature !== undefined ? { temperature } : {}),
+          ...(isOpenAIModel ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
+          ...(isOpenAIReasoningModel ? {} : { stop: ['</code_output>'] }),
+          ...(temperature !== undefined && !isOpenAIReasoningModel ? { temperature } : {}),
           stream: true,
           messages: [
             { role: 'system', content: system },
