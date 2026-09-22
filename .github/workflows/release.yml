@@ -67,12 +67,27 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${GITHUB_REF_NAME}"
-          gh release create "${TAG}" \
-            --title "${TAG}" \
-            --generate-notes \
-            --latest
+          # Idempotent: a re-run of a partially-failed release (e.g. after npm publish 403'd
+          # on an expired token) must not abort here just because the release already exists
+          # from the earlier attempt — otherwise the job dies before reaching npm publish.
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists — skipping create."
+          else
+            gh release create "${TAG}" \
+              --title "${TAG}" \
+              --generate-notes \
+              --latest
+          fi
 
       - name: Publish to npm
-        run: npm publish --access public
+        run: |
+          VERSION="$(node -p "require('./package.json').version")"
+          # Idempotent: skip if this version is already on npm, so re-running a release whose
+          # git/tag/GitHub-release steps already succeeded only performs the missing publish.
+          if npm view "lacuna-cli@${VERSION}" version >/dev/null 2>&1; then
+            echo "lacuna-cli@${VERSION} already published — skipping publish."
+          else
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
