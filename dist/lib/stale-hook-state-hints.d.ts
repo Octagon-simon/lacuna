@@ -1,0 +1,2 @@
+export declare function buildStaleHookStateHint(errorOutput: string | null, testCode: string | null | undefined, sourceCode: string | null | undefined): string | null;
+//# sourceMappingURL=stale-hook-state-hints.d.ts.map
